@@ -31,22 +31,24 @@ from .physics_decoder import PhysicsDecoder
 
 
 class CNNEncoder(nn.Module):
-    """4层 CNN 编码器: 6×60×160 → 512 维隐向量"""
+    """4层 CNN 编码器 + UNet 跳连"""
 
     def __init__(self, in_ch=6, hidden=512):
         super().__init__()
-        self.net = nn.Sequential(
-            nn.Conv2d(in_ch, 32, 3, stride=2, padding=1), nn.BatchNorm2d(32), nn.ReLU(),
-            nn.Conv2d(32, 64, 3, stride=2, padding=1), nn.BatchNorm2d(64), nn.ReLU(),
-            nn.Conv2d(64, 128, 3, stride=2, padding=1), nn.BatchNorm2d(128), nn.ReLU(),
-            nn.Conv2d(128, 256, 3, stride=2, padding=1), nn.BatchNorm2d(256), nn.ReLU(),
-            nn.AdaptiveAvgPool2d(1),
-            nn.Flatten(),
-            nn.Linear(256, hidden),
-        )
+        self.conv1 = nn.Sequential(nn.Conv2d(in_ch, 32, 3, stride=2, padding=1), nn.BatchNorm2d(32), nn.ReLU())
+        self.conv2 = nn.Sequential(nn.Conv2d(32, 64, 3, stride=2, padding=1), nn.BatchNorm2d(64), nn.ReLU())
+        self.conv3 = nn.Sequential(nn.Conv2d(64, 128, 3, stride=2, padding=1), nn.BatchNorm2d(128), nn.ReLU())
+        self.conv4 = nn.Sequential(nn.Conv2d(128, 256, 3, stride=2, padding=1), nn.BatchNorm2d(256), nn.ReLU())
+        self.pool = nn.AdaptiveAvgPool2d(1)
+        self.fc = nn.Linear(256, hidden)
 
     def forward(self, x):
-        return self.net(x)
+        f1 = self.conv1(x)  # [B,32,30,80]
+        f2 = self.conv2(f1) # [B,64,15,40]
+        f3 = self.conv3(f2) # [B,128,8,20]
+        f4 = self.conv4(f3) # [B,256,4,10]
+        latent = self.fc(self.pool(f4).flatten(1))
+        return latent, (f1, f2, f3, f4)
 
 
 class MacroDecoder(nn.Module):
@@ -63,6 +65,7 @@ class MacroDecoder(nn.Module):
             nn.Linear(256, 128), nn.ReLU(), nn.Dropout(0.1),
             nn.Linear(128, n_modes * 2),
         )
+        nn.init.constant_(self.mlp[-1].bias[:n_modes], -2.0)  # sigmoid(-2)≈0.12→3000Hz
 
     def forward(self, latent):
         out = self.mlp(latent)
@@ -72,33 +75,32 @@ class MacroDecoder(nn.Module):
 
 
 class MicroDecoder(nn.Module):
-    """微观上采样解码器: 512 → mode_maps [B,K,60,160]"""
+    """UNet 上采样解码器: 512 + skips → mode_maps [B,K,60,160]"""
 
     def __init__(self, hidden=512, n_modes=3):
         super().__init__()
-        self.n_modes = n_modes
+        self.fc_up = nn.Linear(hidden, 256 * 4 * 10)  # -> f4 尺寸 [B,256,4,10]
 
-        self.up = nn.Sequential(
-            # [B,hidden,1,1] → ×4 → [hidden,4,4]
-            nn.Conv2d(hidden, 256, 3, padding=1), nn.BatchNorm2d(256), nn.ReLU(),
-            # ×4 → [256,16,16]
-            nn.Conv2d(256, 128, 3, padding=1), nn.BatchNorm2d(128), nn.ReLU(),
-            # ×4 → [128,64,64]
-            nn.Conv2d(128, 64, 3, padding=1), nn.BatchNorm2d(64), nn.ReLU(),
-        )
-        self.final = nn.Conv2d(64, n_modes, 3, padding=1)
+        self.up3 = nn.Sequential(nn.Conv2d(256 + 128, 128, 3, padding=1), nn.BatchNorm2d(128), nn.ReLU())
+        self.up2 = nn.Sequential(nn.Conv2d(128 + 64, 64, 3, padding=1), nn.BatchNorm2d(64), nn.ReLU())
+        self.up1 = nn.Sequential(nn.Conv2d(64 + 32, 32, 3, padding=1), nn.BatchNorm2d(32), nn.ReLU())
+        self.final = nn.Conv2d(32, n_modes, 3, padding=1)
 
-    def forward(self, latent):
-        x = latent.view(latent.shape[0], -1, 1, 1)
-        x = F.interpolate(x, scale_factor=4, mode='bilinear', align_corners=False)
-        x = self.up[0:3](x)  # Conv+BN+ReLU
-        x = F.interpolate(x, scale_factor=4, mode='bilinear', align_corners=False)
-        x = self.up[3:6](x)
-        x = F.interpolate(x, scale_factor=4, mode='bilinear', align_corners=False)
-        x = self.up[6:9](x)
+    def forward(self, latent, skips):
+        f1, f2, f3, f4 = skips
+        x = self.fc_up(latent).view(-1, 256, 4, 10)
+
+        x = F.interpolate(x, size=f3.shape[2:], mode='bilinear', align_corners=False)
+        x = self.up3(torch.cat([x, f3], dim=1))
+
+        x = F.interpolate(x, size=f2.shape[2:], mode='bilinear', align_corners=False)
+        x = self.up2(torch.cat([x, f2], dim=1))
+
+        x = F.interpolate(x, size=f1.shape[2:], mode='bilinear', align_corners=False)
+        x = self.up1(torch.cat([x, f1], dim=1))
+
         x = F.interpolate(x, size=(60, 160), mode='bilinear', align_corners=False)
-        x = self.final(x)  # [B, K, 60, 160]
-        return x
+        return self.final(x)
 
 
 class UNetPhysicsModel(nn.Module):
@@ -123,7 +125,7 @@ class UNetPhysicsModel(nn.Module):
         self.physics = PhysicsDecoder(amp_scale, freq_min, freq_max)
 
     def forward(self, image_tensor, query_coords, frequencies=None,
-                phi_exc=None, batch=None):
+                phi_exc=None, batch=None, alpha=1.0):
         """
         Args:
             image_tensor: [B, C, 60, 160] 物理场图像
@@ -143,9 +145,9 @@ class UNetPhysicsModel(nn.Module):
             B = int(batch.max().item()) + 1
             var_n_flag = True
 
-        latent = self.encoder(image_tensor)
-        omega_norm, zeta = self.macro_decoder(latent)  # ω_norm ∈ [0,1]
-        mode_maps = self.micro_decoder(latent)
+        latent, skips = self.encoder(image_tensor)
+        omega_norm, zeta = self.macro_decoder(latent)
+        mode_maps = self.micro_decoder(latent, skips)
 
         # grid_sample: 从连续振型场采样到离散节点
         if var_n_flag:
@@ -167,9 +169,8 @@ class UNetPhysicsModel(nn.Module):
 
         omega_phys = omega_norm * self.macro_decoder.omega_max
         if frequencies is not None:
-            frf_raw = self.physics(phi, omega_phys, zeta, frequencies, phi_exc,
-                                   batch_idx=batch if var_n_flag else None)
-            frf = torch.asinh(frf_raw.clamp(-1e4, 1e4))
+            frf = self.physics(phi, omega_phys, zeta, frequencies, phi_exc,
+                               batch_idx=batch if var_n_flag else None, alpha=alpha)
         else:
             frf = None
 
