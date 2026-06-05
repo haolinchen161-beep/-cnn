@@ -31,7 +31,7 @@ CONFIG = {
 
     'optimizer': {
         'name': 'AdamW',
-        'kwargs': {'lr': 0.001, 'weight_decay': 0.0001, 'betas': (0.9, 0.999)},
+        'kwargs': {'lr': 0.001, 'weight_decay': 0.0003, 'betas': (0.9, 0.999)},
         'gradient_clip': 2.0,
         'gradient_clip_transolver': 3.0,
         'gradient_clip_head_phi': 5.0,
