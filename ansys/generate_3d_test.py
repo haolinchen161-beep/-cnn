@@ -25,10 +25,10 @@ np.random.seed(SEED)
 random.seed(SEED)
 
 # ============ 配置 ============
-N_SAMPLES = 300
-N_TRAIN = 200                     # 67% 训练集
-N_VAL = 50                        # 17% 验证集
-N_TEST = 50                       # 17% 测试集
+N_SAMPLES = 1500
+N_TRAIN = 1200                     # 67% 训练集
+N_VAL = 150                        # 17% 验证集
+N_TEST = 150                       # 17% 测试集
 N_MODES = 3
 N_FREQS = 60  # 每峰至少15点, 总60点保证共振峰幅值精度
 FREQ_MIN, FREQ_MAX = 1.0, 5000.0
