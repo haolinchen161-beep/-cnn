@@ -121,7 +121,7 @@ class GeometricHDF5Dataset(Dataset):
         # 归一化
         if self.normalization:
             freqs = (freqs - self.freq_min) / (self.freq_max - self.freq_min) * 2 - 1
-            frf = torch.asinh(frf)
+            # FRF保持线性物理量, dB/CDF Loss自行处理量级
 
         result = {
             'image_tensor': image_tensor,
