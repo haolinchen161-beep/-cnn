@@ -7,7 +7,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 import numpy as np
 import matplotlib; matplotlib.use('Agg'); import matplotlib.pyplot as plt
 
-SAMPLE_IDX = 16
+SAMPLE_IDX = 1
 
 data = np.load(os.path.join(os.path.dirname(__file__), 'output', 'final_results.npz'), allow_pickle=True)
 f_np = data['frequencies'][SAMPLE_IDX]
