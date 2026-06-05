@@ -61,8 +61,8 @@ class MacroDecoder(nn.Module):
         self.n_modes = n_modes
         self.omega_max = omega_max
         self.mlp = nn.Sequential(
-            nn.Linear(hidden, 256), nn.ReLU(), nn.Dropout(0.2),
-            nn.Linear(256, 128), nn.ReLU(), nn.Dropout(0.2),
+            nn.Linear(hidden, 256), nn.GELU(), nn.Dropout(0.2),
+            nn.Linear(256, 128), nn.GELU(), nn.Dropout(0.2),
             nn.Linear(128, n_modes * 2),
         )
         nn.init.constant_(self.mlp[-1].bias[:n_modes], -2.0)  # sigmoid(-2)≈0.12→3000Hz
@@ -81,9 +81,9 @@ class MicroDecoder(nn.Module):
         super().__init__()
         self.fc_up = nn.Linear(hidden, 256 * 4 * 10)  # -> f4 尺寸 [B,256,4,10]
 
-        self.up3 = nn.Sequential(nn.Conv2d(256 + 128, 128, 3, padding=1), nn.BatchNorm2d(128), nn.ReLU())
-        self.up2 = nn.Sequential(nn.Conv2d(128 + 64, 64, 3, padding=1), nn.BatchNorm2d(64), nn.ReLU())
-        self.up1 = nn.Sequential(nn.Conv2d(64 + 32, 32, 3, padding=1), nn.BatchNorm2d(32), nn.ReLU())
+        self.up3 = nn.Sequential(nn.Conv2d(256 + 128, 128, 3, padding=1), nn.BatchNorm2d(128), nn.GELU())
+        self.up2 = nn.Sequential(nn.Conv2d(128 + 64, 64, 3, padding=1), nn.BatchNorm2d(64), nn.GELU())
+        self.up1 = nn.Sequential(nn.Conv2d(64 + 32, 32, 3, padding=1), nn.BatchNorm2d(32), nn.GELU())
         self.final = nn.Conv2d(32, n_modes, 3, padding=1)
 
     def forward(self, latent, skips):
