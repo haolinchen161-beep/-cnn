@@ -115,7 +115,10 @@ def train(args, config, model_cfg, net, dataloader, optimizer,
                         zeta_pred, batch['modal_zeta'].to(args.device),
                         phi_pred, batch['modal_phi'].to(args.device),
                         batch_idx=batch_idx_t)
-                    loss = loss_m + frf_weight * frf_loss(frf_pred, batch['point_frf'].to(args.device))
+                    raw_frf = frf_loss(frf_pred, batch['point_frf'].to(args.device))
+                    phase2_ep = epoch - unlock_epoch
+                    current_frf_w = 0.05 * min(1.0, phase2_ep / 20.0)  # 预热20轮, 目标0.05
+                    loss = loss_m + current_frf_w * raw_frf
                 else:
                     _, omega_pred, zeta_pred, phi_pred = net(img, coords, None, None, batch_idx_t)
                     loss_m, l_w, l_z, l_p = modal_loss(
