@@ -1,28 +1,16 @@
 """
-losses.py — 模态参数损失 + MAC 物理对齐。
+losses.py — 模态参数损失 + 符号对齐MSE + db/CDF FRF损失。
 """
 import torch
 import torch.nn.functional as F
 
 
-def mac_loss(pred_phi, true_phi):
-    """MAC (Modal Assurance Criterion) 损失。
-    MAC = (φ_pred·φ_true)² / (‖φ_pred‖² · ‖φ_true‖²)
-    值域 [0,1], 1=完全相同, 0=正交。天然处理符号和尺度歧义。
-    """
-    num = (pred_phi * true_phi).sum(dim=0) ** 2
-    den = ((pred_phi ** 2).sum(dim=0) * (true_phi ** 2).sum(dim=0)) + 1e-8
-    mac = num / den
-    return 1.0 - mac.mean()
-
-
 def modal_loss(omega_pred, omega_target,
                zeta_pred, zeta_target,
                phi_pred, phi_target, batch_idx=None,
-               omega_weight=200.0, zeta_weight=0.2, phi_weight=0.3):
-    """模态参数损失。
-    ω×50, ζ×2, φ×0.3: φ 降权让 ω 在 Phase1 占主导 (>70%)
-    """
+               omega_weight=200.0, zeta_weight=10.0, phi_weight=1.0):
+    """模态参数损失。符号对齐MSE强制匹配振型绝对幅值。"""
+
     loss_omega = torch.mean(((omega_pred - omega_target) / (omega_target + 1e-8))**2) * omega_weight
     loss_zeta  = torch.mean(((zeta_pred - zeta_target) / (zeta_target + 1e-8))**2) * zeta_weight
 
@@ -31,31 +19,36 @@ def modal_loss(omega_pred, omega_target,
             phi_pred = phi_pred.view(-1, phi_pred.shape[-1])
             phi_target = phi_target.view(-1, phi_target.shape[-1])
 
-        loss_phi = 0.0
+        raw_phi_mse = 0.0
         num_graphs = int(batch_idx.max().item()) + 1
         for i in range(num_graphs):
             mask = (batch_idx == i)
-            loss_phi += mac_loss(phi_pred[mask], phi_target[mask])
-        loss_phi = (loss_phi / num_graphs) * phi_weight
+            p_p = phi_pred[mask]; p_t = phi_target[mask]
+            dot = torch.sum(p_p * p_t, dim=0, keepdim=True)
+            sign = torch.sign(dot + 1e-8)
+            aligned_t = p_t * sign
+            raw_phi_mse += F.mse_loss(p_p, aligned_t)
+        raw_phi_mse = raw_phi_mse / num_graphs
     else:
-        phi_p = phi_pred.reshape(-1, phi_pred.shape[-1])
-        phi_t = phi_target.reshape(-1, phi_target.shape[-1])
-        loss_phi = mac_loss(phi_p, phi_t) * phi_weight
+        dot = torch.sum(phi_pred * phi_target, dim=1, keepdim=True)
+        sign = torch.sign(dot + 1e-8)
+        aligned_t = phi_target * sign
+        raw_phi_mse = F.mse_loss(phi_pred, aligned_t)
 
-    return loss_omega + loss_zeta + loss_phi, loss_omega, loss_zeta, loss_phi
+    loss_phi = raw_phi_mse * phi_weight
+    return loss_omega + loss_zeta + loss_phi, loss_omega, loss_zeta, raw_phi_mse
 
 
 def frf_loss(frf_pred, frf_target):
-    # dB域 MSE: 压缩幅值动态范围, 避免共振峰非线爆炸
+    # dB域 MSE + CDF 横向引力
     amp_pred = torch.norm(frf_pred, dim=-1) + 1e-12
     amp_target = torch.norm(frf_target, dim=-1) + 1e-12
     loss_db = F.mse_loss(20 * torch.log10(amp_pred), 20 * torch.log10(amp_target))
 
-    # CDF Wasserstein: 共振峰横向牵引
     amp_pred_norm = amp_pred / amp_pred.sum(dim=-1, keepdim=True)
     amp_target_norm = amp_target / amp_target.sum(dim=-1, keepdim=True)
     cdf_pred = torch.cumsum(amp_pred_norm, dim=-1)
     cdf_target = torch.cumsum(amp_target_norm, dim=-1)
     loss_cdf = F.l1_loss(cdf_pred, cdf_target)
 
-    return loss_db + 50.0 * loss_cdf  # dB压制幅值爆炸, CDF横向对齐
+    return loss_db + 50.0 * loss_cdf
