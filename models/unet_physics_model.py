@@ -61,8 +61,8 @@ class MacroDecoder(nn.Module):
         self.n_modes = n_modes
         self.omega_max = omega_max
         self.mlp = nn.Sequential(
-            nn.Linear(hidden, 256), nn.ReLU(), nn.Dropout(0.1),
-            nn.Linear(256, 128), nn.ReLU(), nn.Dropout(0.1),
+            nn.Linear(hidden, 256), nn.ReLU(), nn.Dropout(0.3),
+            nn.Linear(256, 128), nn.ReLU(), nn.Dropout(0.3),
             nn.Linear(128, n_modes * 2),
         )
         nn.init.constant_(self.mlp[-1].bias[:n_modes], -2.0)  # sigmoid(-2)≈0.12→3000Hz
