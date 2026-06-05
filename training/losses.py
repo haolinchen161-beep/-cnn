@@ -11,8 +11,9 @@ def modal_loss(omega_pred, omega_target,
                omega_weight=200.0, zeta_weight=10.0, phi_weight=1.0):
     """模态参数损失。符号对齐MSE强制匹配振型绝对幅值。"""
 
-    loss_omega = torch.mean(((omega_pred - omega_target) / (omega_target + 1e-8))**2) * omega_weight
-    loss_zeta  = torch.mean(((zeta_pred - zeta_target) / (zeta_target + 1e-8))**2) * zeta_weight
+    mode_w = torch.tensor([1.0, 1.5, 2.0], device=omega_pred.device).unsqueeze(0)
+    loss_omega = torch.mean(((omega_pred - omega_target) / (omega_target + 1e-8))**2 * mode_w) * omega_weight
+    loss_zeta  = torch.mean(((zeta_pred - zeta_target) / (zeta_target + 1e-8))**2 * mode_w) * zeta_weight
 
     if batch_idx is not None:
         if phi_pred.dim() == 3:
@@ -52,4 +53,4 @@ def frf_loss(frf_pred, frf_target):
     cdf_target = torch.cumsum(amp_target_norm, dim=-1)
     loss_cdf = F.l1_loss(cdf_pred, cdf_target)
 
-    return loss_db + 50.0 * loss_cdf
+    return loss_db + 10.0 * loss_cdf  # CDF降权, dB照顾小峰
