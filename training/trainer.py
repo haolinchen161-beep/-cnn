@@ -46,7 +46,7 @@ def train(args, config, model_cfg, net, dataloader, optimizer,
     log_file = open(log_path, 'a', newline='')
     log_writer = csv.writer(log_file)
     if not log_exists:
-        log_writer.writerow(['轮次', '训练损失', 'ω相对误差%', 'ζ相对误差%', 'φ误差', '验证asinhMSE', '幅值MAE', '幅值MAPE%', '学习率'])
+        log_writer.writerow(['轮次', '训练损失', 'ω相对误差%', 'ζ相对误差%', 'φMSE', '验证MSE', '幅值MAE', '幅值MAPE%', '学习率'])
 
     phase2_unlocked = False
     unlock_epoch = start_epoch  # 防止断点续训报错
@@ -160,11 +160,11 @@ def train(args, config, model_cfg, net, dataloader, optimizer,
         wgt_p = np.mean(weighted_p_losses) if weighted_p_losses else 0
         omega_pct = raw_w * 100
         zeta_pct  = raw_z * 100
-        phi_pct = wgt_p * 100  # 1-MAC, 直接乘100
+        phi_mse = wgt_p if wgt_p > 0 else 0  # raw MSE (phi_weight=1)
         omega_share = wgt_w / mean_loss * 100 if mean_loss > 0 else 0
         zeta_share  = wgt_z / mean_loss * 100 if mean_loss > 0 else 0
-        phi_share   = wgt_p / mean_loss * 100 if mean_loss > 0 else 0
-        _log(f"Epoch {epoch:4d} | w={omega_pct:.1f}% z={zeta_pct:.1f}% phi={phi_pct:.1f}% | 占比 w{omega_share:.0f}% z{zeta_share:.0f}% phi{phi_share:.0f}% | total={mean_loss:.2e}", logger)
+        phi_share   = (wgt_p * 1.0) / mean_loss * 100 if mean_loss > 0 else 0
+        _log(f"Epoch {epoch:4d} | w={omega_pct:.1f}% z={zeta_pct:.1f}% phiMSE={phi_mse:.3f} | 占比 w{omega_share:.0f}% z{zeta_share:.0f}% phi{phi_share:.0f}% | total={mean_loss:.2e}", logger)
 
         # 动态解锁: ω误差 < 5.0% 即可, FRF 介入帮 ω 对齐共振峰
         # ω需<1% (半功率带宽~6Hz, 10Hz误差就跑偏)
@@ -183,11 +183,11 @@ def train(args, config, model_cfg, net, dataloader, optimizer,
                 val_results = evaluate(args, config, net, valloader, logger, epoch)
                 omega_mae = val_results.get("ω_MAE (rad/s)", -1)
                 _log(f"Epoch {epoch:4d} | ω_MAE={omega_mae:.1f} rad/s (Phase1: FRF metrics skipped)", logger)
-                log_writer.writerow([epoch, f'{mean_loss:.2e}', f'{omega_pct:.3f}', f'{zeta_pct:.3f}', f'{phi_pct:.2f}', '', '', '', f'{lr:.2e}'])
+                log_writer.writerow([epoch, f'{mean_loss:.2e}', f'{omega_pct:.3f}', f'{zeta_pct:.3f}', f'{phi_mse:.2f}', '', '', '', f'{lr:.2e}'])
             else:
                 val_results = evaluate(args, config, net, valloader, logger, epoch)
                 val_loss = val_results["loss (MSE)"]
-                log_writer.writerow([epoch, f'{mean_loss:.2e}', f'{omega_pct:.3f}', f'{zeta_pct:.3f}', f'{phi_pct:.2f}', f'{val_loss:.4f}',
+                log_writer.writerow([epoch, f'{mean_loss:.2e}', f'{omega_pct:.3f}', f'{zeta_pct:.3f}', f'{phi_mse:.2f}', f'{val_loss:.4f}',
                                      f'{val_results.get("Amplitude MAE", 0):.4f}',
                                      f'{val_results.get("Amplitude MAPE (%)", 0):.2f}',
                                      f'{lr:.2e}'])
@@ -208,7 +208,7 @@ def train(args, config, model_cfg, net, dataloader, optimizer,
                 save_model(args.dir, epoch, net, optimizer, best_metric)
                 lowest = best_metric
         else:
-            log_writer.writerow([epoch, f'{mean_loss:.2e}', f'{omega_pct:.3f}', f'{zeta_pct:.3f}', f'{phi_pct:.2f}', '', '', '', f'{lr:.2e}'])
+            log_writer.writerow([epoch, f'{mean_loss:.2e}', f'{omega_pct:.3f}', f'{zeta_pct:.3f}', f'{phi_mse:.2f}', '', '', '', f'{lr:.2e}'])
 
         if epoch == (total_epochs - 1):
             path = os.path.join(args.dir, "checkpoint_best")
