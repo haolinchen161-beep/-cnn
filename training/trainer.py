@@ -219,21 +219,12 @@ def train(args, config, model_cfg, net, dataloader, optimizer,
 
 
 def _apply_gradient_clip(net, config):
-    """分组件梯度裁剪 (GrooveTransFRF 专用)。"""
     grad_clip = config.get('optimizer', {}).get('gradient_clip')
     if grad_clip is None:
         return
-
-    # Transformer: max_norm=1.0 (注意力易大梯度)
-    _clip_module(net, 'encoder', config.get('optimizer', {}).get('gradient_clip_transolver', 3.0))
-    # head_phi (MLP): max_norm=5.0
-    _clip_module(net, 'head_phi', config.get('optimizer', {}).get('gradient_clip_head_phi', 5.0))
-    # Modal decoder + skip: max_norm=2.0
-    _clip_module(net, 'global_pool', config.get('optimizer', {}).get('gradient_clip_modal', 2.0))
-    _clip_module(net, 'macro_omega', config.get('optimizer', {}).get('gradient_clip_modal', 2.0))
-    _clip_module(net, 'micro_omega', config.get('optimizer', {}).get('gradient_clip_modal', 2.0))
-
-
+    _clip_module(net, 'encoder', 3.0)
+    _clip_module(net, 'micro_decoder', 5.0)
+    _clip_module(net, 'macro_decoder', 2.0)
 def _clip_module(net, prefix, max_norm):
     """按参数名前缀裁剪梯度。"""
     params = [p for name, p in net.named_parameters()
@@ -255,66 +246,54 @@ def _generate_preds(args, config, net, dataloader):
         predictions, outputs = [], []
         omega_errs = []
         for batch in dataloader:
-            geometry = batch['geometry'].to(args.device)
+            img = batch['image_tensor'].to(args.device)
+            coords = batch['query_coords'].to(args.device)
+            bt = batch['batch'].to(args.device)
             target = batch['point_frf']
             frequencies = batch['frequencies']
             phi_exc = batch.get('modal_phi_exc')
-            omega_true = batch.get('modal_omega')
+            omega_true = batch.get('modal_omega_phys')
 
-            # 可变F: 逐样本处理
             if isinstance(frequencies, list):
                 for i, freqs_i in enumerate(frequencies):
-                    gd_i = _extract_single_geometry(geometry, i)
+                    m = (bt == i)
+                    img_i = img[i:i+1]; c_i = coords[m].unsqueeze(0)
+                    bt_i = torch.zeros(m.sum(), dtype=torch.long, device=args.device)
                     pe_i = phi_exc[i:i+1].to(args.device) if phi_exc is not None else None
-                    # φ_exc符号对齐
                     if pe_i is not None:
                         with torch.no_grad():
-                            _, _, _, phi_scan = net(gd_i, freqs_i.unsqueeze(0).to(args.device), None)
-                        b_idx = batch_idx_t
-                        mask_i = (b_idx == i) if b_idx is not None else slice(None)
-                        dot = torch.sum(phi_scan.squeeze(0) * batch['modal_phi'].to(args.device)[mask_i], dim=0)
+                            _, _, _, phi_scan = net(img_i, c_i, freqs_i.unsqueeze(0).to(args.device), None, bt_i)
+                        dot = torch.sum(phi_scan.squeeze(0) * batch['modal_phi'].to(args.device)[m], dim=0)
                         pe_i = pe_i * torch.sign(dot + 1e-8).unsqueeze(0)
-                    result_i = net(gd_i, freqs_i.unsqueeze(0).to(args.device), pe_i)
-                    if isinstance(result_i, tuple):
-                        pred_i = result_i[0]  # 模型已输出 asinh 空间, 无需再变换
-                        omega_errs.append((result_i[1].cpu() - omega_true[i]).abs())
+                    r = net(img_i, c_i, freqs_i.unsqueeze(0).to(args.device), pe_i, bt_i)
+                    if isinstance(r, tuple):
+                        predictions.append(r[0].squeeze(0).cpu())
+                        if omega_true is not None:
+                            omega_errs.append((r[1].cpu() - omega_true[i]).abs())
                     else:
-                        pred_i = result_i
-                    predictions.append(pred_i.squeeze(0).cpu())
+                        predictions.append(r.squeeze(0).cpu())
                     outputs.append(target[i].cpu())
             else:
                 target = target.to(args.device)
                 frequencies = frequencies.to(args.device)
                 phi_exc = phi_exc.to(args.device) if phi_exc is not None else None
-                # φ_exc符号对齐
                 if phi_exc is not None:
                     with torch.no_grad():
-                        _, _, _, phi_scan = net(img, coords, frequencies, None, batch_idx_t)
+                        _, _, _, phi_scan = net(img, coords, frequencies, None, bt)
                     modal_phi = batch['modal_phi'].to(args.device)
                     phi_exc_c = phi_exc.clone()
-                    if batch_idx_t is not None:
-                        for i in range(int(batch_idx_t.max().item()) + 1):
-                            m = (batch_idx_t == i)
-                            dot = torch.sum(phi_scan[m] * modal_phi[m], dim=0)
-                            phi_exc_c[i] = phi_exc[i] * torch.sign(dot + 1e-8)
-                    else:
-                        # stacked: (B,N,...), phi_scan=(B*N,K), modal_phi=(B*N,K)
-                        B = phi_exc.shape[0]
-                        N_per = phi_scan.shape[0] // B
-                        phi_scan_view = phi_scan.view(B, N_per, -1)
-                        modal_phi_view = modal_phi.view(B, N_per, -1)
-                        for i in range(B):
-                            dot = torch.sum(phi_scan_view[i] * modal_phi_view[i], dim=0)
-                            phi_exc_c[i] = phi_exc[i] * torch.sign(dot + 1e-8)
+                    for i in range(int(bt.max().item()) + 1):
+                        m = (bt == i)
+                        dot = torch.sum(phi_scan[m] * modal_phi[m], dim=0)
+                        phi_exc_c[i] = phi_exc[i] * torch.sign(dot + 1e-8)
                     phi_exc = phi_exc_c
-                result = net(img, coords, frequencies, phi_exc, batch_idx_t)
-                if isinstance(result, tuple):
-                    prediction = result[0]  # 模型已输出 asinh 空间
+                r = net(img, coords, frequencies, phi_exc, bt)
+                if isinstance(r, tuple):
+                    prediction = r[0]
                     if omega_true is not None:
-                        omega_errs.append((result[1].detach().cpu() - omega_true).abs())
+                        omega_errs.append((r[1].detach().cpu() - omega_true).abs())
                 else:
-                    prediction = result
-                # 对齐形状: 预测永远是展平的 (total_N,...), target 可能是 (B,N,...)
+                    prediction = r
                 pred_out = prediction.detach().cpu()
                 tgt_out = target.detach().cpu()
                 if pred_out.ndim == 3 and tgt_out.ndim == 4:
@@ -326,25 +305,6 @@ def _generate_preds(args, config, net, dataloader):
         return torch.cat(predictions, dim=0), torch.cat(outputs, dim=0), omega_errs
     except RuntimeError:
         return predictions, outputs, omega_errs
-
-
-def _extract_single_geometry(geometry, idx):
-    """从批处理的geometry中提取第idx个样本."""
-    from models.geometry_data import GeometryData
-    batch_idx = batch_idx_t
-    if batch_idx is not None:
-        mask = batch_idx == idx
-        pts = geometry.points[mask].unsqueeze(0)
-        pf = geometry.point_features[mask].unsqueeze(0) if geometry.point_features is not None else None
-        return GeometryData(points=pts, point_features=pf)
-    else:
-        # stacked: (B, N, ...) → 取第idx个
-        pts = geometry.points[idx:idx+1]
-        pf = geometry.point_features[idx:idx+1] if geometry.point_features is not None else None
-        return GeometryData(points=pts, point_features=pf)
-
-
-def _evaluate(prediction, output, omega_errs, logger, epoch, verbose=True):
     """评估: asinh→物理空间, 计算幅值 MAE 和百分比 MAPE."""
     if isinstance(prediction, list):
         asinh_mse_vals = [F.mse_loss(p, o).item() for p, o in zip(prediction, output)]
@@ -381,6 +341,38 @@ def _evaluate(prediction, output, omega_errs, logger, epoch, verbose=True):
         for key, val in results.items():
             _log(f"{key} = {val:4.4f}" if isinstance(val, float) else f"{key} = {val:4.4}", logger)
 
+    return results
+
+
+def _evaluate(prediction, output, omega_errs, logger, epoch, verbose=True):
+    if isinstance(prediction, list):
+        asinh_mse_vals = [F.mse_loss(p, o).item() for p, o in zip(prediction, output)]
+        results = {"loss (asinh-MSE)": np.mean(asinh_mse_vals)}
+        mae_list, mape_list = [], []
+        for p_asinh, o_asinh in zip(prediction, output):
+            p_phys = torch.sinh(p_asinh); o_phys = torch.sinh(o_asinh)
+            p_amp = torch.sqrt(p_phys[..., 0]**2 + p_phys[..., 1]**2 + 1e-8)
+            o_amp = torch.sqrt(o_phys[..., 0]**2 + o_phys[..., 1]**2 + 1e-8)
+            mae_list.append(F.l1_loss(p_amp, o_amp).item())
+            mape_list.append((torch.abs(p_amp - o_amp) / (o_amp + 1e-6)).mean().item() * 100.0)
+        results["Amplitude MAE"] = np.mean(mae_list)
+        results["Amplitude MAPE (%)"] = np.mean(mape_list)
+    else:
+        results = {}
+        if prediction.shape != output.shape:
+            output = output.reshape(prediction.shape)
+        results["loss (asinh-MSE)"] = F.mse_loss(prediction, output).item()
+        if prediction.ndim >= 3 and prediction.shape[-1] == 2:
+            p_phys = torch.sinh(prediction); o_phys = torch.sinh(output)
+            p_amp = torch.sqrt(p_phys[..., 0]**2 + p_phys[..., 1]**2 + 1e-8)
+            o_amp = torch.sqrt(o_phys[..., 0]**2 + o_phys[..., 1]**2 + 1e-8)
+            results["Amplitude MAE"] = F.l1_loss(p_amp, o_amp).item()
+            results["Amplitude MAPE (%)"] = (torch.abs(p_amp - o_amp) / (o_amp + 1e-6)).mean().item() * 100.0
+    if omega_errs:
+        results["ω_MAE (rad/s)"] = torch.cat([e.flatten() for e in omega_errs]).mean().item()
+    if verbose:
+        for key, val in results.items():
+            _log(f"{key} = {val:4.4f}" if isinstance(val, float) else f"{key} = {val:4.4}", logger)
     return results
 
 
