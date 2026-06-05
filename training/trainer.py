@@ -183,7 +183,7 @@ def train(args, config, model_cfg, net, dataloader, optimizer,
                 log_writer.writerow([epoch, f'{mean_loss:.2e}', f'{omega_pct:.3f}', f'{zeta_pct:.3f}', f'{phi_pct:.2f}', '', '', '', f'{lr:.2e}'])
             else:
                 val_results = evaluate(args, config, net, valloader, logger, epoch)
-                val_loss = val_results["loss (asinh-MSE)"]
+                val_loss = val_results["loss (MSE)"]
                 log_writer.writerow([epoch, f'{mean_loss:.2e}', f'{omega_pct:.3f}', f'{zeta_pct:.3f}', f'{phi_pct:.2f}', f'{val_loss:.4f}',
                                      f'{val_results.get("Amplitude MAE", 0):.4f}',
                                      f'{val_results.get("Amplitude MAPE (%)", 0):.2f}',
@@ -191,7 +191,7 @@ def train(args, config, model_cfg, net, dataloader, optimizer,
             log_file.flush()
             use_val_metric = not in_phase1
             if use_val_metric:
-                val_loss = val_results["loss (asinh-MSE)"]
+                val_loss = val_results["loss (MSE)"]
                 best_metric = val_loss
                 metric_name = "val_loss"
                 fmt = ".6f"
@@ -270,7 +270,7 @@ def _generate_preds(args, config, net, dataloader):
                     if isinstance(r, tuple):
                         predictions.append(r[0].squeeze(0).cpu())
                         if omega_true is not None:
-                            omega_errs.append((r[1].cpu() - omega_true[i]).abs())
+                            omega_errs.append((r[1].cpu() * 25000.0 - omega_true[i]).abs())
                     else:
                         predictions.append(r.squeeze(0).cpu())
                     outputs.append(target[i].cpu())
@@ -292,7 +292,7 @@ def _generate_preds(args, config, net, dataloader):
                 if isinstance(r, tuple):
                     prediction = r[0]
                     if omega_true is not None:
-                        omega_errs.append((r[1].detach().cpu() - omega_true).abs())
+                        omega_errs.append((r[1].detach().cpu() * 25000.0 - omega_true).abs())
                 else:
                     prediction = r
                 pred_out = prediction.detach().cpu()
@@ -309,7 +309,7 @@ def _generate_preds(args, config, net, dataloader):
     """评估: asinh→物理空间, 计算幅值 MAE 和百分比 MAPE."""
     if isinstance(prediction, list):
         asinh_mse_vals = [F.mse_loss(p, o).item() for p, o in zip(prediction, output)]
-        results = {"loss (asinh-MSE)": np.mean(asinh_mse_vals)}
+        results = {"loss (MSE)": np.mean(asinh_mse_vals)}
         mae_list, mape_list = [], []
         for p_asinh, o_asinh in zip(prediction, output):
             p_phys = p_asinh  # FRF已是线性物理量
@@ -325,7 +325,7 @@ def _generate_preds(args, config, net, dataloader):
         # 兜底: 确保 prediction 和 output 形状一致
         if prediction.shape != output.shape:
             output = output.reshape(prediction.shape)
-        results["loss (asinh-MSE)"] = F.mse_loss(prediction, output).item()
+        results["loss (MSE)"] = F.mse_loss(prediction, output).item()
         if prediction.ndim >= 3 and prediction.shape[-1] == 2:
             p_phys = prediction
             o_phys = output
@@ -348,7 +348,7 @@ def _generate_preds(args, config, net, dataloader):
 def _evaluate(prediction, output, omega_errs, logger, epoch, verbose=True):
     if isinstance(prediction, list):
         asinh_mse_vals = [F.mse_loss(p, o).item() for p, o in zip(prediction, output)]
-        results = {"loss (asinh-MSE)": np.mean(asinh_mse_vals)}
+        results = {"loss (MSE)": np.mean(asinh_mse_vals)}
         mae_list, mape_list = [], []
         for p_asinh, o_asinh in zip(prediction, output):
             p_phys = p_asinh  # FRF已是线性物理量; o_phys = o_asinh
@@ -362,7 +362,7 @@ def _evaluate(prediction, output, omega_errs, logger, epoch, verbose=True):
         results = {}
         if prediction.shape != output.shape:
             output = output.reshape(prediction.shape)
-        results["loss (asinh-MSE)"] = F.mse_loss(prediction, output).item()
+        results["loss (MSE)"] = F.mse_loss(prediction, output).item()
         if prediction.ndim >= 3 and prediction.shape[-1] == 2:
             p_phys = prediction; o_phys = output
             p_amp = torch.sqrt(p_phys[..., 0]**2 + p_phys[..., 1]**2 + 1e-8)
