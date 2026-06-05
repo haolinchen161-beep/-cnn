@@ -52,7 +52,7 @@ def main():
                 phi_exc_t = phi_exc_t * torch.sign(dot + 1e-8)
             frf_p, _, _, _ = net(gd, sn['frequencies'].unsqueeze(0).to(device), phi_exc_t)
         p = torch.clamp(frf_p.squeeze(0).cpu(), -5000, 5000)
-        t = testset_raw.undo_normalize(sn['point_frf'])
+        t = sr['point_frf']
         all_preds.append(torch.sqrt(p[...,0]**2+p[...,1]**2+1e-8).numpy())
         all_targets.append(torch.sqrt(t[...,0]**2+t[...,1]**2+1e-8).numpy())
 
