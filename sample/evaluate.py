@@ -74,7 +74,7 @@ def main():
         p = torch.clamp(frf_p, -5000, 5000)
         t = s_raw['point_frf']  # 已是物理空间, 无需 undo_normalize
 
-        omega_errs.append((op.cpu() - s_norm['modal_omega']).abs())
+        omega_errs.append((op.cpu() * 25000.0 - s_norm['modal_omega_phys']).abs())
         zeta_errs.append((zp.cpu() - s_norm['modal_zeta']).abs())
 
         all_preds.append(torch.sqrt(p[...,0]**2+p[...,1]**2+1e-8).numpy())
