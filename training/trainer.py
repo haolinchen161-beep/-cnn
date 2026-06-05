@@ -49,6 +49,7 @@ def train(args, config, model_cfg, net, dataloader, optimizer,
         log_writer.writerow(['轮次', '训练损失', 'ω相对误差%', 'ζ相对误差%', 'φ误差', '验证asinhMSE', '幅值MAE', '幅值MAPE%', '学习率'])
 
     phase2_unlocked = False
+    unlock_epoch = start_epoch  # 防止断点续训报错
 
     try:
       for epoch in range(start_epoch, total_epochs):
@@ -311,8 +312,8 @@ def _generate_preds(args, config, net, dataloader):
         results = {"loss (asinh-MSE)": np.mean(asinh_mse_vals)}
         mae_list, mape_list = [], []
         for p_asinh, o_asinh in zip(prediction, output):
-            p_phys = torch.sinh(p_asinh)
-            o_phys = torch.sinh(o_asinh)
+            p_phys = p_asinh  # FRF已是线性物理量
+            o_phys = o_asinh
             p_amp = torch.sqrt(p_phys[..., 0]**2 + p_phys[..., 1]**2 + 1e-8)
             o_amp = torch.sqrt(o_phys[..., 0]**2 + o_phys[..., 1]**2 + 1e-8)
             mae_list.append(F.l1_loss(p_amp, o_amp).item())
@@ -326,8 +327,8 @@ def _generate_preds(args, config, net, dataloader):
             output = output.reshape(prediction.shape)
         results["loss (asinh-MSE)"] = F.mse_loss(prediction, output).item()
         if prediction.ndim >= 3 and prediction.shape[-1] == 2:
-            p_phys = torch.sinh(prediction)
-            o_phys = torch.sinh(output)
+            p_phys = prediction
+            o_phys = output
             p_amp = torch.sqrt(p_phys[..., 0]**2 + p_phys[..., 1]**2 + 1e-8)
             o_amp = torch.sqrt(o_phys[..., 0]**2 + o_phys[..., 1]**2 + 1e-8)
             results["Amplitude MAE"] = F.l1_loss(p_amp, o_amp).item()
@@ -350,7 +351,7 @@ def _evaluate(prediction, output, omega_errs, logger, epoch, verbose=True):
         results = {"loss (asinh-MSE)": np.mean(asinh_mse_vals)}
         mae_list, mape_list = [], []
         for p_asinh, o_asinh in zip(prediction, output):
-            p_phys = torch.sinh(p_asinh); o_phys = torch.sinh(o_asinh)
+            p_phys = p_asinh  # FRF已是线性物理量; o_phys = o_asinh
             p_amp = torch.sqrt(p_phys[..., 0]**2 + p_phys[..., 1]**2 + 1e-8)
             o_amp = torch.sqrt(o_phys[..., 0]**2 + o_phys[..., 1]**2 + 1e-8)
             mae_list.append(F.l1_loss(p_amp, o_amp).item())
@@ -363,7 +364,7 @@ def _evaluate(prediction, output, omega_errs, logger, epoch, verbose=True):
             output = output.reshape(prediction.shape)
         results["loss (asinh-MSE)"] = F.mse_loss(prediction, output).item()
         if prediction.ndim >= 3 and prediction.shape[-1] == 2:
-            p_phys = torch.sinh(prediction); o_phys = torch.sinh(output)
+            p_phys = prediction; o_phys = output
             p_amp = torch.sqrt(p_phys[..., 0]**2 + p_phys[..., 1]**2 + 1e-8)
             o_amp = torch.sqrt(o_phys[..., 0]**2 + o_phys[..., 1]**2 + 1e-8)
             results["Amplitude MAE"] = F.l1_loss(p_amp, o_amp).item()
