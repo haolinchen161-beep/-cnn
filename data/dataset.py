@@ -58,43 +58,28 @@ class GeometricHDF5Dataset(Dataset):
         E_val = point_features[0, 0]
         rho_val = point_features[0, 2]
 
-        # 像素坐标: X_pix = int(X * 1000), Y_pix = int(Y * 1000)
+        # 像素坐标
         X_pix = (X * 1000).long().clamp(0, L_MM - 1)
         Y_pix = (Y * 1000).long().clamp(0, W_MM - 1)
+        pix_idx = Y_pix * L_MM + X_pix  # 1D index
 
-        # 初始化 6 通道图像
-        img = torch.zeros(6, W_MM, L_MM, dtype=torch.float32)
+        img = torch.zeros(6, W_MM * L_MM, dtype=torch.float32)
 
-        # Ch0: Z/H, 每像素取最大值
-        img_ch0 = torch.full((W_MM, L_MM), -1.0, dtype=torch.float32)
-        for n in range(len(points)):
-            xp, yp = X_pix[n].item(), Y_pix[n].item()
-            if Z_H[n] > img_ch0[yp, xp]:
-                img_ch0[yp, xp] = Z_H[n]
-        img[0] = img_ch0.clamp(0, 1)
+        # Ch0: Z/H max per pixel (向量化scatter)
+        img[0].scatter_reduce_(0, pix_idx, Z_H, reduce='amax')
+        # Ch1: is_fixed max per pixel
+        img[1].scatter_reduce_(0, pix_idx, is_fixed, reduce='amax')
+        # Ch2-3: 仅弹簧节点 (logK>0)
+        spring_mask = logK > 0
+        if spring_mask.any():
+            img[2].scatter_reduce_(0, pix_idx[spring_mask], logK[spring_mask], reduce='amax')
+            img[3].scatter_reduce_(0, pix_idx[spring_mask], logC[spring_mask], reduce='amax')
 
-        # Ch1: is_fixed, per-pixel max
-        for n in range(len(points)):
-            xp, yp = X_pix[n].item(), Y_pix[n].item()
-            img[1, yp, xp] = max(img[1, yp, xp].item(), is_fixed[n].item())
-
-        # Ch2: log10(K), spring nodes only
-        for n in range(len(points)):
-            if logK[n] > 0:
-                xp, yp = X_pix[n].item(), Y_pix[n].item()
-                img[2, yp, xp] = max(img[2, yp, xp].item(), logK[n].item())
-
-        # Ch3: log10(C), spring nodes only
-        for n in range(len(points)):
-            if logC[n] > 0:
-                xp, yp = X_pix[n].item(), Y_pix[n].item()
-                img[3, yp, xp] = max(img[3, yp, xp].item(), logC[n].item())
-
-        # Ch4-5: 全局材料常数
+        # Ch4-5: 全局材料
         img[4] = E_val
         img[5] = rho_val
 
-        return img
+        return img.view(6, W_MM, L_MM)
 
     def __len__(self):
         return len(self._samples)
