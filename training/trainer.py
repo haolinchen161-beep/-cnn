@@ -62,7 +62,7 @@ def train(args, config, model_cfg, net, dataloader, optimizer,
 
         # ---- 阶段切换 ----
         if in_phase1 and epoch == 0:
-            _log("=== 阶段1: 全解冻纯模态, ω<1% 或 epoch>600 解锁 FRF ===", logger)
+            _log("=== 阶段1: 全解冻纯模态, ω<1% 或 epoch>1000 解锁 FRF ===", logger)
         elif in_phase2 and epoch > 0 and not getattr(net, '_phase2_logged', False):
             _log(f"=== 阶段2: FRF 联合训练 (第 {epoch} 轮解锁) ===", logger)
             net._phase2_logged = True
@@ -168,8 +168,8 @@ def train(args, config, model_cfg, net, dataloader, optimizer,
 
         # 动态解锁: ω误差 < 5.0% 即可, FRF 介入帮 ω 对齐共振峰
         # ω需<1% (半功率带宽~6Hz, 10Hz误差就跑偏)
-        if not phase2_unlocked and (omega_pct < 1.0 or epoch > 600):
-            trigger = 'ω<1%' if omega_pct < 1.0 else f'epoch>{600}'
+        if not phase2_unlocked and (omega_pct < 1.0 or epoch > 1000):
+            trigger = 'ω<1%' if omega_pct < 1.0 else f'epoch>{1000}'
             phase2_unlocked = True
             unlock_epoch = epoch
             _log(f">>> {trigger} 动态解锁 Phase2! <<<", logger)
