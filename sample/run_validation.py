@@ -31,7 +31,7 @@ CONFIG = {
 
     'optimizer': {
         'name': 'AdamW',
-        'kwargs': {'lr': 0.0005, 'weight_decay': 0.00008, 'betas': (0.9, 0.999)},
+        'kwargs': {'lr': 0.001, 'weight_decay': 0.0001, 'betas': (0.9, 0.999)},
         'gradient_clip': 2.0,
         'gradient_clip_transolver': 3.0,
         'gradient_clip_head_phi': 5.0,
@@ -105,7 +105,7 @@ def main():
     # 初始Loss
     print("\n--- Step 4: Initial Loss ---")
     with torch.no_grad():
-        init_loss, _, _, _ = modal_loss(op, batch['modal_omega'].to(args.device),
+        init_loss, _, _, _ = modal_loss(op, batch['modal_omega_norm'].to(args.device),
             zp, batch['modal_zeta'].to(args.device),
             pp, batch['modal_phi'].to(args.device), batch_idx=batch_idx)
     print(f"  Init loss: {init_loss.item():.0f}")
