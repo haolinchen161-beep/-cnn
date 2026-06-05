@@ -30,6 +30,7 @@ def modal_loss(omega_pred, omega_target,
             raw_phi_mse += F.mse_loss(p_p, aligned_t)
         raw_phi_mse = raw_phi_mse / num_graphs
     else:
+        # phi: [B,N,K], dim=1求和于节点维度, 符号 [B,1,K]
         dot = torch.sum(phi_pred * phi_target, dim=1, keepdim=True)
         sign = torch.sign(dot + 1e-8)
         aligned_t = phi_target * sign
