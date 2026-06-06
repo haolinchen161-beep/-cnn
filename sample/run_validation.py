@@ -17,8 +17,10 @@ CONFIG = {
 
     # 两阶段
     'phase1_epochs': 300,    # CNN收敛快, 300轮够
-    'frf_loss_weight': 50.0,
-    'zeta_loss_weight': 0.0,
+    'frf_loss_weight': 0.05,      # FRF预热目标权重
+    'omega_loss_weight': 200.0,    # ω 损失权重
+    'zeta_loss_weight': 10.0,      # ζ 损失权重
+    'phi_loss_weight': 100.0,      # φ 损失权重
 
     'freq_min': 1.0, 'freq_max': 5000.0,
     'data_path_train': ['train.h5'],
