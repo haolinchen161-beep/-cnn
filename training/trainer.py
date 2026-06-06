@@ -32,7 +32,7 @@ def train(args, config, model_cfg, net, dataloader, optimizer,
 
     total_epochs = config.get('epochs', 2000)
 
-    frf_weight = config.get('frf_loss_weight', 50.0)
+    frf_weight = config.get('frf_loss_weight', 0.05)
 
     # 损失日志
     import csv
@@ -311,43 +311,6 @@ def _generate_preds(args, config, net, dataloader):
         return torch.cat(predictions, dim=0), torch.cat(outputs, dim=0), omega_errs
     except RuntimeError:
         return predictions, outputs, omega_errs
-    """评估: asinh→物理空间, 计算幅值 MAE 和百分比 MAPE."""
-    if isinstance(prediction, list):
-        asinh_mse_vals = [F.mse_loss(p, o).item() for p, o in zip(prediction, output)]
-        results = {"loss (MSE)": np.mean(asinh_mse_vals)}
-        mae_list, mape_list = [], []
-        for p_asinh, o_asinh in zip(prediction, output):
-            p_phys = p_asinh  # FRF已是线性物理量
-            o_phys = o_asinh
-            p_amp = torch.sqrt(p_phys[..., 0]**2 + p_phys[..., 1]**2 + 1e-8)
-            o_amp = torch.sqrt(o_phys[..., 0]**2 + o_phys[..., 1]**2 + 1e-8)
-            mae_list.append(F.l1_loss(p_amp, o_amp).item())
-            mape_list.append((torch.abs(p_amp - o_amp) / (o_amp + 1e-6)).mean().item() * 100.0)
-        results["Amplitude MAE"] = np.mean(mae_list)
-        results["Amplitude MAPE (%)"] = np.mean(mape_list)
-    else:
-        results = {}
-        # 兜底: 确保 prediction 和 output 形状一致
-        if prediction.shape != output.shape:
-            output = output.reshape(prediction.shape)
-        results["loss (MSE)"] = F.mse_loss(prediction, output).item()
-        if prediction.ndim >= 3 and prediction.shape[-1] == 2:
-            p_phys = prediction
-            o_phys = output
-            p_amp = torch.sqrt(p_phys[..., 0]**2 + p_phys[..., 1]**2 + 1e-8)
-            o_amp = torch.sqrt(o_phys[..., 0]**2 + o_phys[..., 1]**2 + 1e-8)
-            results["Amplitude MAE"] = F.l1_loss(p_amp, o_amp).item()
-            results["Amplitude MAPE (%)"] = (torch.abs(p_amp - o_amp) / (o_amp + 1e-6)).mean().item() * 100.0
-
-    # ω误差
-    if omega_errs:
-        results["ω_MAE (rad/s)"] = torch.cat([e.flatten() for e in omega_errs]).mean().item()
-
-    if verbose:
-        for key, val in results.items():
-            _log(f"{key} = {val:4.4f}" if isinstance(val, float) else f"{key} = {val:4.4}", logger)
-
-    return results
 
 
 def _evaluate(prediction, output, omega_errs, logger, epoch, verbose=True):
