@@ -13,7 +13,6 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 from .losses import modal_loss, frf_loss
-from .augmentations import create_augmenter
 
 
 def train(args, config, model_cfg, net, dataloader, optimizer,
@@ -34,9 +33,6 @@ def train(args, config, model_cfg, net, dataloader, optimizer,
     total_epochs = config.get('epochs', 2000)
 
     frf_weight = config.get('frf_loss_weight', 50.0)
-
-    # 数据增强器
-    augmenter = create_augmenter(config)
 
     # 损失日志
     import csv
@@ -70,11 +66,6 @@ def train(args, config, model_cfg, net, dataloader, optimizer,
 
         for batch in dataloader:
             optimizer.zero_grad()
-
-            # 数据增强
-            if augmenter is not None:
-                augmenter.train()
-                batch = augmenter(batch)
 
             img = batch['image_tensor'].to(args.device)
             coords = batch['query_coords'].to(args.device)
@@ -114,7 +105,10 @@ def train(args, config, model_cfg, net, dataloader, optimizer,
                         omega_pred, batch['modal_omega_norm'].to(args.device),
                         zeta_pred, batch['modal_zeta'].to(args.device),
                         phi_pred, batch['modal_phi'].to(args.device),
-                        batch_idx=batch_idx_t)
+                        batch_idx=batch_idx_t,
+                        omega_weight=config.get('omega_loss_weight', 200.0),
+                        zeta_weight=config.get('zeta_loss_weight', 10.0),
+                        phi_weight=config.get('phi_loss_weight', 100.0))
                     raw_frf = frf_loss(frf_pred, batch['point_frf'].to(args.device))
                     phase2_ep = epoch - unlock_epoch
                     current_frf_w = 0.05 * min(1.0, phase2_ep / 20.0)  # 预热20轮, 目标0.05
@@ -125,7 +119,10 @@ def train(args, config, model_cfg, net, dataloader, optimizer,
                         omega_pred, batch['modal_omega_norm'].to(args.device),
                         zeta_pred, batch['modal_zeta'].to(args.device),
                         phi_pred, batch['modal_phi'].to(args.device),
-                        batch_idx=batch_idx_t)
+                        batch_idx=batch_idx_t,
+                        omega_weight=config.get('omega_loss_weight', 200.0),
+                        zeta_weight=config.get('zeta_loss_weight', 10.0),
+                        phi_weight=config.get('phi_loss_weight', 100.0))
                     loss = loss_m
 
             losses.append(loss.detach().cpu().item())
