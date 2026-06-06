@@ -39,8 +39,8 @@ class CNNEncoder(nn.Module):
         self.conv2 = nn.Sequential(nn.Conv2d(32, 64, 3, stride=2, padding=1), nn.BatchNorm2d(64), nn.ReLU())
         self.conv3 = nn.Sequential(nn.Conv2d(64, 128, 3, stride=2, padding=1), nn.BatchNorm2d(128), nn.ReLU())
         self.conv4 = nn.Sequential(nn.Conv2d(128, 256, 3, stride=2, padding=1), nn.BatchNorm2d(256), nn.ReLU())
-        self.pool = nn.AdaptiveAvgPool2d(1)
-        self.fc = nn.Linear(256, hidden)
+        self.pool = nn.AdaptiveAvgPool2d((2, 2))  # 保留 2×2 空间网格，不压成 1×1
+        self.fc = nn.Linear(256 * 4, hidden)      # 256 通道 × 4 个空间位置
 
     def forward(self, x):
         f1 = self.conv1(x)  # [B,32,30,80]
@@ -60,8 +60,9 @@ class MacroDecoder(nn.Module):
         self.omega_max = omega_max
         input_dim = hidden  # 512
         self.mlp = nn.Sequential(
-            nn.Linear(input_dim, 256), nn.GELU(), nn.Dropout(0.2),
-            nn.Linear(256, 128), nn.GELU(), nn.Dropout(0.2),
+            nn.Linear(input_dim, 512), nn.GELU(), nn.Dropout(0.1),   # 加宽：256→512
+            nn.Linear(512, 256), nn.GELU(), nn.Dropout(0.1),          # 加深一层
+            nn.Linear(256, 128), nn.GELU(),
             nn.Linear(128, n_modes * 2),
         )
         nn.init.constant_(self.mlp[-1].bias[:n_modes], -2.0)  # sigmoid(-2)≈0.12→3000Hz
