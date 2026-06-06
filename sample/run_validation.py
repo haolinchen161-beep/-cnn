@@ -137,7 +137,7 @@ def main():
     results = evaluate(args, CONFIG, net, testloader, verbose=True)
     print(f"\n{'='*60}")
     print(f"Done | Device:{args.device} | Params:{total_params:,} | Time:{elapsed:.0f}s")
-    print(f"Test MSE:{results.get('loss (asinh-MSE)', -1):.4f}")
+    print(f"Test MSE:{results.get('loss (MSE)', -1):.4f}")
     return 0
 
 
