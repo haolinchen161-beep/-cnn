@@ -52,16 +52,15 @@ class CNNEncoder(nn.Module):
 
 
 class MacroDecoder(nn.Module):
-    """宏观参数 MLP: 512 → ω[B,K] + ζ[B,K]
-    ω 输出归一化 [0,1], 使用时 ×omega_max 还原。
-    """
+    """宏观参数 MLP: latent+skip_pools → ω[B,K] + ζ[B,K]"""
 
     def __init__(self, hidden=512, n_modes=3, omega_max=25000.0):
         super().__init__()
         self.n_modes = n_modes
         self.omega_max = omega_max
+        input_dim = hidden  # 512
         self.mlp = nn.Sequential(
-            nn.Linear(hidden, 256), nn.GELU(), nn.Dropout(0.2),
+            nn.Linear(input_dim, 256), nn.GELU(), nn.Dropout(0.2),
             nn.Linear(256, 128), nn.GELU(), nn.Dropout(0.2),
             nn.Linear(128, n_modes * 2),
         )
@@ -79,7 +78,7 @@ class MicroDecoder(nn.Module):
 
     def __init__(self, hidden=512, n_modes=3):
         super().__init__()
-        self.fc_up = nn.Linear(hidden, 256 * 4 * 10)  # -> f4 尺寸 [B,256,4,10]
+        self.fc_up = nn.Linear(hidden, 256 * 8 * 20)  # -> f3 尺寸 [B,256,8,20]
 
         self.up3 = nn.Sequential(nn.Conv2d(256 + 128, 128, 3, padding=1), nn.BatchNorm2d(128), nn.GELU())
         self.up2 = nn.Sequential(nn.Conv2d(128 + 64, 64, 3, padding=1), nn.BatchNorm2d(64), nn.GELU())
@@ -88,7 +87,7 @@ class MicroDecoder(nn.Module):
 
     def forward(self, latent, skips):
         f1, f2, f3, f4 = skips
-        x = self.fc_up(latent).view(-1, 256, 4, 10)
+        x = self.fc_up(latent).view(-1, 256, 8, 20)
 
         x = F.interpolate(x, size=f3.shape[2:], mode='bilinear', align_corners=False)
         x = self.up3(torch.cat([x, f3], dim=1))
