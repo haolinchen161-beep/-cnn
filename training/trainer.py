@@ -163,7 +163,7 @@ def train(args, config, model_cfg, net, dataloader, optimizer,
         phi_mse = wgt_p if wgt_p > 0 else 0  # raw MSE (phi_weight=1)
         omega_share = wgt_w / mean_loss * 100 if mean_loss > 0 else 0
         zeta_share  = wgt_z / mean_loss * 100 if mean_loss > 0 else 0
-        phi_share   = (wgt_p * 1.0) / mean_loss * 100 if mean_loss > 0 else 0
+        phi_share   = (wgt_p * 100.0) / mean_loss * 100 if mean_loss > 0 else 0
         frf_s = 0 if in_phase1 else (100 - omega_share - zeta_share - phi_share)
         _log(f"Epoch {epoch:4d} | w={omega_pct:.1f}% z={zeta_pct:.1f}% phiMSE={phi_mse:.3f} | 占比 w{omega_share:.0f}% z{zeta_share:.0f}% phi{phi_share:.0f}% frf{frf_s:.0f}% | total={mean_loss:.2e}", logger)
 
