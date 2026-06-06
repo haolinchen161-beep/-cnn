@@ -46,7 +46,7 @@ def train(args, config, model_cfg, net, dataloader, optimizer,
     log_file = open(log_path, 'a', newline='')
     log_writer = csv.writer(log_file)
     if not log_exists:
-        log_writer.writerow(['轮次', '训练损失', 'ω相对误差%', 'ζ相对误差%', 'φMSE', '验证MSE', '幅值MAE', '幅值MAPE%', '学习率'])
+        log_writer.writerow(['轮次', '训练损失', 'ω%', 'ζ%', 'φMSE', 'w占比%', 'z占比%', 'phi占比%', 'FRF占比%', '验证MSE', '幅值MAE', '幅值MAPE%', '学习率'])
 
     phase2_unlocked = False
     unlock_epoch = start_epoch  # 防止断点续训报错
@@ -62,7 +62,7 @@ def train(args, config, model_cfg, net, dataloader, optimizer,
 
         # ---- 阶段切换 ----
         if in_phase1 and epoch == 0:
-            _log("=== 阶段1: 全解冻纯模态, ω<1% 或 epoch>1000 解锁 FRF ===", logger)
+            _log("=== 阶段1: 全解冻纯模态, ω<0.5% 或 epoch>1000 解锁 FRF ===", logger)
         elif in_phase2 and epoch > 0 and not getattr(net, '_phase2_logged', False):
             _log(f"=== 阶段2: FRF 联合训练 (第 {epoch} 轮解锁) ===", logger)
             net._phase2_logged = True
@@ -164,12 +164,12 @@ def train(args, config, model_cfg, net, dataloader, optimizer,
         omega_share = wgt_w / mean_loss * 100 if mean_loss > 0 else 0
         zeta_share  = wgt_z / mean_loss * 100 if mean_loss > 0 else 0
         phi_share   = (wgt_p * 1.0) / mean_loss * 100 if mean_loss > 0 else 0
-        _log(f"Epoch {epoch:4d} | w={omega_pct:.1f}% z={zeta_pct:.1f}% phiMSE={phi_mse:.3f} | 占比 w{omega_share:.0f}% z{zeta_share:.0f}% phi{phi_share:.0f}% | total={mean_loss:.2e}", logger)
+        frf_s = 0 if in_phase1 else (100 - omega_share - zeta_share - phi_share)
+        _log(f"Epoch {epoch:4d} | w={omega_pct:.1f}% z={zeta_pct:.1f}% phiMSE={phi_mse:.3f} | 占比 w{omega_share:.0f}% z{zeta_share:.0f}% phi{phi_share:.0f}% frf{frf_s:.0f}% | total={mean_loss:.2e}", logger)
 
-        # 动态解锁: ω误差 < 5.0% 即可, FRF 介入帮 ω 对齐共振峰
-        # ω需<1% (半功率带宽~6Hz, 10Hz误差就跑偏)
-        if not phase2_unlocked and (omega_pct < 1.0 or epoch > 1000):
-            trigger = 'ω<1%' if omega_pct < 1.0 else f'epoch>{1000}'
+        # 动态解锁: ω误差 < 0.5% 才进入Phase 2
+        if not phase2_unlocked and (omega_pct < 0.5 or epoch > 1000):
+            trigger = 'ω<0.5%' if omega_pct < 0.5 else f'epoch>{1000}'
             phase2_unlocked = True
             unlock_epoch = epoch
             _log(f">>> {trigger} 动态解锁 Phase2! <<<", logger)
@@ -183,11 +183,12 @@ def train(args, config, model_cfg, net, dataloader, optimizer,
                 val_results = evaluate(args, config, net, valloader, logger, epoch)
                 omega_mae = val_results.get("ω_MAE (rad/s)", -1)
                 _log(f"Epoch {epoch:4d} | ω_MAE={omega_mae:.1f} rad/s (Phase1: FRF metrics skipped)", logger)
-                log_writer.writerow([epoch, f'{mean_loss:.2e}', f'{omega_pct:.3f}', f'{zeta_pct:.3f}', f'{phi_mse:.2f}', '', '', '', f'{lr:.2e}'])
+                log_writer.writerow([epoch, f'{mean_loss:.2e}', f'{omega_pct:.3f}', f'{zeta_pct:.3f}', f'{phi_mse:.2f}', f'{omega_share:.1f}', f'{zeta_share:.1f}', f'{phi_share:.1f}', '0', '', '', '', f'{lr:.2e}'])
             else:
                 val_results = evaluate(args, config, net, valloader, logger, epoch)
                 val_loss = val_results["loss (MSE)"]
-                log_writer.writerow([epoch, f'{mean_loss:.2e}', f'{omega_pct:.3f}', f'{zeta_pct:.3f}', f'{phi_mse:.2f}', f'{val_loss:.4f}',
+                frf_share = 100 - omega_share - zeta_share - phi_share
+                log_writer.writerow([epoch, f'{mean_loss:.2e}', f'{omega_pct:.3f}', f'{zeta_pct:.3f}', f'{phi_mse:.2f}', f'{omega_share:.1f}', f'{zeta_share:.1f}', f'{phi_share:.1f}', f'{frf_share:.1f}', f'{val_loss:.4f}',
                                      f'{val_results.get("Amplitude MAE", 0):.4f}',
                                      f'{val_results.get("Amplitude MAPE (%)", 0):.2f}',
                                      f'{lr:.2e}'])
@@ -208,7 +209,8 @@ def train(args, config, model_cfg, net, dataloader, optimizer,
                 save_model(args.dir, epoch, net, optimizer, best_metric)
                 lowest = best_metric
         else:
-            log_writer.writerow([epoch, f'{mean_loss:.2e}', f'{omega_pct:.3f}', f'{zeta_pct:.3f}', f'{phi_mse:.2f}', '', '', '', f'{lr:.2e}'])
+            frf_s = 0 if in_phase1 else (100 - omega_share - zeta_share - phi_share)
+            log_writer.writerow([epoch, f'{mean_loss:.2e}', f'{omega_pct:.3f}', f'{zeta_pct:.3f}', f'{phi_mse:.2f}', f'{omega_share:.1f}', f'{zeta_share:.1f}', f'{phi_share:.1f}', f'{frf_s:.1f}', '', '', '', f'{lr:.2e}'])
 
         if epoch == (total_epochs - 1):
             path = os.path.join(args.dir, "checkpoint_best")
