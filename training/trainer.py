@@ -58,7 +58,7 @@ def train(args, config, model_cfg, net, dataloader, optimizer,
 
         # ---- 阶段切换 ----
         if in_phase1 and epoch == 0:
-            _log("=== 阶段1: 全解冻纯模态, ω<0.5% 或 epoch>1000 解锁 FRF ===", logger)
+            _log("=== 阶段1: 全解冻纯模态, ω<0.1% 或 epoch>1000 解锁 FRF ===", logger)
         elif in_phase2 and epoch > 0 and not getattr(net, '_phase2_logged', False):
             _log(f"=== 阶段2: FRF 联合训练 (第 {epoch} 轮解锁) ===", logger)
             net._phase2_logged = True
@@ -72,6 +72,12 @@ def train(args, config, model_cfg, net, dataloader, optimizer,
             batch_idx_t = batch['batch'].to(args.device)
 
             with torch.cuda.amp.autocast(enabled=args.fp16):
+                # ==========================================
+                # 动态卸甲: Phase1 phi_weight=1.0 (让 omega 拿 70%+ 梯度全力冲刺)
+                #           Phase2 phi_weight=100.0 (披甲抗 FRF 波峰坍塌)
+                # ==========================================
+                current_phi_w = 100.0 if in_phase2 else 1.0
+
                 if in_phase2:
                     # 阻尼退火: alpha 从 10 线性衰减到 1 (200轮内)
                     phase2_epoch = epoch - unlock_epoch
@@ -108,7 +114,7 @@ def train(args, config, model_cfg, net, dataloader, optimizer,
                         batch_idx=batch_idx_t,
                         omega_weight=config.get('omega_loss_weight', 200.0),
                         zeta_weight=config.get('zeta_loss_weight', 10.0),
-                        phi_weight=config.get('phi_loss_weight', 100.0))
+                        phi_weight=current_phi_w)
                     raw_frf = frf_loss(frf_pred, batch['point_frf'].to(args.device))
                     phase2_ep = epoch - unlock_epoch
                     current_frf_w = frf_weight * min(1.0, phase2_ep / 20.0)  # 预热20轮
@@ -122,7 +128,7 @@ def train(args, config, model_cfg, net, dataloader, optimizer,
                         batch_idx=batch_idx_t,
                         omega_weight=config.get('omega_loss_weight', 200.0),
                         zeta_weight=config.get('zeta_loss_weight', 10.0),
-                        phi_weight=config.get('phi_loss_weight', 100.0))
+                        phi_weight=current_phi_w)
                     loss = loss_m
 
             losses.append(loss.detach().cpu().item())
@@ -160,16 +166,16 @@ def train(args, config, model_cfg, net, dataloader, optimizer,
         wgt_p = np.mean(weighted_p_losses) if weighted_p_losses else 0
         omega_pct = raw_w * 100
         zeta_pct  = raw_z * 100
-        phi_mse = wgt_p if wgt_p > 0 else 0  # raw MSE (phi_weight=1)
+        phi_mse = wgt_p / (100.0 if in_phase2 else 1.0) if wgt_p > 0 else 0  # 还原为 raw MSE
         omega_share = wgt_w / mean_loss * 100 if mean_loss > 0 else 0
         zeta_share  = wgt_z / mean_loss * 100 if mean_loss > 0 else 0
-        phi_share   = (wgt_p * 100.0) / mean_loss * 100 if mean_loss > 0 else 0
+        phi_share = wgt_p / mean_loss * 100 if mean_loss > 0 else 0
         frf_s = 0 if in_phase1 else (100 - omega_share - zeta_share - phi_share)
         _log(f"Epoch {epoch:4d} | w={omega_pct:.1f}% z={zeta_pct:.1f}% phiMSE={phi_mse:.3f} | 占比 w{omega_share:.0f}% z{zeta_share:.0f}% phi{phi_share:.0f}% frf{frf_s:.0f}% | total={mean_loss:.2e}", logger)
 
-        # 动态解锁: ω误差 < 0.5% 才进入Phase 2
-        if not phase2_unlocked and (omega_pct < 0.5 or epoch > 1000):
-            trigger = 'ω<0.5%' if omega_pct < 0.5 else f'epoch>{1000}'
+        # 动态解锁: ω误差 < 0.1% 才进入Phase 2
+        if not phase2_unlocked and (omega_pct < 0.1 or epoch > 1000):
+            trigger = 'ω<0.1%' if omega_pct < 0.1 else f'epoch>{1000}'
             phase2_unlocked = True
             unlock_epoch = epoch
             _log(f">>> {trigger} 动态解锁 Phase2! <<<", logger)
