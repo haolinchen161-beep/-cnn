@@ -111,7 +111,7 @@ def train(args, config, model_cfg, net, dataloader, optimizer,
                         phi_weight=config.get('phi_loss_weight', 100.0))
                     raw_frf = frf_loss(frf_pred, batch['point_frf'].to(args.device))
                     phase2_ep = epoch - unlock_epoch
-                    current_frf_w = 0.05 * min(1.0, phase2_ep / 20.0)  # 预热20轮, 目标0.05
+                    current_frf_w = frf_weight * min(1.0, phase2_ep / 20.0)  # 预热20轮
                     loss = loss_m + current_frf_w * raw_frf
                 else:
                     _, omega_pred, zeta_pred, phi_pred = net(img, coords, None, None, batch_idx_t)
@@ -356,7 +356,7 @@ def _evaluate(prediction, output, omega_errs, logger, epoch, verbose=True):
         results = {"loss (MSE)": np.mean(asinh_mse_vals)}
         mae_list, mape_list = [], []
         for p_asinh, o_asinh in zip(prediction, output):
-            p_phys = p_asinh  # FRF已是线性物理量; o_phys = o_asinh
+            p_phys = p_asinh; o_phys = o_asinh
             p_amp = torch.sqrt(p_phys[..., 0]**2 + p_phys[..., 1]**2 + 1e-8)
             o_amp = torch.sqrt(o_phys[..., 0]**2 + o_phys[..., 1]**2 + 1e-8)
             mae_list.append(F.l1_loss(p_amp, o_amp).item())
