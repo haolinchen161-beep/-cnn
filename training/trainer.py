@@ -278,7 +278,7 @@ def _generate_preds(args, config, net, dataloader):
                     if isinstance(r, tuple):
                         predictions.append(r[0].squeeze(0).cpu())
                         if omega_true is not None:
-                            omega_errs.append((r[1].cpu() * 25000.0 - omega_true[i]).abs())
+                            omega_pred_val, _ = torch.sort(r[1].cpu(), dim=-1); omega_errs.append((omega_pred_val * 25000.0 - omega_true[i]).abs())
                     else:
                         predictions.append(r.squeeze(0).cpu())
                     outputs.append(target[i].cpu())
@@ -300,7 +300,7 @@ def _generate_preds(args, config, net, dataloader):
                 if isinstance(r, tuple):
                     prediction = r[0]
                     if omega_true is not None:
-                        omega_errs.append((r[1].detach().cpu() * 25000.0 - omega_true).abs())
+                        omega_pred_val, _ = torch.sort(r[1].detach().cpu(), dim=-1); omega_errs.append((omega_pred_val * 25000.0 - omega_true).abs())
                 else:
                     prediction = r
                 pred_out = prediction.detach().cpu()
