@@ -46,7 +46,7 @@ def modal_loss(omega_pred, omega_target,
         raw_phi_mse = F.mse_loss(phi_pred_sorted, phi_target * sign)
 
     loss_phi = raw_phi_mse * phi_weight
-    return loss_omega + loss_zeta + loss_phi, loss_omega, loss_zeta, raw_phi_mse
+    return loss_omega + loss_zeta + loss_phi, loss_omega, loss_zeta, loss_phi
 
 
 def frf_loss(frf_pred, frf_target):
