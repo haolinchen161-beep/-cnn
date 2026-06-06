@@ -1,15 +1,13 @@
 # geometric_frf_groove — 基于几何的频响函数预测
 
-输入 3D 几何 + 边界条件 → GrooveTransFRF (几何感知物理 Transformer) → 模态参数 (ω, ζ, φ) → 物理公式重建 FRF。
+输入 3D 几何 + 边界条件 → UNetPhysicsModel (2.5D CNN-UNet + PhysicsDecoder) → 模态参数 (ω, ζ, φ) → 物理公式重建 FRF。
 
 ## 1. 目录结构
 
 ```
 ├── models/
-│   ├── groove_transfrf.py      主模型: GrooveTransFRF
-│   ├── transolver_encoder.py   Transolver 几何编码器 (SliceAttention)
+│   ├── unet_physics_model.py   主模型: 2.5D CNN-UNet
 │   ├── frf_model.py             模型工厂 build_geometric_model()
-│   ├── bc_aware_decoder.py     全局注意力池化
 │   ├── physics_decoder.py       无参数物理解码器 (模态叠加→FRF)
 │   ├── geometry_data.py         GeometryData 数据容器
 ├── data/
@@ -34,29 +32,25 @@
 ## 2. 架构
 
 ```
-输入: points(N,3) + point_features(N,7) + frequencies(B,F) + phi_exc(B,K)
+输入: 6ch 物理场图像 [B,6,60,160] + query_coords [N,2]
                     │
     ┌───────────────┴───────────────┐
-    │  TransolverEncoder            │  SliceAttention (全分辨率, 无降采样)
-    │  → node_tokens (N, 256)       │
+    │  CNN Encoder (4层Conv+UNet跳连) │ → latent [B,512]
     └───────────────┬───────────────┘
                     │
          ┌──────────┴──────────┐
          │                     │
     ┌────┴────┐          ┌─────┴──────┐
-    │head_phi │          │BC-Aware    │  可学习模态token交叉注意力
-    │→φ_k(x)  │          │ModalDecoder│
-    │(N,K)    │          │→Δω,ζ (B,2K)│
-    └────┬────┘          └─────┬──────┘
+    │Macro MLP│          │Micro UNet  │
+    │→ ω[B,K]│          │→ mode_maps │ [B,K,60,160]
+    │→ ζ[B,K]│          │   grid_sample(query_coords)
+    └────┬────┘          │   → φ [N,K]│
+         │               └─────┬──────┘
          │                     │
     ┌────┴─────────────────────┴──────┐
-    │  ω = softplus(macro(4标量))×15000 + tanh(micro(modal_out[:K]))×5000  │
-    │  ζ = softplus(Δζ)×0.004 + 1e-4            │
-    └────────────────┬────────────────┘
-                     │
-    ┌────────────────┴────────────────┐
-    │  PhysicsDecoder (无参数)         │  H=Σφ_k(x)φ_k(x_f)/(ω_k²-ω²+j2ζ_kω_kω)
-    │  → FRF (N, F, 2) [Re, Im]      │
+    │  PhysicsDecoder (无参数)         │
+    │  H=Σφ_kφ_k/(ω_k²-ω²+j2ζ_kω_kω) │
+    │  → FRF (N,F,2)                  │
     └─────────────────────────────────┘
 ```
 
@@ -97,21 +91,21 @@
 
 | 阶段 | Epoch | 动作 | 损失 | 目的 |
 |------|-------|------|------|------|
-| 1: 模态预热 | 0-300 | 全解冻, φ权重×1 | modal_loss | ω/ζ 独享梯度, 快速收敛 |
-| 2: FRF联合 | 300-2000 | 全解冻, φ权重×100 | modal + FRF×50 | 端到端全耦合 |
+| 1: modal warmup | dynamic unlock | sorted loss + phi x 100 | modal_loss | omega < 0.5%% or epoch > 1000 |
+| 2: FRF joint | unlock ~ 2000 | FRF warmup x 0.05 | modal + FRF(warmup) | damping anneal alpha: 10 -> 1 |
 
 ### 超参数
 
 | 参数 | 值 |
 |------|-----|
-| 模型 | GrooveTransFRF (~1.95M params) |
-| hidden_dim / num_heads | 256 / 8 |
-| n_transolver_layers / slice_num | 3 / 64 |
-| dropout | 0.1 |
-| 损失权重 | rel_ω×20K + rel_ζ×200 + φ×100 + FRF×50 |
-| 优化器 | AdamW, lr=3e-4, wd=8e-5, ReduceLROnPlateau |
-| 梯度裁剪 | Transolver=3.0, head_phi=5.0, Modal=2.0 |
-| batch_size | 4 |
+| 模型 | UNetPhysicsModel (~6.5M params) |
+| hidden / n_modes | 512 / 3 |
+| Conv layers / UNet skips | 4 / 3 |
+| dropout | 0.2 |
+| loss weights | rel_omega x 200 + rel_zeta x 10 + phi signMSE x 100 + FRF dB x 1 + CDF x 10 |
+| optimizer | AdamW, lr=1e-3, wd=3e-4, CosineAnnealingLR |
+| 梯度裁剪 | encoder=3.0, micro=5.0, macro=2.0 |
+| batch_size | 8 |
 
 ## 5. 快速开始
 
