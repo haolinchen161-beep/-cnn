@@ -129,11 +129,14 @@ def train(args, config, model_cfg, net, dataloader, optimizer,
                     loss = loss_m
 
             losses.append(loss.detach().cpu().item())
+            # 日志排序: 与 losses.py 一致, 防止模态互换虚增误差
+            omega_pred_sorted, sort_idx_log = torch.sort(omega_pred, dim=-1)
+            zeta_pred_sorted = torch.gather(zeta_pred, dim=-1, index=sort_idx_log)
             omega_target = batch['modal_omega_norm'].to(args.device)
-            omega_rel_err = torch.abs(omega_pred - omega_target) / (omega_target + 1e-8)
+            omega_rel_err = torch.abs(omega_pred_sorted - omega_target) / (omega_target + 1e-8)
             omega_losses.append(omega_rel_err.mean().detach().cpu().item())
             zeta_target = batch['modal_zeta'].to(args.device)
-            zeta_rel_err = torch.abs(zeta_pred - zeta_target) / (zeta_target + 1e-8)
+            zeta_rel_err = torch.abs(zeta_pred_sorted - zeta_target) / (zeta_target + 1e-8)
             zeta_losses.append(zeta_rel_err.mean().detach().cpu().item())
             weighted_w_losses.append(l_w.detach().cpu().item())
             weighted_z_losses.append(l_z.detach().cpu().item())
