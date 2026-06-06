@@ -8,7 +8,7 @@ import torch.nn.functional as F
 def modal_loss(omega_pred, omega_target,
                zeta_pred, zeta_target,
                phi_pred, phi_target, batch_idx=None,
-               omega_weight=200.0, zeta_weight=10.0, phi_weight=1.0):
+               omega_weight=200.0, zeta_weight=10.0, phi_weight=100.0):
 
     # 排序: 强制 ω₁<ω₂<ω₃
     omega_pred_sorted, sort_idx = torch.sort(omega_pred, dim=-1)          # [B,K]
