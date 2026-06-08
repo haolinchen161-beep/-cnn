@@ -17,7 +17,7 @@ from models import build_geometric_model
 CONFIG = {
     'freq_min': 1.0,
     'freq_max': 5000.0,
-    'omega_max': 25000.0,
+    'omega_max': 32000.0,
     'graph': {'knn_k': 12},
 }
 
@@ -28,7 +28,7 @@ MODEL_CFG = {
         'hidden': 256,
         'n_layers': 8,
         'n_modes': 3,
-        'omega_max': 25000.0,
+        'omega_max': 32000.0,
         'amp_scale': 500000.0,
         'freq_min': 1.0,
         'freq_max': 5000.0,
@@ -153,18 +153,23 @@ def main():
         # 单样本推理时，global 索引就是 excitation_index
         exc_idx = sn.get('excitation_index')
         exc_idx_global = exc_idx.unsqueeze(0).to(device) if exc_idx is not None else None
+        # 获取力方向向量
+        force_vector = sn.get('force_vector')
+        if force_vector is not None:
+            force_vector = force_vector.unsqueeze(0).to(device)
 
         with torch.no_grad():
-            frf_pred, omega_norm, zeta_pred, phi_pred = model(
+            frf_pred, omega_norm, zeta_pred, phi_3d, phi_active = model(
                 gb['node_features'], gb['edge_index'], gb['edge_attr'], gb['batch'],
                 frequencies=gb['frequencies'],
                 excitation_index_global=exc_idx_global,
+                force_vector=force_vector,
             )
             omega_norm = omega_norm.squeeze(0)
             zeta_pred = zeta_pred.squeeze(0)
             omega_norm_sorted, sort_idx = torch.sort(omega_norm)
             zeta_sorted = zeta_pred[sort_idx]
-            phi_sorted = phi_pred[:, sort_idx]
+            phi_sorted = phi_active[:, sort_idx]  # 使用投影后的振型计算指标
             mac, nrmse, std_ratio, phi_aligned, _ = phi_metrics(phi_sorted, true_phi)
             omega_phys_pred = omega_norm_sorted * omega_max
             freq_hz_pred = omega_phys_pred / (2.0 * torch.pi)
