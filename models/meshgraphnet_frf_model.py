@@ -10,9 +10,11 @@ meshgraphnet_frf_model.py — MeshGraphNet/GNN 模态 FRF 代理模型。
 网络输出：
     omega_norm: [B, K]
     zeta:       [B, K]
-    phi_3d:     [total_N, K, 3]  — XYZ 三方向振型
-    phi_active: [total_N, K]     — 经力方向投影后的标量振型
+    phi_z:      [total_N, K]     — Z 向振型（当前专注训练 1D）
     frf:        [total_N, F, 2]，当 frequencies 不为空时输出
+
+注：数据集保留 3D 全量信息（modal_phi_xyz），当前网络专注训练 Z 向。
+    未来扩展到侧铣时，只需将 phi_head 输出改为 n_modes * 3 并加点乘投影。
 
 该实现仅依赖 PyTorch，不依赖 torch_geometric。
 """
@@ -114,11 +116,11 @@ class MeshGraphFRFModel(nn.Module):
             nn.Linear(hidden, hidden // 2), nn.GELU(),
             nn.Linear(hidden // 2, n_modes * 2),
         )
-        # 修改：phi_head 输出 3D 振型 [total_N, K, 3]，支持任意力方向
+        # 直接输出 K 维 Z 向标量振型
         self.phi_head = nn.Sequential(
             nn.Linear(hidden * 2, hidden), nn.GELU(), nn.Dropout(dropout),
             nn.Linear(hidden, hidden // 2), nn.GELU(),
-            nn.Linear(hidden // 2, n_modes * 3),  # 输出 K*3 维
+            nn.Linear(hidden // 2, n_modes),  # 专攻 Z 向振型
         )
         self.n_modes = n_modes
         self.physics = PhysicsDecoder(amp_scale=amp_scale, freq_min=freq_min, freq_max=freq_max)
@@ -130,7 +132,7 @@ class MeshGraphFRFModel(nn.Module):
                 batch: torch.Tensor,
                 frequencies: Optional[torch.Tensor] = None,
                 excitation_index_global: Optional[torch.Tensor] = None,
-                force_vector: Optional[torch.Tensor] = None,
+                force_vector: Optional[torch.Tensor] = None,  # 保留占位符，兼容 dataset 传参
                 alpha: float = 1.0):
         if node_features.shape[-1] != self.node_in_dim:
             raise ValueError(
@@ -164,36 +166,23 @@ class MeshGraphFRFModel(nn.Module):
             zeta_raw = torch.gather(zeta_raw, dim=-1, index=sort_idx)
 
         zeta = self.zeta_min + torch.sigmoid(zeta_raw) * (self.zeta_max - self.zeta_min)
-        g_node = g[batch]
-        phi_3d_raw = self.phi_head(torch.cat([h, g_node], dim=-1))
-        # reshape 为 [total_N, K, 3]
-        phi_3d = phi_3d_raw.view(-1, self.n_modes, 3)
 
-        # 根据力方向进行点乘投影: phi_active = phi_3d · force_vector
-        # force_vector: [B, 3] 或 [3]
-        if force_vector is not None:
-            # force_vector: [B, 3] -> [B, 1, 3] 用于广播
-            if force_vector.dim() == 2:
-                fv = force_vector[batch].unsqueeze(1)  # [total_N, 1, 3]
-            else:
-                fv = force_vector.view(1, 1, 3)  # [1, 1, 3]
-            phi_active = torch.sum(phi_3d * fv, dim=-1)  # [total_N, K]
-        else:
-            # 默认取 Z 向
-            phi_active = phi_3d[:, :, 2]
+        g_node = g[batch]
+        # 直接输出 Z 向振型 phi，形状为 [total_N, K]
+        phi = self.phi_head(torch.cat([h, g_node], dim=-1))
 
         frf = None
         if frequencies is not None:
             omega_phys = omega_norm * self.omega_max
-            # 从预测的 phi_active 中提取激励点振型，避免数据泄露
+            # 从预测的 phi 中提取激励点振型，避免数据泄露
             # (-phi_i) * (-phi_exc) = phi_i * phi_exc，天然符号免疫
             phi_exc_pred = None
             if excitation_index_global is not None:
-                phi_exc_pred = phi_active[excitation_index_global]  # [B, K]
+                phi_exc_pred = phi[excitation_index_global]  # [B, K]
 
-            frf = self.physics(phi_active, omega_phys, zeta, frequencies, phi_exc_pred,
+            frf = self.physics(phi, omega_phys, zeta, frequencies, phi_exc_pred,
                                batch_idx=batch, alpha=alpha)
-        return frf, omega_norm, zeta, phi_3d, phi_active
+        return frf, omega_norm, zeta, phi
 
 
 def global_mean_pool(x: torch.Tensor, batch: torch.Tensor) -> torch.Tensor:
