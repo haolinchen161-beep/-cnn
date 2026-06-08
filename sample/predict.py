@@ -51,17 +51,6 @@ def to_obj(arr_list):
     return out
 
 
-def align_phi(pred_phi, true_phi):
-    aligned = pred_phi.clone()
-    signs = []
-    for k in range(pred_phi.shape[1]):
-        dot = torch.sum(pred_phi[:, k] * true_phi[:, k])
-        sign = torch.sign(dot + 1e-8)
-        aligned[:, k] = pred_phi[:, k] * sign
-        signs.append(sign)
-    return aligned, torch.stack(signs)
-
-
 def main():
     testset = GraphHDF5Dataset(['test.h5'], CONFIG, data_dir=data_dir, normalization=True, test=True)
     testset_raw = GraphHDF5Dataset(['test.h5'], CONFIG, data_dir=data_dir, normalization=False, test=True)
@@ -85,31 +74,15 @@ def main():
         edge_attr = sn['edge_attr'].to(device)
         batch_idx = torch.zeros(sn['points'].shape[0], dtype=torch.long, device=device)
         freqs = sn['frequencies'].unsqueeze(0).to(device)
-        true_phi = sn['modal_phi'].to(device)
-        phi_exc = sn.get('modal_phi_exc')
-        phi_exc_t = phi_exc.unsqueeze(0).to(device) if phi_exc is not None else None
+        # 单样本推理时，global 索引就是 excitation_index
+        exc_idx = sn.get('excitation_index')
+        exc_idx_global = exc_idx.unsqueeze(0).to(device) if exc_idx is not None else None
 
         with torch.no_grad():
-            _, omega_norm, zeta_pred, phi_pred = net(
+            frf_p, omega_norm, zeta_pred, phi_pred = net(
                 node_features, edge_index, edge_attr, batch_idx,
-                frequencies=None, phi_exc=None,
-            )
-            omega_norm = omega_norm.squeeze(0)
-            zeta_pred = zeta_pred.squeeze(0)
-            omega_norm_sorted, sort_idx = torch.sort(omega_norm)
-            zeta_sorted = zeta_pred[sort_idx]
-            phi_sorted = phi_pred[:, sort_idx]
-            phi_aligned, _ = align_phi(phi_sorted, true_phi)
-            omega_phys = omega_norm_sorted * omega_max
-
-            frf_p = net.physics(
-                phi_aligned,
-                omega_phys.unsqueeze(0),
-                zeta_sorted.unsqueeze(0),
-                freqs,
-                phi_exc_t,
-                batch_idx=batch_idx,
-                alpha=1.0,
+                frequencies=freqs,
+                excitation_index_global=exc_idx_global,
             )
 
         p = frf_p.detach().cpu()
