@@ -159,7 +159,7 @@ def main():
             force_vector = force_vector.unsqueeze(0).to(device)
 
         with torch.no_grad():
-            frf_pred, omega_norm, zeta_pred, phi_3d, phi_active = model(
+            frf_pred, omega_norm, zeta_pred, phi_pred = model(
                 gb['node_features'], gb['edge_index'], gb['edge_attr'], gb['batch'],
                 frequencies=gb['frequencies'],
                 excitation_index_global=exc_idx_global,
@@ -169,7 +169,7 @@ def main():
             zeta_pred = zeta_pred.squeeze(0)
             omega_norm_sorted, sort_idx = torch.sort(omega_norm)
             zeta_sorted = zeta_pred[sort_idx]
-            phi_sorted = phi_active[:, sort_idx]  # 使用投影后的振型计算指标
+            phi_sorted = phi_pred[:, sort_idx]
             mac, nrmse, std_ratio, phi_aligned, _ = phi_metrics(phi_sorted, true_phi)
             omega_phys_pred = omega_norm_sorted * omega_max
             freq_hz_pred = omega_phys_pred / (2.0 * torch.pi)
