@@ -12,7 +12,7 @@ import torch
 import numpy as np
 
 from models import build_geometric_model
-from data.dataset import GraphHDF5Dataset
+from data.dataset import GraphHDF5Dataset, NODE_FEATURE_DIM
 
 
 CONFIG = {
@@ -24,7 +24,7 @@ CONFIG = {
 
 MODEL_CFG = {
     'encoder_kwargs': {
-        'node_in_dim': 10,
+        'node_in_dim': NODE_FEATURE_DIM,
         'edge_in_dim': 4,
         'hidden': 256,
         'n_layers': 8,
@@ -41,6 +41,7 @@ MODEL_CFG = {
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
 data_dir = os.path.join(os.path.dirname(__file__), '..', 'ansys', 'data')
 out_dir = os.path.join(os.path.dirname(__file__), 'output')
+ckpt_path = os.path.join(out_dir, 'checkpoint_best')
 
 
 def to_obj(arr_list):
@@ -66,10 +67,11 @@ def main():
     testset_raw = GraphHDF5Dataset(['test.h5'], CONFIG, data_dir=data_dir, normalization=False, test=True)
 
     net = build_geometric_model(MODEL_CFG['encoder_kwargs'], MODEL_CFG['decoder_kwargs']).to(device)
-    ckpt = torch.load(os.path.join(out_dir, 'checkpoint_best'), map_location=device)
+    ckpt = torch.load(ckpt_path, map_location=device)
     net.load_state_dict(ckpt['model_state_dict'])
     net.eval()
     print(f"Checkpoint epoch={ckpt['epoch']}, loss={ckpt['loss']:.6f}, params={sum(p.numel() for p in net.parameters()):,}")
+    print(f"Using NODE_FEATURE_DIM={NODE_FEATURE_DIM}")
 
     omega_max = float(CONFIG.get('omega_max', 25000.0))
     all_preds, all_targets = [], []
