@@ -56,8 +56,8 @@ MODEL_CFG = {
     'encoder_kwargs': {
         'node_in_dim': NODE_FEATURE_DIM,   # 25D full graph features from data/dataset.py
         'edge_in_dim': 4,                  # dx, dy, dz, normalized length
-        'hidden': 256,
-        'n_layers': 8,
+        'hidden': 128,
+        'n_layers': 6,
         'n_modes': 3,
         'omega_max': 32000.0,
         'amp_scale': 500000.0,
@@ -72,10 +72,10 @@ MODEL_CFG = {
 class SimpleArgs:
     def __init__(self):
         # 5000节点级图数据比CNN显存更重，建议从1~2开始。
-        self.batch_size = 2
+        self.batch_size = 1
         self.seed = 42
         self.device = 'cuda' if torch.cuda.is_available() else 'cpu'
-        self.fp16 = False
+        self.fp16 = True
         self.dir = os.path.join(os.path.dirname(__file__), 'output')
         self.debug = False
 
