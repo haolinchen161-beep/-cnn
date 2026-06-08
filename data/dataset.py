@@ -1,34 +1,49 @@
 """
-dataset.py — MeshGraphNet/GNN 数据集。
+dataset.py — MeshGraphNet/GNN 图数据集。
 
-旧版会把 3D 节点投影成 [C, 60, 160] 的 2.5D 图像；这不再适用于
-GNN / MeshGraphNet。新版直接返回有限元节点图：
+新版 generate_3d_test.py 已直接导出 FE 拓扑与图学习所需字段。本数据集不再做
+2.5D CNN 图像投影，而是直接返回 disjoint graph batch 所需张量：
 
-    points, node_features, edge_index, edge_attr, batch
+    node_features, points, edge_index, edge_attr, batch
+
+默认节点特征维度为 25：
+    0:3    normalized xyz
+    3:10   point_features = [E/E_base, PRXY, rho/rho_base, is_fixed, logK, logC, Z/H]
+    10:13  normalized log spring_k_xyz
+    13:16  normalized log spring_c_xyz
+    16:21  node_type one-hot: ordinary/bottom/cut/side/corner
+    21     pocket_bottom_mask
+    22     cut_region_mask
+    23     excitation_flag
+    24     normalized distance to excitation point
 
 HDF5 推荐格式：
-    /sample_i/points          (N, 3)      节点坐标, 单位 m
-    /sample_i/point_features  (N, F)      节点物理特征
-    /sample_i/edge_index      (2, E)      可选, FE 单元拓扑边
-    /sample_i/point_frf       (N, T, 2)   FRF [Re, Im]
-    /sample_i/frequencies     (T,)        频率 Hz
-    /sample_i/modal_omega     (K,)        圆频率 rad/s
-    /sample_i/modal_zeta      (K,)        阻尼比
-    /sample_i/modal_phi       (N, K)      Z 向振型
-    /sample_i/modal_phi_exc   (K,)        激励点 Z 向振型
-
-如果旧数据里没有 edge_index，Dataset 会用 kNN 图兜底。正式训练建议先运行：
-    python ansys/prepare_graph_h5.py
-把 edge_index 写入 *_graph.h5，避免每轮动态建图。
+    /sample_i/points              (N, 3)
+    /sample_i/edge_index          (2, E)
+    /sample_i/edge_attr           (E, 4)
+    /sample_i/point_features      (N, 7)
+    /sample_i/spring_k_xyz        (N, 3)
+    /sample_i/spring_c_xyz        (N, 3)
+    /sample_i/node_type           (N,)
+    /sample_i/pocket_bottom_mask  (N,)
+    /sample_i/cut_region_mask     (N,)
+    /sample_i/excitation_index    scalar
+    /sample_i/excitation_coord    (3,)
+    /sample_i/point_frf           (N, F, 2)
+    /sample_i/frequencies         (F,)
+    /sample_i/modal_omega         (K,)
+    /sample_i/modal_zeta          (K,)
+    /sample_i/modal_phi           (N, K)
+    /sample_i/modal_phi_xyz       (N, K, 3)
+    /sample_i/modal_phi_exc       (K,)
 """
 
 from __future__ import annotations
 
 import os
-from typing import Dict, Iterable, List, Optional
+from typing import Dict, Iterable, List
 
 import h5py
-import numpy as np
 import torch
 from torch.utils.data import Dataset
 
@@ -37,6 +52,7 @@ L_BASE = 0.160
 W_BASE = 0.060
 H_BASE = 0.010
 OMEGA_MAX_DEFAULT = 25000.0
+NODE_FEATURE_DIM = 25
 
 
 class GraphHDF5Dataset(Dataset):
@@ -72,7 +88,6 @@ class GraphHDF5Dataset(Dataset):
         return len(self._samples)
 
     def undo_normalize(self, frf: torch.Tensor) -> torch.Tensor:
-        # 兼容旧 trainer/evaluate 接口；当前 FRF 默认保持物理量，不再 asinh。
         return frf
 
     def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
@@ -90,16 +105,38 @@ class GraphHDF5Dataset(Dataset):
                 if edge_index.ndim != 2 or edge_index.shape[0] != 2:
                     edge_index = edge_index.t().contiguous()
 
+            edge_attr = None
+            if "edge_attr" in grp:
+                edge_attr = torch.from_numpy(grp["edge_attr"][:]).float()
+
+            n_nodes = points.shape[0]
+            spring_k_xyz = _read_optional_node_array(grp, "spring_k_xyz", n_nodes, 3)
+            spring_c_xyz = _read_optional_node_array(grp, "spring_c_xyz", n_nodes, 3)
+            node_type = _read_optional_1d(grp, "node_type", n_nodes, dtype=torch.long)
+            pocket_bottom_mask = _read_optional_1d(grp, "pocket_bottom_mask", n_nodes, dtype=torch.float32)
+            cut_region_mask = _read_optional_1d(grp, "cut_region_mask", n_nodes, dtype=torch.float32)
+
             out: Dict[str, torch.Tensor] = {}
             for key in ["modal_omega", "modal_zeta", "modal_phi", "modal_phi_exc", "modal_phi_xyz"]:
                 if key in grp:
                     out[key] = torch.from_numpy(grp[key][:]).float()
 
             if "excitation_index" in grp:
-                out["excitation_index"] = torch.tensor(int(grp["excitation_index"][()]), dtype=torch.long)
+                excitation_index = torch.tensor(int(grp["excitation_index"][()]), dtype=torch.long)
+            else:
+                excitation_index = torch.tensor(0, dtype=torch.long)
+            out["excitation_index"] = excitation_index
+
+            if "excitation_coord" in grp:
+                excitation_coord = torch.from_numpy(grp["excitation_coord"][:]).float()
+            else:
+                excitation_coord = points[excitation_index].clone()
+            out["excitation_coord"] = excitation_coord
 
         if edge_index is None or edge_index.numel() == 0:
             edge_index = build_knn_edge_index(points, k=self.knn_k)
+        if edge_attr is None or edge_attr.shape[0] != edge_index.shape[1]:
+            edge_attr = build_edge_attr(points, edge_index)
 
         if self.normalization:
             frequencies = (frequencies - self.freq_min) / (self.freq_max - self.freq_min) * 2.0 - 1.0
@@ -109,16 +146,31 @@ class GraphHDF5Dataset(Dataset):
             out["modal_omega_norm"] = out.pop("modal_omega") / self.omega_max
 
         coords_norm = normalize_points(points)
-        node_features = torch.cat([coords_norm, sanitize_features(point_features)], dim=-1)
-        edge_attr = build_edge_attr(points, edge_index)
+        node_features = build_node_features(
+            points=points,
+            coords_norm=coords_norm,
+            point_features=point_features,
+            spring_k_xyz=spring_k_xyz,
+            spring_c_xyz=spring_c_xyz,
+            node_type=node_type,
+            pocket_bottom_mask=pocket_bottom_mask,
+            cut_region_mask=cut_region_mask,
+            excitation_index=out["excitation_index"],
+            excitation_coord=out["excitation_coord"],
+        )
 
         result: Dict[str, torch.Tensor] = {
             "points": points,
-            "query_coords": coords_norm,   # 兼容旧脚本命名；现在是 3D normalized coords
+            "query_coords": coords_norm,
             "point_features": point_features,
             "node_features": node_features,
             "edge_index": edge_index,
             "edge_attr": edge_attr,
+            "spring_k_xyz": spring_k_xyz,
+            "spring_c_xyz": spring_c_xyz,
+            "node_type": node_type,
+            "pocket_bottom_mask": pocket_bottom_mask,
+            "cut_region_mask": cut_region_mask,
             "point_frf": point_frf,
             "frequencies": frequencies,
         }
@@ -126,8 +178,20 @@ class GraphHDF5Dataset(Dataset):
         return result
 
 
-# 向后兼容旧入口名，但语义已改为图数据。
 GeometricHDF5Dataset = GraphHDF5Dataset
+
+
+def _read_optional_node_array(grp, key: str, n_nodes: int, width: int) -> torch.Tensor:
+    if key in grp:
+        return torch.from_numpy(grp[key][:]).float()
+    return torch.zeros(n_nodes, width, dtype=torch.float32)
+
+
+def _read_optional_1d(grp, key: str, n_nodes: int, dtype=torch.float32) -> torch.Tensor:
+    if key in grp:
+        arr = torch.from_numpy(grp[key][:])
+        return arr.to(dtype=dtype)
+    return torch.zeros(n_nodes, dtype=dtype)
 
 
 def normalize_points(points: torch.Tensor) -> torch.Tensor:
@@ -136,35 +200,79 @@ def normalize_points(points: torch.Tensor) -> torch.Tensor:
 
 
 def sanitize_features(features: torch.Tensor) -> torch.Tensor:
-    """把旧 point_features 中的缺省 logK/logC 等安全化。"""
     features = torch.nan_to_num(features.float(), nan=0.0, posinf=0.0, neginf=0.0)
     return features
 
 
-def build_knn_edge_index(points: torch.Tensor, k: int = 12) -> torch.Tensor:
-    """无外部依赖的 kNN 兜底建图。
+def normalize_log_positive(x: torch.Tensor, max_log: float = 8.0) -> torch.Tensor:
+    """log10(1+x)/max_log，零弹簧保持 0，避免无弹簧被 -1 混淆。"""
+    x = torch.clamp(torch.nan_to_num(x.float(), nan=0.0, posinf=0.0, neginf=0.0), min=0.0)
+    return torch.log10(1.0 + x) / max_log
 
-    仅建议用于兼容旧数据；正式训练应把 FE 拓扑 edge_index 写入 HDF5。
-    """
+
+def build_node_features(points: torch.Tensor,
+                        coords_norm: torch.Tensor,
+                        point_features: torch.Tensor,
+                        spring_k_xyz: torch.Tensor,
+                        spring_c_xyz: torch.Tensor,
+                        node_type: torch.Tensor,
+                        pocket_bottom_mask: torch.Tensor,
+                        cut_region_mask: torch.Tensor,
+                        excitation_index: torch.Tensor,
+                        excitation_coord: torch.Tensor) -> torch.Tensor:
+    point_features = sanitize_features(point_features)
+    spring_k_norm = normalize_log_positive(spring_k_xyz, max_log=8.0)
+    spring_c_norm = normalize_log_positive(spring_c_xyz, max_log=4.0)
+
+    node_type = torch.clamp(node_type.long(), min=0, max=4)
+    node_type_onehot = torch.nn.functional.one_hot(node_type, num_classes=5).float()
+
+    bottom = pocket_bottom_mask.float().unsqueeze(-1)
+    cut = cut_region_mask.float().unsqueeze(-1)
+
+    excitation_flag = torch.zeros(points.shape[0], 1, dtype=points.dtype, device=points.device)
+    if 0 <= int(excitation_index.item()) < points.shape[0]:
+        excitation_flag[int(excitation_index.item()), 0] = 1.0
+
+    scale = torch.tensor([L_BASE, W_BASE, H_BASE], dtype=points.dtype, device=points.device)
+    exc = excitation_coord.to(points.device, dtype=points.dtype)
+    dist_to_exc = torch.linalg.norm((points - exc.unsqueeze(0)) / scale, dim=-1, keepdim=True)
+
+    return torch.cat([
+        coords_norm,
+        point_features,
+        spring_k_norm,
+        spring_c_norm,
+        node_type_onehot,
+        bottom,
+        cut,
+        excitation_flag,
+        dist_to_exc,
+    ], dim=-1).float()
+
+
+def build_knn_edge_index(points: torch.Tensor, k: int = 12) -> torch.Tensor:
     n = int(points.shape[0])
     if n <= 1:
         return torch.zeros(2, 0, dtype=torch.long)
     k = max(1, min(k, n - 1))
     with torch.no_grad():
-        dist = torch.cdist(points, points)
+        scaled = points / torch.tensor([L_BASE, W_BASE, H_BASE], dtype=points.dtype, device=points.device)
+        dist = torch.cdist(scaled, scaled)
         nn_idx = dist.topk(k + 1, largest=False).indices[:, 1:]
-        src = torch.arange(n, dtype=torch.long).repeat_interleave(k)
+        src = torch.arange(n, dtype=torch.long, device=points.device).repeat_interleave(k)
         dst = nn_idx.reshape(-1).long()
         edge_index = torch.stack([src, dst], dim=0)
         edge_index = torch.cat([edge_index, edge_index.flip(0)], dim=1)
         edge_index = torch.unique(edge_index, dim=1)
-    return edge_index.contiguous()
+    return edge_index.cpu().contiguous()
 
 
 def build_edge_attr(points: torch.Tensor, edge_index: torch.Tensor) -> torch.Tensor:
     if edge_index.numel() == 0:
         return torch.zeros(0, 4, dtype=points.dtype)
-    src, dst = edge_index
+    edge_index_cpu = edge_index.cpu()
+    src, dst = edge_index_cpu
     delta = points[dst] - points[src]
     scale = torch.tensor([L_BASE, W_BASE, H_BASE], dtype=points.dtype, device=points.device)
     delta_norm = delta / scale
@@ -173,12 +281,20 @@ def build_edge_attr(points: torch.Tensor, edge_index: torch.Tensor) -> torch.Ten
 
 
 def collate_geometry_batch(batch: List[Dict[str, torch.Tensor]]) -> Dict[str, torch.Tensor]:
-    """把多个变节点数样本拼成一个 disjoint graph batch。"""
     node_features, points, query_coords, point_features = [], [], [], []
     edge_indices, edge_attrs = [], []
     point_frf = []
     batch_vec = []
     node_offset = 0
+
+    passthrough_cat = {
+        "spring_k_xyz": [],
+        "spring_c_xyz": [],
+        "node_type": [],
+        "pocket_bottom_mask": [],
+        "cut_region_mask": [],
+    }
+    excitation_index_local, excitation_index_global, excitation_coord = [], [], []
 
     for i, item in enumerate(batch):
         n_i = int(item["points"].shape[0])
@@ -192,6 +308,17 @@ def collate_geometry_batch(batch: List[Dict[str, torch.Tensor]]) -> Dict[str, to
         ei = item["edge_index"].long() + node_offset
         edge_indices.append(ei)
         edge_attrs.append(item.get("edge_attr", build_edge_attr(item["points"], item["edge_index"])))
+
+        for key in passthrough_cat:
+            if key in item:
+                passthrough_cat[key].append(item[key])
+        if "excitation_index" in item:
+            local_idx = item["excitation_index"].long()
+            excitation_index_local.append(local_idx)
+            excitation_index_global.append(local_idx + node_offset)
+        if "excitation_coord" in item:
+            excitation_coord.append(item["excitation_coord"])
+
         node_offset += n_i
 
     f_lens = [item["frequencies"].shape[0] for item in batch]
@@ -214,6 +341,15 @@ def collate_geometry_batch(batch: List[Dict[str, torch.Tensor]]) -> Dict[str, to
         "point_frf": frf_out,
     }
 
+    for key, values in passthrough_cat.items():
+        if len(values) == len(batch):
+            out[key] = torch.cat(values, dim=0)
+    if len(excitation_index_local) == len(batch):
+        out["excitation_index"] = torch.stack(excitation_index_local)
+        out["excitation_index_global"] = torch.stack(excitation_index_global)
+    if len(excitation_coord) == len(batch):
+        out["excitation_coord"] = torch.stack(excitation_coord)
+
     modal = _stack_modal(batch)
     if modal:
         out.update(modal)
@@ -235,6 +371,4 @@ def _stack_modal(batch: List[Dict[str, torch.Tensor]]) -> Dict[str, torch.Tensor
             result[key] = torch.stack([item[key] for item in batch])
     if "modal_phi_xyz" in batch[0]:
         result["modal_phi_xyz"] = torch.cat([item["modal_phi_xyz"] for item in batch], dim=0)
-    if "excitation_index" in batch[0]:
-        result["excitation_index"] = torch.stack([item["excitation_index"] for item in batch])
     return result
