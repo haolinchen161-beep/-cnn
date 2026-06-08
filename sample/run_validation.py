@@ -130,11 +130,15 @@ def main():
             'batch': batch['batch'].to(args.device),
         }
         freqs = batch['frequencies'].to(args.device)
-        phi_exc = batch.get('modal_phi_exc')
-        phi_exc = phi_exc.to(args.device) if phi_exc is not None else None
+        exc_idx_global = batch.get("excitation_index_global")
+        exc_idx_global = exc_idx_global.to(args.device) if exc_idx_global is not None else None
+        force_vector = batch.get("force_vector")
+        force_vector = force_vector.to(args.device) if force_vector is not None else None
         frf_p, op, zp, pp = net(
             graph_batch['node_features'], graph_batch['edge_index'], graph_batch['edge_attr'],
-            graph_batch['batch'], frequencies=freqs, phi_exc=phi_exc,
+            graph_batch['batch'], frequencies=freqs,
+            excitation_index_global=exc_idx_global,
+            force_vector=force_vector,
         )
     print(f'  FRF={list(frf_p.shape)}, omega={list(op.shape)}, zeta={list(zp.shape)}, phi={list(pp.shape)}')
 
