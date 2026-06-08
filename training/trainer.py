@@ -49,42 +49,16 @@ def _move_graph_batch(batch: Dict, device: str) -> Dict:
     return out
 
 
-def _forward_modal(net, batch: Dict, frequencies=None, phi_exc=None, alpha: float = 1.0):
+def _forward_modal(net, batch: Dict, frequencies=None, excitation_index_global=None, alpha: float = 1.0):
     return net(
         batch["node_features"],
         batch["edge_index"],
         batch["edge_attr"],
         batch["batch"],
         frequencies=frequencies,
-        phi_exc=phi_exc,
+        excitation_index_global=excitation_index_global,
         alpha=alpha,
     )
-
-
-def _align_phi_exc(net, batch: Dict):
-    """根据预测 phi_z 与真值 phi_z 的符号关系，对激励点 phi_exc 做符号对齐。
-
-    模态振型有任意正负号；FRF 中 phi(node)*phi(exc) 需要符号一致。
-    这里不传 frequencies，避免为了符号对齐额外计算 FRF。
-    """
-    phi_exc = batch.get("modal_phi_exc")
-    if phi_exc is None or "modal_phi" not in batch:
-        return None
-
-    with torch.no_grad():
-        _, _, _, phi_scan = _forward_modal(net, batch, frequencies=None, phi_exc=None)
-
-    modal_phi = batch["modal_phi"]
-    phi_exc_aligned = phi_exc.clone()
-    batch_idx = batch["batch"]
-    n_graphs = int(batch_idx.max().item()) + 1
-    for i in range(n_graphs):
-        mask = batch_idx == i
-        if not torch.any(mask):
-            continue
-        dot = torch.sum(phi_scan[mask] * modal_phi[mask], dim=0)
-        phi_exc_aligned[i] = phi_exc[i] * torch.sign(dot + 1e-8)
-    return phi_exc_aligned
 
 
 def train(args, config, model_cfg, net, dataloader, optimizer,
@@ -142,9 +116,10 @@ def train(args, config, model_cfg, net, dataloader, optimizer,
                         phase2_epoch = epoch - unlock_epoch
                         alpha = max(1.0, 10.0 - 9.0 * phase2_epoch / 200.0)
                         frequencies = _require_tensor_frequencies(batch)
-                        phi_exc = _align_phi_exc(net, batch)
                         frf_pred, omega_pred, zeta_pred, phi_pred = _forward_modal(
-                            net, batch, frequencies=frequencies, phi_exc=phi_exc, alpha=alpha
+                            net, batch, frequencies=frequencies,
+                            excitation_index_global=batch.get("excitation_index_global"),
+                            alpha=alpha
                         )
                         loss_m, l_w, l_z, l_p = modal_loss(
                             omega_pred, batch["modal_omega_norm"],
@@ -303,8 +278,10 @@ def _generate_preds(args, config, net, dataloader):
             batch = _move_graph_batch(raw_batch, args.device)
             frequencies = _require_tensor_frequencies(batch)
             target = batch["point_frf"]
-            phi_exc = _align_phi_exc(net, batch)
-            frf_pred, omega_pred, _, _ = _forward_modal(net, batch, frequencies=frequencies, phi_exc=phi_exc)
+            frf_pred, omega_pred, _, _ = _forward_modal(
+                net, batch, frequencies=frequencies,
+                excitation_index_global=batch.get("excitation_index_global")
+            )
             predictions.append(frf_pred.detach().cpu())
             outputs.append(target.detach().cpu())
 
