@@ -1,14 +1,19 @@
 """
-meshgraphnet_frf_model.py — GNN / MeshGraphNet 模态参数预测模型。
+meshgraphnet_frf_model.py — MeshGraphNet/GNN 模态 FRF 代理模型。
 
-核心思想：
-    3D mesh graph + 边界/材料/装夹节点特征
-        → MeshGraphNet message passing
-        → global modal head: omega, zeta
-        → node modal head: phi_z(node, mode)
-        → PhysicsDecoder 重建 FRF
+输入来自新版 GraphHDF5Dataset 的完整图特征：
+    node_features: [total_N, 25]
+    edge_index:    [2, total_E]
+    edge_attr:     [total_E, 4]
+    batch:         [total_N]
 
-该文件不依赖 torch_geometric，便于在现有 PyTorch 环境中直接运行。
+网络输出：
+    omega_norm: [B, K]
+    zeta:       [B, K]
+    phi_z:      [total_N, K]
+    frf:        [total_N, F, 2]，当 frequencies 不为空时输出
+
+该实现仅依赖 PyTorch，不依赖 torch_geometric。
 """
 
 from __future__ import annotations
@@ -20,6 +25,10 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from .physics_decoder import PhysicsDecoder
+
+
+DEFAULT_NODE_FEATURE_DIM = 25
+DEFAULT_EDGE_FEATURE_DIM = 4
 
 
 class MLP(nn.Module):
@@ -43,7 +52,7 @@ class MLP(nn.Module):
 
 
 class MeshGraphBlock(nn.Module):
-    """MeshGraphNet 风格 edge update + node update residual block."""
+    """MeshGraphNet 风格 residual message passing block。"""
 
     def __init__(self, hidden_dim: int, dropout: float = 0.0):
         super().__init__()
@@ -70,11 +79,11 @@ class MeshGraphBlock(nn.Module):
 
 
 class MeshGraphFRFModel(nn.Module):
-    """GNN/MeshGraphNet + modal bottleneck + physics decoder."""
+    """GNN/MeshGraphNet + modal bottleneck + physics decoder。"""
 
     def __init__(self,
-                 node_in_dim: int = 10,
-                 edge_in_dim: int = 4,
+                 node_in_dim: int = DEFAULT_NODE_FEATURE_DIM,
+                 edge_in_dim: int = DEFAULT_EDGE_FEATURE_DIM,
                  hidden: int = 256,
                  n_layers: int = 8,
                  n_modes: int = 3,
@@ -87,6 +96,8 @@ class MeshGraphFRFModel(nn.Module):
                  dropout: float = 0.05,
                  predict_delta_omega: bool = True):
         super().__init__()
+        self.node_in_dim = node_in_dim
+        self.edge_in_dim = edge_in_dim
         self.n_modes = n_modes
         self.omega_max = omega_max
         self.zeta_min = zeta_min
@@ -117,17 +128,16 @@ class MeshGraphFRFModel(nn.Module):
                 frequencies: Optional[torch.Tensor] = None,
                 phi_exc: Optional[torch.Tensor] = None,
                 alpha: float = 1.0):
-        """
-        Args:
-            node_features: (total_N, node_in_dim)
-            edge_index:    (2, total_E)
-            edge_attr:     (total_E, edge_in_dim)
-            batch:         (total_N,) graph index for each node
-            frequencies:   (B, F) normalized frequency in [-1, 1], optional
-            phi_exc:       (B, K) excitation modal value, optional
-        Returns:
-            frf, omega_norm, zeta, phi
-        """
+        if node_features.shape[-1] != self.node_in_dim:
+            raise ValueError(
+                f"node_features dim mismatch: got {node_features.shape[-1]}, expected {self.node_in_dim}. "
+                "Check data/dataset.py NODE_FEATURE_DIM and MODEL_CFG['node_in_dim']."
+            )
+        if edge_attr.shape[-1] != self.edge_in_dim:
+            raise ValueError(
+                f"edge_attr dim mismatch: got {edge_attr.shape[-1]}, expected {self.edge_in_dim}."
+            )
+
         h = self.node_encoder(node_features)
         e = self.edge_encoder(edge_attr)
         for block in self.blocks:
@@ -142,7 +152,6 @@ class MeshGraphFRFModel(nn.Module):
             delta = F.softplus(omega_raw) + 1e-6
             omega_norm = torch.cumsum(delta, dim=-1)
             omega_norm = omega_norm / (omega_norm[:, -1:].detach() + 1e-6)
-            # 只归一化相对顺序会过于强；再给一个 sigmoid 幅值门控，保持 [0,1]
             scale = torch.sigmoid(omega_raw.mean(dim=-1, keepdim=True))
             omega_norm = omega_norm * scale
         else:
