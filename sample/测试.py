@@ -17,7 +17,7 @@ import matplotlib.pyplot as plt
 from data.dataset import GraphHDF5Dataset, NODE_FEATURE_DIM
 
 
-CONFIG = {'freq_min': 1.0, 'freq_max': 5000.0, 'omega_max': 25000.0, 'graph': {'knn_k': 12}}
+CONFIG = {'freq_min': 1.0, 'freq_max': 5000.0, 'omega_max': 32000.0, 'graph': {'knn_k': 12}}
 data_dir = os.path.join(os.path.dirname(__file__), '..', 'ansys', 'data')
 out_dir = os.path.join(os.path.dirname(__file__), 'output')
 os.makedirs(out_dir, exist_ok=True)
