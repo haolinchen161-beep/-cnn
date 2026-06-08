@@ -126,7 +126,7 @@ class MeshGraphFRFModel(nn.Module):
                 edge_attr: torch.Tensor,
                 batch: torch.Tensor,
                 frequencies: Optional[torch.Tensor] = None,
-                phi_exc: Optional[torch.Tensor] = None,
+                excitation_index_global: Optional[torch.Tensor] = None,
                 alpha: float = 1.0):
         if node_features.shape[-1] != self.node_in_dim:
             raise ValueError(
@@ -166,7 +166,13 @@ class MeshGraphFRFModel(nn.Module):
         frf = None
         if frequencies is not None:
             omega_phys = omega_norm * self.omega_max
-            frf = self.physics(phi, omega_phys, zeta, frequencies, phi_exc,
+            # 核心修改：从预测的 phi 中提取激励点振型，避免数据泄露
+            # (-phi_i) * (-phi_exc) = phi_i * phi_exc，天然符号免疫
+            phi_exc_pred = None
+            if excitation_index_global is not None:
+                phi_exc_pred = phi[excitation_index_global]  # [B, K]
+
+            frf = self.physics(phi, omega_phys, zeta, frequencies, phi_exc_pred,
                                batch_idx=batch, alpha=alpha)
         return frf, omega_norm, zeta, phi
 
