@@ -1,8 +1,8 @@
 """
 dataset.py — MeshGraphNet/GNN 图数据集。
 
-新版 generate_3d_test.py 已直接导出 FE 拓扑与图学习所需字段。本数据集不再做
-2.5D CNN 图像投影，而是直接返回 disjoint graph batch 所需张量：
+GraphHDF5Dataset 读取 generate_3d_test.py 导出的 FE 拓扑与图学习字段，
+返回 disjoint graph batch 所需张量：
 
     node_features, points, edge_index, edge_attr, batch
 
@@ -51,15 +51,17 @@ from torch.utils.data import Dataset
 L_BASE = 0.160
 W_BASE = 0.060
 H_BASE = 0.010
-OMEGA_MAX_DEFAULT = 25000.0
+OMEGA_MAX_DEFAULT = 32000.0
 NODE_FEATURE_DIM = 25
+DEFAULT_FORCE_VECTOR = [0.0, 0.0, 1.0]  # 默认 Z 向激励
 
 
 class GraphHDF5Dataset(Dataset):
     """per-sample-group HDF5 → variable-size mesh graph batch."""
 
     def __init__(self, data_paths: Iterable[str], config: Dict, data_dir: str = ".",
-                 test: bool = False, normalization: bool = True):
+                 test: bool = False, normalization: bool = True,
+                 force_vector: List[float] = None):
         self.config = config
         self.normalization = normalization
         self.test = test
@@ -67,6 +69,7 @@ class GraphHDF5Dataset(Dataset):
         self.freq_max = float(config.get("freq_max", 5000.0))
         self.omega_max = float(config.get("omega_max", OMEGA_MAX_DEFAULT))
         self.knn_k = int(config.get("graph", {}).get("knn_k", 12))
+        self.force_vector = torch.tensor(force_vector or DEFAULT_FORCE_VECTOR, dtype=torch.float32)
         self._samples: List[tuple[str, str]] = []
 
         full_paths = [os.path.join(data_dir, p) for p in data_paths]
@@ -173,6 +176,7 @@ class GraphHDF5Dataset(Dataset):
             "cut_region_mask": cut_region_mask,
             "point_frf": point_frf,
             "frequencies": frequencies,
+            "force_vector": self.force_vector,
         }
         result.update(out)
         return result
@@ -295,6 +299,7 @@ def collate_geometry_batch(batch: List[Dict[str, torch.Tensor]]) -> Dict[str, to
         "cut_region_mask": [],
     }
     excitation_index_local, excitation_index_global, excitation_coord = [], [], []
+    force_vectors = []
 
     for i, item in enumerate(batch):
         n_i = int(item["points"].shape[0])
@@ -318,6 +323,8 @@ def collate_geometry_batch(batch: List[Dict[str, torch.Tensor]]) -> Dict[str, to
             excitation_index_global.append(local_idx + node_offset)
         if "excitation_coord" in item:
             excitation_coord.append(item["excitation_coord"])
+        if "force_vector" in item:
+            force_vectors.append(item["force_vector"])
 
         node_offset += n_i
 
@@ -349,6 +356,8 @@ def collate_geometry_batch(batch: List[Dict[str, torch.Tensor]]) -> Dict[str, to
         out["excitation_index_global"] = torch.stack(excitation_index_global)
     if len(excitation_coord) == len(batch):
         out["excitation_coord"] = torch.stack(excitation_coord)
+    if len(force_vectors) == len(batch):
+        out["force_vector"] = torch.stack(force_vectors)
 
     modal = _stack_modal(batch)
     if modal:
