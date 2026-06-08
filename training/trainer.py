@@ -4,7 +4,7 @@ trainer.py — MeshGraphNet/GNN 两阶段训练循环 + 评估。
 当前数据流：
     25D node_features + edge_index + edge_attr + batch + normalized frequencies
         → MeshGraphFRFModel
-        → omega, zeta, phi_z
+        → omega, zeta, phi_3d[K,3], phi_active[K]
         → PhysicsDecoder
         → point_frf(Re, Im)
 
@@ -34,7 +34,7 @@ GRAPH_TENSOR_KEYS = [
     "excitation_index", "excitation_index_global", "excitation_coord",
     "modal_omega_norm", "modal_omega_phys", "modal_zeta",
     "modal_phi", "modal_phi_exc", "modal_phi_xyz",
-    "point_frf",
+    "point_frf", "force_vector",
 ]
 
 
@@ -49,7 +49,8 @@ def _move_graph_batch(batch: Dict, device: str) -> Dict:
     return out
 
 
-def _forward_modal(net, batch: Dict, frequencies=None, excitation_index_global=None, alpha: float = 1.0):
+def _forward_modal(net, batch: Dict, frequencies=None, excitation_index_global=None,
+                   force_vector=None, alpha: float = 1.0):
     return net(
         batch["node_features"],
         batch["edge_index"],
@@ -57,6 +58,7 @@ def _forward_modal(net, batch: Dict, frequencies=None, excitation_index_global=N
         batch["batch"],
         frequencies=frequencies,
         excitation_index_global=excitation_index_global,
+        force_vector=force_vector,
         alpha=alpha,
     )
 
@@ -116,15 +118,16 @@ def train(args, config, model_cfg, net, dataloader, optimizer,
                         phase2_epoch = epoch - unlock_epoch
                         alpha = max(1.0, 10.0 - 9.0 * phase2_epoch / 200.0)
                         frequencies = _require_tensor_frequencies(batch)
-                        frf_pred, omega_pred, zeta_pred, phi_pred = _forward_modal(
+                        frf_pred, omega_pred, zeta_pred, phi_3d, phi_active = _forward_modal(
                             net, batch, frequencies=frequencies,
                             excitation_index_global=batch.get("excitation_index_global"),
+                            force_vector=batch.get("force_vector"),
                             alpha=alpha
                         )
                         loss_m, l_w, l_z, l_p = modal_loss(
                             omega_pred, batch["modal_omega_norm"],
                             zeta_pred, batch["modal_zeta"],
-                            phi_pred, batch["modal_phi"],
+                            phi_active, batch["modal_phi"],
                             batch_idx=batch["batch"],
                             omega_weight=config.get("omega_loss_weight", 200.0),
                             zeta_weight=config.get("zeta_loss_weight", 10.0),
@@ -135,11 +138,11 @@ def train(args, config, model_cfg, net, dataloader, optimizer,
                         loss_frf = current_frf_w * raw_frf
                         loss = loss_m + loss_frf
                     else:
-                        _, omega_pred, zeta_pred, phi_pred = _forward_modal(net, batch)
+                        _, omega_pred, zeta_pred, phi_3d, phi_active = _forward_modal(net, batch)
                         loss_m, l_w, l_z, l_p = modal_loss(
                             omega_pred, batch["modal_omega_norm"],
                             zeta_pred, batch["modal_zeta"],
-                            phi_pred, batch["modal_phi"],
+                            phi_active, batch["modal_phi"],
                             batch_idx=batch["batch"],
                             omega_weight=config.get("omega_loss_weight", 200.0),
                             zeta_weight=config.get("zeta_loss_weight", 10.0),
@@ -271,16 +274,17 @@ def _generate_preds(args, config, net, dataloader):
     was_training = net.training
     net.eval()
     predictions, outputs, omega_errs = [], [], []
-    omega_max = float(config.get("omega_max", 25000.0))
+    omega_max = float(config.get("omega_max", 32000.0))
 
     with torch.no_grad():
         for raw_batch in dataloader:
             batch = _move_graph_batch(raw_batch, args.device)
             frequencies = _require_tensor_frequencies(batch)
             target = batch["point_frf"]
-            frf_pred, omega_pred, _, _ = _forward_modal(
+            frf_pred, omega_pred, _, _, _ = _forward_modal(
                 net, batch, frequencies=frequencies,
-                excitation_index_global=batch.get("excitation_index_global")
+                excitation_index_global=batch.get("excitation_index_global"),
+                force_vector=batch.get("force_vector")
             )
             predictions.append(frf_pred.detach().cpu())
             outputs.append(target.detach().cpu())
