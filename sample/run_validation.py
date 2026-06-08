@@ -18,6 +18,7 @@ import torch
 
 from models import build_geometric_model
 from training import train, evaluate, modal_loss
+from data.dataset import NODE_FEATURE_DIM
 
 
 CONFIG = {
@@ -53,8 +54,8 @@ CONFIG = {
 
 MODEL_CFG = {
     'encoder_kwargs': {
-        'node_in_dim': 10,     # normalize xyz(3) + point_features(7)
-        'edge_in_dim': 4,      # dx,dy,dz,dist
+        'node_in_dim': NODE_FEATURE_DIM,   # 25D full graph features from data/dataset.py
+        'edge_in_dim': 4,                  # dx, dy, dz, normalized length
         'hidden': 256,
         'n_layers': 8,
         'n_modes': 3,
@@ -112,6 +113,7 @@ def main():
     print(f"  Train: {len(trainset)} samples, {len(trainloader)} batches")
     print(f"  Nodes: {batch['node_features'].shape}, Edges: {batch['edge_index'].shape}, edge_attr: {batch['edge_attr'].shape}")
     print(f"  Frequencies: {batch['frequencies'].shape}, FRF: {batch['point_frf'].shape}")
+    print(f"  Node feature dim: {batch['node_features'].shape[-1]} / expected {NODE_FEATURE_DIM}")
 
     print('\n--- Step 2: Model ---')
     net = build_geometric_model(MODEL_CFG['encoder_kwargs'], MODEL_CFG['decoder_kwargs']).to(args.device)
