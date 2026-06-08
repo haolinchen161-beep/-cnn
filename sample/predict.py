@@ -18,7 +18,7 @@ from data.dataset import GraphHDF5Dataset, NODE_FEATURE_DIM
 CONFIG = {
     'freq_min': 1.0,
     'freq_max': 5000.0,
-    'omega_max': 25000.0,
+    'omega_max': 32000.0,
     'graph': {'knn_k': 12},
 }
 
@@ -29,7 +29,7 @@ MODEL_CFG = {
         'hidden': 256,
         'n_layers': 8,
         'n_modes': 3,
-        'omega_max': 25000.0,
+        'omega_max': 32000.0,
         'amp_scale': 500000.0,
         'freq_min': 1.0,
         'freq_max': 5000.0,
@@ -62,7 +62,7 @@ def main():
     print(f"Checkpoint epoch={ckpt['epoch']}, loss={ckpt['loss']:.6f}, params={sum(p.numel() for p in net.parameters()):,}")
     print(f"Using NODE_FEATURE_DIM={NODE_FEATURE_DIM}")
 
-    omega_max = float(CONFIG.get('omega_max', 25000.0))
+    omega_max = float(CONFIG.get('omega_max', 32000.0))
     all_preds, all_targets = [], []
     all_pred_re, all_pred_im = [], []
     all_true_re, all_true_im = [], []
@@ -77,12 +77,17 @@ def main():
         # 单样本推理时，global 索引就是 excitation_index
         exc_idx = sn.get('excitation_index')
         exc_idx_global = exc_idx.unsqueeze(0).to(device) if exc_idx is not None else None
+        # 获取力方向向量
+        force_vector = sn.get('force_vector')
+        if force_vector is not None:
+            force_vector = force_vector.unsqueeze(0).to(device)
 
         with torch.no_grad():
-            frf_p, omega_norm, zeta_pred, phi_pred = net(
+            frf_p, omega_norm, zeta_pred, phi_3d, phi_active = net(
                 node_features, edge_index, edge_attr, batch_idx,
                 frequencies=freqs,
                 excitation_index_global=exc_idx_global,
+                force_vector=force_vector,
             )
 
         p = frf_p.detach().cpu()
