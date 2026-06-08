@@ -1,10 +1,21 @@
 """
-augmentations.py — MeshGraphNet 图数据增强。
+augmentations.py — MeshGraphNet 25D 图数据增强。
 
-当前主数据结构是 collate_geometry_batch 返回的 disjoint graph batch：
+当前主数据结构来自 data.dataset.collate_geometry_batch：
     node_features, points, edge_index, edge_attr, batch, point_frf, frequencies
 
-默认训练脚本暂未启用增强。该模块保留为可选工具，避免旧 geometry 容器接口残留。
+25D node_features 布局：
+    0:3    normalized xyz
+    3:10   point_features
+    10:13  spring_k_xyz log normalized
+    13:16  spring_c_xyz log normalized
+    16:21  node_type one-hot
+    21     pocket_bottom_mask
+    22     cut_region_mask
+    23     excitation_flag
+    24     normalized distance to excitation
+
+默认训练脚本未启用增强；该模块仅作为可选工具。
 """
 
 from __future__ import annotations
@@ -12,67 +23,71 @@ from __future__ import annotations
 import torch
 
 
-class GraphBatchAugmenter:
-    """对 GNN 图 batch 做轻量增强。
+L_BASE, W_BASE, H_BASE = 0.160, 0.060, 0.010
 
-    注意：节点 dropout 会改变 edge_index/edge_attr/point_frf/modal_phi，对物理一致性要求较高。
-    因此当前默认只做坐标和节点特征微扰，不做节点删除。
-    """
+
+class GraphBatchAugmenter:
+    """对 GNN 图 batch 做保守增强。"""
 
     def __init__(self,
                  coord_noise: float = 1e-4,
-                 feat_noise_scale: float = 0.005,
+                 material_noise: float = 0.002,
+                 log_spring_noise: float = 0.003,
                  freq_subsample: int | None = None,
                  enabled: bool = True):
         self.coord_noise = coord_noise
-        self.feat_noise_scale = feat_noise_scale
+        self.material_noise = material_noise
+        self.log_spring_noise = log_spring_noise
         self.freq_subsample = freq_subsample
         self.enabled = enabled
         self.training = True
 
     def train(self):
         self.training = True
+        return self
 
     def eval(self):
         self.training = False
+        return self
 
     def __call__(self, batch):
         if not self.enabled or not self.training:
             return batch
+        batch = dict(batch)
         batch = self._augment_coords(batch)
-        batch = self._augment_node_features(batch)
+        batch = self._augment_features(batch)
         batch = self._augment_frequencies(batch)
         return batch
 
     def _augment_coords(self, batch):
-        if 'points' not in batch:
+        if 'points' not in batch or 'node_features' not in batch:
             return batch
         points = batch['points']
         noise = torch.randn_like(points) * self.coord_noise
         if 'point_features' in batch and batch['point_features'].shape[-1] >= 4:
-            # 保持装夹节点几何更稳定。
             is_bc = batch['point_features'][:, 3] > 0
             noise[is_bc] *= 0.1
         batch['points'] = points + noise
-        # node_features 前三维是归一化坐标，保持同步近似更新。
-        if 'node_features' in batch and batch['node_features'].shape[-1] >= 3:
-            scale = torch.tensor([0.160, 0.060, 0.010], dtype=points.dtype, device=points.device)
-            batch['node_features'][:, :3] = batch['points'] / scale * 2.0 - 1.0
+        scale = torch.tensor([L_BASE, W_BASE, H_BASE], dtype=points.dtype, device=points.device)
+        batch['node_features'] = batch['node_features'].clone()
+        batch['node_features'][:, :3] = batch['points'] / scale * 2.0 - 1.0
         return batch
 
-    def _augment_node_features(self, batch):
+    def _augment_features(self, batch):
         if 'node_features' not in batch:
             return batch
-        nf = batch['node_features']
-        noise = torch.zeros_like(nf)
-        # 前3维是坐标，已由 _augment_coords 处理；后7维来自 point_features。
-        if nf.shape[-1] >= 10:
-            scales = torch.tensor([
-                0.0, 0.0, 0.0,   # xyz normalized
-                0.005, 0.0, 0.003, 0.0, 0.05, 0.05, 0.005,
-            ], dtype=nf.dtype, device=nf.device)
-            noise = torch.randn_like(nf) * scales * self.feat_noise_scale
-        batch['node_features'] = nf + noise
+        nf = batch['node_features'].clone()
+        if nf.shape[-1] < 25:
+            batch['node_features'] = nf
+            return batch
+
+        # 仅扰动连续物理量，不扰动 one-hot/mask/excitation。
+        # point_features: E ratio, rho ratio, logK/logC/ZH 等。
+        cont_idx = [3, 5, 7, 8, 9]
+        nf[:, cont_idx] += torch.randn_like(nf[:, cont_idx]) * self.material_noise
+        # normalized spring log features。
+        nf[:, 10:16] += torch.randn_like(nf[:, 10:16]) * self.log_spring_noise
+        batch['node_features'] = nf
         return batch
 
     def _augment_frequencies(self, batch):
