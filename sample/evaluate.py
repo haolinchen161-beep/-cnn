@@ -52,6 +52,7 @@ def to_obj(arr_list):
 
 
 def sign_align_phi(pred_phi, true_phi, eps=1e-8):
+    """符号对齐用于振型指标计算（MAC/NRMSE），不影响 FRF 重建。"""
     aligned = pred_phi.clone()
     signs = []
     for k in range(pred_phi.shape[1]):
@@ -63,16 +64,17 @@ def sign_align_phi(pred_phi, true_phi, eps=1e-8):
 
 
 def phi_metrics(pred_phi, true_phi, eps=1e-8):
-    pred_phi, signs = sign_align_phi(pred_phi, true_phi, eps=eps)
+    """振型指标计算，使用符号对齐后的 phi 评估 MAC/NRMSE。"""
+    pred_phi_aligned, signs = sign_align_phi(pred_phi, true_phi, eps=eps)
     macs, nrmse, std_ratio = [], [], []
     for k in range(true_phi.shape[1]):
-        p, t = pred_phi[:, k], true_phi[:, k]
+        p, t = pred_phi_aligned[:, k], true_phi[:, k]
         mac = (torch.sum(p * t) ** 2) / (torch.sum(p ** 2) * torch.sum(t ** 2) + eps)
         rmse = torch.sqrt(torch.mean((p - t) ** 2))
         macs.append(mac)
         nrmse.append(rmse / (torch.std(t) + eps))
         std_ratio.append((torch.std(p) + eps) / (torch.std(t) + eps))
-    return torch.stack(macs), torch.stack(nrmse), torch.stack(std_ratio), pred_phi, signs
+    return torch.stack(macs), torch.stack(nrmse), torch.stack(std_ratio), pred_phi_aligned, signs
 
 
 def compute_peak_metrics(freqs_hz, pred_amp, true_amp, true_freq_hz, true_zeta):
@@ -148,13 +150,15 @@ def main():
         true_zeta = sn['modal_zeta'].to(device)
         true_omega = sn['modal_omega_phys'].to(device)
         true_freq_hz = true_omega / (2.0 * torch.pi)
-        phi_exc = sn.get('modal_phi_exc')
-        phi_exc = phi_exc.unsqueeze(0).to(device) if phi_exc is not None else None
+        # 单样本推理时，global 索引就是 excitation_index
+        exc_idx = sn.get('excitation_index')
+        exc_idx_global = exc_idx.unsqueeze(0).to(device) if exc_idx is not None else None
 
         with torch.no_grad():
-            _, omega_norm, zeta_pred, phi_pred = model(
+            frf_pred, omega_norm, zeta_pred, phi_pred = model(
                 gb['node_features'], gb['edge_index'], gb['edge_attr'], gb['batch'],
-                frequencies=None, phi_exc=None,
+                frequencies=gb['frequencies'],
+                excitation_index_global=exc_idx_global,
             )
             omega_norm = omega_norm.squeeze(0)
             zeta_pred = zeta_pred.squeeze(0)
@@ -164,10 +168,6 @@ def main():
             mac, nrmse, std_ratio, phi_aligned, _ = phi_metrics(phi_sorted, true_phi)
             omega_phys_pred = omega_norm_sorted * omega_max
             freq_hz_pred = omega_phys_pred / (2.0 * torch.pi)
-            frf_pred = model.physics(
-                phi_aligned, omega_phys_pred.unsqueeze(0), zeta_sorted.unsqueeze(0),
-                gb['frequencies'], phi_exc, batch_idx=gb['batch'], alpha=1.0,
-            )
 
         p = frf_pred.detach().cpu()
         t = sr['point_frf'].detach().cpu()
