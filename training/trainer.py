@@ -4,7 +4,7 @@ trainer.py — MeshGraphNet/GNN 两阶段训练循环 + 评估。
 当前数据流：
     25D node_features + edge_index + edge_attr + batch + normalized frequencies
         → MeshGraphFRFModel
-        → omega, zeta, phi_3d[K,3], phi_active[K]
+        → omega, zeta, phi_z[K]
         → PhysicsDecoder
         → point_frf(Re, Im)
 
@@ -118,7 +118,7 @@ def train(args, config, model_cfg, net, dataloader, optimizer,
                         phase2_epoch = epoch - unlock_epoch
                         alpha = max(1.0, 10.0 - 9.0 * phase2_epoch / 200.0)
                         frequencies = _require_tensor_frequencies(batch)
-                        frf_pred, omega_pred, zeta_pred, phi_3d, phi_active = _forward_modal(
+                        frf_pred, omega_pred, zeta_pred, phi_pred = _forward_modal(
                             net, batch, frequencies=frequencies,
                             excitation_index_global=batch.get("excitation_index_global"),
                             force_vector=batch.get("force_vector"),
@@ -127,7 +127,7 @@ def train(args, config, model_cfg, net, dataloader, optimizer,
                         loss_m, l_w, l_z, l_p = modal_loss(
                             omega_pred, batch["modal_omega_norm"],
                             zeta_pred, batch["modal_zeta"],
-                            phi_active, batch["modal_phi"],
+                            phi_pred, batch["modal_phi"],
                             batch_idx=batch["batch"],
                             omega_weight=config.get("omega_loss_weight", 200.0),
                             zeta_weight=config.get("zeta_loss_weight", 10.0),
@@ -138,11 +138,11 @@ def train(args, config, model_cfg, net, dataloader, optimizer,
                         loss_frf = current_frf_w * raw_frf
                         loss = loss_m + loss_frf
                     else:
-                        _, omega_pred, zeta_pred, phi_3d, phi_active = _forward_modal(net, batch)
+                        _, omega_pred, zeta_pred, phi_pred = _forward_modal(net, batch)
                         loss_m, l_w, l_z, l_p = modal_loss(
                             omega_pred, batch["modal_omega_norm"],
                             zeta_pred, batch["modal_zeta"],
-                            phi_active, batch["modal_phi"],
+                            phi_pred, batch["modal_phi"],
                             batch_idx=batch["batch"],
                             omega_weight=config.get("omega_loss_weight", 200.0),
                             zeta_weight=config.get("zeta_loss_weight", 10.0),
@@ -281,7 +281,7 @@ def _generate_preds(args, config, net, dataloader):
             batch = _move_graph_batch(raw_batch, args.device)
             frequencies = _require_tensor_frequencies(batch)
             target = batch["point_frf"]
-            frf_pred, omega_pred, _, _, _ = _forward_modal(
+            frf_pred, omega_pred, _, _ = _forward_modal(
                 net, batch, frequencies=frequencies,
                 excitation_index_global=batch.get("excitation_index_global"),
                 force_vector=batch.get("force_vector")
