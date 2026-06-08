@@ -83,7 +83,7 @@ def main():
             force_vector = force_vector.unsqueeze(0).to(device)
 
         with torch.no_grad():
-            frf_p, omega_norm, zeta_pred, phi_3d, phi_active = net(
+            frf_p, omega_norm, zeta_pred, phi_pred = net(
                 node_features, edge_index, edge_attr, batch_idx,
                 frequencies=freqs,
                 excitation_index_global=exc_idx_global,
