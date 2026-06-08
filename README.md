@@ -1,148 +1,221 @@
-# geometric_frf_groove — 基于几何的频响函数预测
+# geometric_frf_groove — MeshGraphNet 模态 FRF 预测
 
-输入 3D 几何 + 边界条件 → UNetPhysicsModel (2.5D CNN-UNet + PhysicsDecoder) → 模态参数 (ω, ζ, φ) → 物理公式重建 FRF。
+本项目已从旧的 2.5D CNN-UNet 方案迁移为 **GNN / MeshGraphNet + 物理模态叠加层**。
+
+当前主流程：
+
+```text
+3D 几何 + ANSYS FE mesh + 材料 + 装夹边界
+        ↓
+GraphHDF5Dataset
+        ↓
+MeshGraphFRFModel
+        ↓
+ω, ζ, φ_z
+        ↓
+PhysicsDecoder 模态叠加
+        ↓
+FRF(Re, Im)
+```
+
+CNN/UNet 模块已废弃，不再作为训练、评估或预测入口。
+
+---
 
 ## 1. 目录结构
 
-```
-├── models/
-│   ├── unet_physics_model.py   主模型: 2.5D CNN-UNet
-│   ├── frf_model.py             模型工厂 build_geometric_model()
-│   ├── physics_decoder.py       无参数物理解码器 (模态叠加→FRF)
-│   ├── geometry_data.py         GeometryData 数据容器
-├── data/
-│   └── dataset.py               HDF5 数据集 (per-sample-group) + collate
-├── training/
-│   ├── losses.py                modal_loss + frf_loss
-│   ├── trainer.py               两阶段训练循环 + 评估
-│   └── augmentations.py         数据增强 (坐标/特征噪声, 节点dropout, 频率子采样)
+```text
 ├── ansys/
-│   ├── generate_3d_test.py      ANSYS MAPDL 数据生成 (凹槽工件)
-│   ├── data/                    train/val/test.h5
-│   └── mesh_viz/                网格截图
+│   ├── generate_3d_test.py       ANSYS MAPDL 数据生成，直接导出图数据
+│   ├── data/                     train.h5 / val.h5 / test.h5
+│   └── mesh_viz/                 网格与 FRF 可视化
+├── data/
+│   ├── __init__.py
+│   └── dataset.py                GraphHDF5Dataset + 图 batch collate
+├── models/
+│   ├── __init__.py
+│   ├── frf_model.py              build_geometric_model()
+│   ├── meshgraphnet_frf_model.py MeshGraphNet 主模型
+│   ├── physics_decoder.py        模态叠加 FRF 物理解码器
+│   └── geometry_data.py          可选图数据容器
+├── training/
+│   ├── __init__.py
+│   ├── losses.py                 modal_loss + frf_loss
+│   ├── trainer.py                两阶段训练循环
+│   └── augmentations.py          可选图 batch 增强
 └── sample/
-    ├── run_validation.py        训练入口
-    ├── evaluate.py              评估 + 保存 final_results.npz
-    ├── 测试.py                  查看原始 FRF
-    ├── 对比图.py                预测 vs 真实对比图
-    ├── predict.py               推理
-    └── output/                  checkpoint + 图表 + npz
+    ├── run_validation.py         训练入口
+    ├── evaluate.py               模态/FRF 评估并保存 final_results.npz
+    ├── predict.py                checkpoint 推理
+    ├── 测试.py                   原始 FRF 数据可视化
+    ├── 对比图.py                 预测 vs 真实对比图
+    └── output/                   checkpoint、日志和 npz 结果
 ```
 
-## 2. 架构
+---
 
-```
-输入: 6ch 物理场图像 [B,6,60,160] + query_coords [N,2]
-                    │
-    ┌───────────────┴───────────────┐
-    │  CNN Encoder (4层Conv+UNet跳连) │ → latent [B,512]
-    └───────────────┬───────────────┘
-                    │
-         ┌──────────┴──────────┐
-         │                     │
-    ┌────┴────┐          ┌─────┴──────┐
-    │Macro MLP│          │Micro UNet  │
-    │→ ω[B,K]│          │→ mode_maps │ [B,K,60,160]
-    │→ ζ[B,K]│          │   grid_sample(query_coords)
-    └────┬────┘          │   → φ [N,K]│
-         │               └─────┬──────┘
-         │                     │
-    ┌────┴─────────────────────┴──────┐
-    │  PhysicsDecoder (无参数)         │
-    │  H=Σφ_kφ_k/(ω_k²-ω²+j2ζ_kω_kω) │
-    │  → FRF (N,F,2)                  │
-    └─────────────────────────────────┘
+## 2. 数据生成
+
+运行：
+
+```bash
+F:/pytorch_cuda12/python.exe ansys/generate_3d_test.py
 ```
 
-## 3. 数据
+生成：
 
-### ANSYS 凹槽工件
+```text
+ansys/data/train.h5
+ansys/data/val.h5
+ansys/data/test.h5
+```
+
+### 保持不变的数据分布
 
 | 参数 | 值 |
-|------|-----|
-| 工件尺寸 | 160×60×10mm (固定), 铝7075 |
-| 材料范围 | E±5% (Sobol序列), ρ±3% |
-| 凹槽布局 | 5凹槽(4×3格局) / 6凹槽(4×3) / 7凹槽(5×3), 等概率 |
-| 凹槽加工 | 随机选择1~N个凹槽, 每个深度30~60%×H (3~6mm) |
+|---|---|
+| 工件尺寸 | 160×60×10mm，铝7075 |
+| 材料范围 | E±5%，ρ±3%，Sobol 序列 |
+| 凹槽布局 | 5凹槽 / 6凹槽 / 7凹槽，等概率 |
+| 凹槽加工 | 随机选择 1~N 个凹槽，每个深度 30~60%×H |
 | 结构筋/边界 | 6mm 绝对宽度 |
-| 装夹 | 4角螺栓 (XYZ三向弹簧) + 3侧顶杆 (Y向弹簧) |
-| 弹簧刚度 K | 角点 K_c∈[5e6,1e8] N/m, 侧面 K_s∈[1e6,3e7] N/m, 每个装夹区独立采样 |
-| 弹簧阻尼 C | C=2ζ√(K·M_ref), ζ_joint∈[0.005,0.05], M_ref=0.01kg |
+| 装夹 | 4角螺栓 XYZ 三向弹簧 + 3侧顶杆 Y 向弹簧 |
+| 弹簧刚度 | 角点 Kc∈[5e6,1e8] N/m；侧面 Ks∈[1e6,3e7] N/m |
+| 弹簧阻尼 | C=2ζ√(K·M_ref)，ζ_joint∈[0.005,0.05]，M_ref=0.01kg |
 | 材料阻尼 | ζ_material=0.002 |
-| 总阻尼 | ζ_k = 0.002 + Σ(C·φ²)/(2ω_k) (三维耗散求和) |
-| 网格 | SOLID187 四面体, 6mm, 自由划分 |
-| 模态求解 | Block Lanczos (LANB), 质量归一化 (nrmkey=ON) |
-| 模态方向 | 前3阶, Z向面外振型 |
-| 激励点 | 凹槽底面几何中心最近节点, Z向激励 |
-| 频率网格 | 60点, 每峰±3×半功率带宽线性采样 (≥15点), 间隙对数补点 |
+| 总阻尼 | ζ_k=0.002+Σ(Cxφx²+Cyφy²+Czφz²)/(2ω_k) |
+| 网格 | SOLID187 四面体，6mm，自由划分 |
+| 模态求解 | Block Lanczos，质量归一化 nrmkey=ON |
+| 模态阶数 | 前3阶 |
+| 激励点 | 凹槽底面几何中心最近节点，Z向激励 |
+| 频率网格 | 60点，每峰±3×半功率带宽线性采样，间隙对数补点 |
 
-### 2.5D 投影物理场 (dataset.py 在线生成)
+### 新 HDF5 字段
 
-HDF5 存储原始 3D 节点数据。`__getitem__` 时投影为 6 通道 160×60 像素图像：
-
-| 通道 | 内容 | 投影方式 |
-|------|------|---------|
-| Ch0 | 局部厚度 Z/H | scatter_reduce(max) 每像素 |
-| Ch1 | is_fixed 边界条件 | 0/0.5/1.0 |
-| Ch2 | log10(K) 弹簧刚度 | 仅弹簧节点 |
-| Ch3 | log10(C) 弹簧阻尼 | 仅弹簧节点 |
-| Ch4 | E/E_base 弹性模量 | 全局常数 |
-| Ch5 | ρ/ρ_base 密度 | 全局常数 |
-
-坐标归一化到 [-1,1] (X/0.160×2-1, Y/0.060×2-1)。
-数据划分: 1200 训练 / 150 验证 / 150 测试。
-
-### HDF5 格式 (per-sample-group)
-
+```text
+/sample_i/
+├── points              (N, 3)       节点坐标，m
+├── edge_index          (2, E)       FE mesh 拓扑边
+├── edge_attr           (E, 4)       [dx/L, dy/W, dz/H, length]
+├── point_features      (N, 7)       旧物理特征，兼容保留
+├── spring_k_xyz        (N, 3)       每节点三向弹簧刚度
+├── spring_c_xyz        (N, 3)       每节点三向弹簧阻尼
+├── node_type           (N,)         0普通/1槽底/2切削区/3侧顶杆/4角点夹持
+├── pocket_bottom_mask  (N,)         凹槽底面节点 mask
+├── cut_region_mask     (N,)         切削区节点 mask
+├── point_frf           (N, F, 2)    复数 FRF [Re, Im]
+├── frequencies         (F,)         频率 Hz
+├── modal_omega         (K,)         固有圆频率 rad/s
+├── modal_zeta          (K,)         阻尼比
+├── modal_phi           (N, K)       Z向振型
+├── modal_phi_xyz       (N, K, 3)    XYZ三向振型
+├── modal_phi_exc       (K,)         激励节点 Z向振型
+├── excitation_index    scalar       激励节点索引
+└── excitation_coord    (3,)         激励点坐标
 ```
-/sample_0/
-├── points         (N₀, 3)        3D 节点坐标 [x, y, z] (m)
-├── point_frf      (N₀, F₀, 2)   复数 FRF [Re, Im] (Z向, 物理空间)
-├── frequencies    (F₀,)          频率采样点 (Hz)
-├── point_features (N₀, 7)        逐节点: [E/E_base, PRXY, ρ/ρ_base, is_fixed, logK, logC, Z/H]
-├── modal_omega    (K,)           固有圆频率 (rad/s)
-├── modal_zeta     (K,)           阻尼比
-├── modal_phi      (N₀, K)        Z向模态振型
-└── modal_phi_exc  (K,)           激励点振型值
+
+---
+
+## 3. 模型架构
+
+```text
+node_features + edge_index + edge_attr + batch
+        ↓
+node encoder / edge encoder
+        ↓
+MeshGraphNet message passing blocks
+        ↓
+全局池化
+        ↓
+┌────────────────────────┬────────────────────────┐
+│ global modal head      │ node modal head         │
+│ ω1,ω2,ω3               │ φ_z(node, mode)         │
+│ ζ1,ζ2,ζ3               │                         │
+└────────────────────────┴────────────────────────┘
+        ↓
+PhysicsDecoder
+        ↓
+FRF(node, frequency, Re/Im)
 ```
+
+模型入口：
+
+```python
+from models import build_geometric_model
+net = build_geometric_model(
+    encoder_kwargs={
+        'node_in_dim': 10,
+        'edge_in_dim': 4,
+        'hidden': 256,
+        'n_layers': 8,
+        'n_modes': 3,
+        'omega_max': 25000.0,
+        'amp_scale': 500000.0,
+        'freq_min': 1.0,
+        'freq_max': 5000.0,
+    },
+    decoder_kwargs={},
+)
+```
+
+---
 
 ## 4. 训练
 
-### 两阶段策略
-
-| 阶段 | Epoch | 动作 | 损失 | 目的 |
-|------|-------|------|------|------|
-| 1: modal warmup | dynamic unlock | sorted loss + phi x 100 | modal_loss | omega < 0.5%% or epoch > 1000 |
-| 2: FRF joint | unlock ~ 2000 | FRF warmup x 0.05 | modal + FRF(warmup) | damping anneal alpha: 10 -> 1 |
-
-### 超参数
-
-| 参数 | 值 |
-|------|-----|
-| 模型 | UNetPhysicsModel (~6.5M params) |
-| hidden / n_modes | 512 / 3 |
-| Conv layers / UNet skips | 4 / 3 |
-| dropout | 0.2 |
-| loss weights | rel_omega x 200 + rel_zeta x 10 + phi signMSE x 100 + FRF dB x 1 + CDF x 10 |
-| optimizer | AdamW, lr=1e-3, wd=3e-4, CosineAnnealingLR |
-| 梯度裁剪 | encoder=3.0, micro=5.0, macro=2.0 |
-| batch_size | 8 |
-
-## 5. 快速开始
+运行：
 
 ```bash
-# 生成数据 (需 ANSYS MAPDL license)
-F:/pytorch_cuda12/python.exe ansys/generate_3d_test.py
+F:/pytorch_cuda12/python.exe sample/run_validation.py
+```
 
-# 查看原始 FRF
+训练入口使用：
+
+```text
+GraphHDF5Dataset → collate_geometry_batch → MeshGraphFRFModel → trainer.train
+```
+
+两阶段训练：
+
+| 阶段 | 目标 | 损失 |
+|---|---|---|
+| Phase 1 | 先学习模态参数 | Lω + Lζ + Lφ |
+| Phase 2 | 加入 FRF 物理重建 | Lω + Lζ + Lφ + LFRF |
+
+输出：
+
+```text
+sample/output/checkpoint_last
+sample/output/checkpoint_best
+sample/output/loss_log.csv
+```
+
+---
+
+## 5. 评估、预测和画图
+
+```bash
+# 查看原始真实 FRF
 F:/pytorch_cuda12/python.exe sample/测试.py
 
-# 训练
-F:/pytorch_cuda12/python.exe sample/run_validation.py
-
-# 评估
+# 评估 checkpoint，生成 final_results.npz
 F:/pytorch_cuda12/python.exe sample/evaluate.py
 
-# 对比图
+# 推理，生成 predictions.npz
+F:/pytorch_cuda12/python.exe sample/predict.py
+
+# 预测 vs 真实对比图
 F:/pytorch_cuda12/python.exe sample/对比图.py
 ```
+
+---
+
+## 6. 当前推荐工作流
+
+```text
+1. 运行 ansys/generate_3d_test.py 重新生成 train/val/test.h5
+2. 运行 sample/run_validation.py 训练 MeshGraphNet
+3. 运行 sample/evaluate.py 计算模态和 FRF 指标
+4. 运行 sample/对比图.py 生成论文用对比图
+```
+
+旧 CNN 数据投影和 UNet 训练路径已移除。当前仓库以 MeshGraphNet/GNN 为主线。
