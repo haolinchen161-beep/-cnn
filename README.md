@@ -1,13 +1,13 @@
 # geometric_frf_groove — MeshGraphNet 模态 FRF 预测
 
-本项目已从旧的 2.5D CNN-UNet 方案迁移为 **GNN / MeshGraphNet + 物理模态叠加层**。
+本项目基于 **GNN / MeshGraphNet + 物理模态叠加层** 实现模态 FRF 预测。
 
 当前主流程：
 
 ```text
 3D 几何 + ANSYS FE mesh + 材料 + 装夹边界
         ↓
-GraphHDF5Dataset
+GraphHDF5Dataset (25D 节点特征)
         ↓
 MeshGraphFRFModel
         ↓
@@ -17,8 +17,6 @@ PhysicsDecoder 模态叠加
         ↓
 FRF(Re, Im)
 ```
-
-CNN/UNet 模块已废弃，不再作为训练、评估或预测入口。
 
 ---
 
@@ -142,14 +140,16 @@ FRF(node, frequency, Re/Im)
 
 ```python
 from models import build_geometric_model
+from data.dataset import NODE_FEATURE_DIM  # 25
+
 net = build_geometric_model(
     encoder_kwargs={
-        'node_in_dim': 10,
+        'node_in_dim': NODE_FEATURE_DIM,  # 25D graph features
         'edge_in_dim': 4,
         'hidden': 256,
         'n_layers': 8,
         'n_modes': 3,
-        'omega_max': 25000.0,
+        'omega_max': 32000.0,
         'amp_scale': 500000.0,
         'freq_min': 1.0,
         'freq_max': 5000.0,
@@ -157,6 +157,22 @@ net = build_geometric_model(
     decoder_kwargs={},
 )
 ```
+
+### 节点特征维度说明
+
+`GraphHDF5Dataset` 默认构建 **25 维**节点特征（`NODE_FEATURE_DIM = 25`）：
+
+| 维度范围 | 含义 |
+|---|---|
+| 0:3 | 归一化 xyz 坐标 |
+| 3:10 | point_features = [E/E_base, PRXY, rho/rho_base, is_fixed, logK, logC, Z/H] |
+| 10:13 | 归一化 log spring_k_xyz |
+| 13:16 | 归一化 log spring_c_xyz |
+| 16:21 | node_type one-hot (5类) |
+| 21 | pocket_bottom_mask |
+| 22 | cut_region_mask |
+| 23 | excitation_flag |
+| 24 | 归一化距离 excitation point |
 
 ---
 
@@ -218,4 +234,4 @@ F:/pytorch_cuda12/python.exe sample/对比图.py
 4. 运行 sample/对比图.py 生成论文用对比图
 ```
 
-旧 CNN 数据投影和 UNet 训练路径已移除。当前仓库以 MeshGraphNet/GNN 为主线。
+当前仓库以 MeshGraphNet/GNN 为主线。
