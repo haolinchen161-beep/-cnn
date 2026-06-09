@@ -43,6 +43,7 @@ class TransolverTrainer:
             excitation_index=batch.get('excitation_index'),
             frequencies=batch.get('frequencies'),
             num_graphs=batch.get('num_graphs'),
+            node_counts=batch.get('node_counts'),
         )
 
     def train_epoch(self, loader, config: Dict, epoch: int = 0) -> Dict[str, float]:
