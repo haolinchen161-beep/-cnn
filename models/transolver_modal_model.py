@@ -1,14 +1,11 @@
-"""物理引导 Transolver 风格模型，用于模态 FRF 预测。
+"""物理引导 Transolver 风格模型，用于模态 FRF 预测（Dense Padding 极速版）。
 
 输入:
     非结构化 ANSYS 节点 + Transolver 节点特征 + 可选网格边。
 输出:
     模态固有频率、模态阻尼比、逐节点 XYZ 三向振型，以及方向性 FRF。
 
-这是 Transolver 的轻量级、零外部依赖实现。使用物理感知的 learned slices：
-节点被软分配到固定数量的状态 token，在 token 空间做注意力，再将信息
-散射回节点。全链路使用纯 PyTorch 操作（无 torch_scatter 依赖），
-通过指针切片 + cat/stack 实现极速计算。
+全链路使用 Dense Padding + bmm 实现，0 隐式同步，100% 向量化。
 
 方向约定
 --------
@@ -23,6 +20,27 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from .physics_decoder import ModalFRFDecoder
+
+
+# ======================= Dense Padding 工具 =======================
+def pad_batch(x: torch.Tensor, node_counts: list):
+    """将 (total_N, H) 填充为 (B, N_max, H)，解锁 Tensor Core bmm。"""
+    B = len(node_counts)
+    max_len = max(node_counts)
+    out = x.new_zeros(B, max_len, *x.shape[1:])
+    mask = x.new_zeros(B, max_len, dtype=torch.bool)
+    ptr = 0
+    for i, c in enumerate(node_counts):
+        out[i, :c] = x[ptr:ptr + c]
+        mask[i, :c] = True
+        ptr += c
+    return out, mask
+
+
+def unpad_batch(x_dense: torch.Tensor, node_counts: list) -> torch.Tensor:
+    """将 (B, N_max, H) 压缩回 (total_N, H)。"""
+    out_list = [x_dense[i, :c] for i, c in enumerate(node_counts)]
+    return torch.cat(out_list, dim=0)
 
 
 class GraphEdgeConv(nn.Module):
@@ -50,11 +68,10 @@ class GraphEdgeConv(nn.Module):
 
 
 class SliceTransolverBlock(nn.Module):
-    """Transolver 风格 slice attention 块，纯 PyTorch 指针切片实现。"""
+    """Dense 张量 Transolver 注意力层（0 切片循环，100% bmm 向量化）。"""
 
     def __init__(self, hidden_dim: int, num_heads: int, num_slices: int, dropout: float = 0.0):
         super().__init__()
-        self.num_slices = num_slices
         self.assign = nn.Linear(hidden_dim, num_slices)
         self.token_attn = nn.MultiheadAttention(hidden_dim, num_heads, dropout=dropout, batch_first=True)
         self.node_norm1 = nn.LayerNorm(hidden_dim)
@@ -65,50 +82,30 @@ class SliceTransolverBlock(nn.Module):
             nn.Linear(hidden_dim * 4, hidden_dim), nn.Dropout(dropout),
         )
 
-    def forward(self, x: torch.Tensor, batch: torch.Tensor, num_graphs: int, node_counts: list) -> torch.Tensor:
-        assign_logits = self.assign(x)  # (total_N, S)
+    def forward(self, x: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+        # x: (B, N_max, H), mask: (B, N_max)
+        assign_logits = self.assign(x).masked_fill(~mask.unsqueeze(-1), float('-inf'))
+        assign = torch.softmax(assign_logits, dim=1).masked_fill(~mask.unsqueeze(-1), 0.0)  # (B, N, S)
 
-        # 逐图 softmax（替代 scatter_softmax）
-        assign_parts = []
-        ptr = 0
-        for c in node_counts:
-            assign_parts.append(torch.softmax(assign_logits[ptr:ptr + c], dim=0))
-            ptr += c
-        assign = torch.cat(assign_parts, dim=0)  # (total_N, S)
-
-        # 投影到 token 空间：逐图矩阵乘法
-        tokens_parts, denom_parts = [], []
-        ptr = 0
-        for c in node_counts:
-            xg = x[ptr:ptr + c]              # (c, H)
-            ag = assign[ptr:ptr + c]         # (c, S)
-            tokens_parts.append(ag.t() @ xg) # (S, c) @ (c, H) → (S, H)
-            denom_parts.append(ag.sum(dim=0).clamp_min(1e-6))
-            ptr += c
-        tokens = torch.stack(tokens_parts, dim=0)                # (B, S, H)
-        denom = torch.stack(denom_parts, dim=0).unsqueeze(-1)    # (B, S, 1)
-        tokens = tokens / denom
+        # bmm 并行投影到 token 空间
+        denom = assign.sum(dim=1, keepdim=True).clamp_min(1e-6)  # (B, 1, S)
+        tokens = torch.bmm(assign.transpose(1, 2), x) / denom.transpose(1, 2)  # (B, S, H)
 
         # Token 注意力
         tokens_norm = self.token_norm(tokens)
         tokens_attn, _ = self.token_attn(tokens_norm, tokens_norm, tokens_norm,
-                                          need_weights=False)   # (B, S, H)
+                                          need_weights=False)  # (B, S, H)
 
-        # 回写节点：用 cat 替代原地赋值，避免 CopySlicesBackward
-        back_parts = []
-        ptr = 0
-        for g, c in enumerate(node_counts):
-            back_parts.append(assign[ptr:ptr + c] @ tokens_attn[g])  # (c, S) @ (S, H) → (c, H)
-            ptr += c
-        back = torch.cat(back_parts, dim=0)  # (total_N, H)
+        # bmm 回写节点
+        back = torch.bmm(assign, tokens_attn)  # (B, N, H)
 
         y = self.node_norm1(x + back)
         y = self.node_norm2(y + self.ffn(y))
-        return y
+        return y.masked_fill(~mask.unsqueeze(-1), 0.0)
 
 
 class TransolverModalFRF(nn.Module):
-    """Transolver 编码器 + 模态预测头 + 可微 FRF 解码器。
+    """Transolver 编码器 + 模态预测头 + 可微 FRF 解码器（Dense Padding 版）。
 
     参数
     ----------
@@ -134,17 +131,12 @@ class TransolverModalFRF(nn.Module):
                  omega_scale: float = 8000.0):
         super().__init__()
         self.n_modes = n_modes
-        self.hidden_dim = hidden_dim
         self.use_edge_stem = use_edge_stem
 
-        # ======================= 方向配置 =======================
         _DIR_MAP = {"X": 0, "Y": 1, "Z": 2}
-        self.response_direction = response_direction.upper()
-        self.force_direction = force_direction.upper()
-        self.response_dir_index = _DIR_MAP[self.response_direction]
-        self.force_dir_index = _DIR_MAP[self.force_direction]
+        self.response_dir_index = _DIR_MAP[response_direction.upper()]
+        self.force_dir_index = _DIR_MAP[force_direction.upper()]
 
-        # ======================= 编码器主干 =======================
         self.input_proj = nn.Sequential(
             nn.Linear(3 + in_dim, hidden_dim), nn.GELU(),
             nn.Linear(hidden_dim, hidden_dim), nn.LayerNorm(hidden_dim),
@@ -155,7 +147,6 @@ class TransolverModalFRF(nn.Module):
             for _ in range(n_layers)
         ])
 
-        # ======================= 全局池化与预测头 =======================
         self.pool_gate = nn.Sequential(
             nn.Linear(hidden_dim, hidden_dim), nn.GELU(),
             nn.Linear(hidden_dim, 1),
@@ -173,7 +164,6 @@ class TransolverModalFRF(nn.Module):
             nn.Linear(hidden_dim, n_modes * 3),
         )
 
-        # ======================= 振型加权 zeta 残差（局部边界感知） =======================
         self.zeta_context_gate = nn.Sequential(
             nn.Linear(hidden_dim + 2, hidden_dim),
             nn.GELU(),
@@ -185,84 +175,55 @@ class TransolverModalFRF(nn.Module):
             nn.Linear(hidden_dim, 1),
         )
 
-        # ======================= 物理解码器 =======================
         self.physics = ModalFRFDecoder(amp_scale=amp_scale)
         self.omega_scale = nn.Parameter(torch.tensor(omega_scale, dtype=torch.float32))
 
-    # ------------------------------------------------------------------
-    # 编码
-    # ------------------------------------------------------------------
-    def encode(self, points, node_features, batch, edge_index=None, num_graphs=None, node_counts=None):
-        if num_graphs is None:
-            num_graphs = int(batch.max().item()) + 1
-        if node_counts is None:
-            node_counts = batch.bincount().tolist()
+    def encode(self, points, node_features, edge_index=None, node_counts=None):
+        """编码：拼接输入 → edge stem → dense padding → slice blocks → unpadding。"""
         x = self.input_proj(torch.cat([points, node_features], dim=-1))
-        if self.use_edge_stem and edge_index is not None:
+        if self.use_edge_stem and edge_index is not None and edge_index.numel() > 0:
             x = self.edge_stem(x, edge_index)
+
+        x_dense, mask = pad_batch(x, node_counts)
         for block in self.blocks:
-            x = block(x, batch, num_graphs, node_counts)
-        return x
+            x_dense = block(x_dense, mask)
 
-    # ------------------------------------------------------------------
-    # 全局池化（纯 PyTorch 指针切片）
-    # ------------------------------------------------------------------
-    def global_pool(self, x, batch, num_graphs, node_counts):
-        gate_logits = self.pool_gate(x).squeeze(-1)  # (total_N,)
-        out_parts = []
-        ptr = 0
-        for c in node_counts:
-            g_c = torch.softmax(gate_logits[ptr:ptr + c], dim=0)
-            out_parts.append((g_c.unsqueeze(-1) * x[ptr:ptr + c]).sum(dim=0))
-            ptr += c
-        return torch.stack(out_parts, dim=0)  # (B, H)
+        latent_flat = unpad_batch(x_dense, node_counts)
+        return latent_flat, x_dense, mask
 
-    # ------------------------------------------------------------------
-    # 物理阻尼基底：材料阻尼 + 边界耗散（纯 PyTorch 指针切片）
-    # ------------------------------------------------------------------
-    def compute_physics_zeta(self, modal_phi_xyz, boundary_c_xyz, omega, batch, num_graphs, node_counts):
-        diss_per_node = (boundary_c_xyz.unsqueeze(1) * modal_phi_xyz.pow(2)).sum(dim=-1)  # (total_N, K)
-        diss_parts = []
-        ptr = 0
-        for c in node_counts:
-            diss_parts.append(diss_per_node[ptr:ptr + c].sum(dim=0))
-            ptr += c
-        diss_per_graph = torch.stack(diss_parts, dim=0)  # (B, K)
-        zeta = 0.002 + diss_per_graph / (2.0 * omega.clamp_min(1.0))
-        return zeta
+    def global_pool(self, x_dense, mask):
+        """对 dense 张量做门控全局池化。"""
+        gate_logits = self.pool_gate(x_dense).squeeze(-1).masked_fill(~mask, float('-inf'))
+        gate = torch.softmax(gate_logits, dim=1).masked_fill(~mask, 0.0)
+        return (gate.unsqueeze(-1) * x_dense).sum(dim=1)  # (B, H)
 
-    # ------------------------------------------------------------------
-    # 振型加权池化：局部边界感知的 zeta 残差（纯 PyTorch 指针切片）
-    # ------------------------------------------------------------------
-    def mode_weighted_pool(self, latent, phi_xyz, boundary_c_xyz, batch, num_graphs, node_counts):
-        n_modes = self.n_modes
-        modal_energy = phi_xyz.pow(2).sum(dim=-1)                     # (total_N, K)
-        boundary_strength = torch.log1p(boundary_c_xyz.abs().sum(dim=-1))  # (total_N,)
+    def compute_physics_zeta(self, phi_xyz_dense, boundary_c_xyz_dense, omega, mask):
+        """根据材料阻尼与三向边界耗散计算基线阻尼比（dense 版）。"""
+        diss = (boundary_c_xyz_dense.unsqueeze(2) * phi_xyz_dense.pow(2)).sum(dim=-1)  # (B, N, K)
+        diss_per_graph = diss.masked_fill(~mask.unsqueeze(-1), 0.0).sum(dim=1)  # (B, K)
+        return 0.002 + diss_per_graph / (2.0 * omega.clamp_min(1.0))
+
+    def mode_weighted_pool(self, latent_dense, phi_xyz_dense, boundary_c_xyz_dense, mask):
+        """振型加权池化（dense 版，逐模态 masked softmax）。"""
+        modal_energy = phi_xyz_dense.pow(2).sum(dim=-1)  # (B, N, K)
+        boundary_strength = torch.log1p(boundary_c_xyz_dense.abs().sum(dim=-1))  # (B, N)
 
         context_modes = []
-        for k in range(n_modes):
+        for k in range(self.n_modes):
             score_input = torch.cat([
-                latent,
-                modal_energy[:, k:k + 1],
+                latent_dense,
+                modal_energy[..., k:k + 1],
                 boundary_strength.unsqueeze(-1),
             ], dim=-1)
-            learned_score = self.zeta_context_gate(score_input).squeeze(-1)  # (total_N,)
+            learned_score = self.zeta_context_gate(score_input).squeeze(-1)  # (B, N)
             score = (learned_score
-                     + torch.log(modal_energy[:, k] + 1e-8)
-                     + 0.1 * boundary_strength)  # (total_N,)
-
-            ctx_parts = []
-            ptr = 0
-            for c in node_counts:
-                w_c = torch.softmax(score[ptr:ptr + c], dim=0)
-                ctx_parts.append((w_c.unsqueeze(-1) * latent[ptr:ptr + c]).sum(dim=0))
-                ptr += c
-            context_modes.append(torch.stack(ctx_parts, dim=0))  # each (B, H)
+                     + torch.log(modal_energy[..., k] + 1e-8)
+                     + 0.1 * boundary_strength)  # (B, N)
+            score = score.masked_fill(~mask, float('-inf'))
+            w = torch.softmax(score, dim=1).masked_fill(~mask, 0.0)  # (B, N)
+            context_modes.append((w.unsqueeze(-1) * latent_dense).sum(dim=1))  # (B, H)
         return torch.stack(context_modes, dim=1)  # (B, K, H)
 
-    # ------------------------------------------------------------------
-    # 前向传播
-    # ------------------------------------------------------------------
     def forward(self,
                 points: torch.Tensor,
                 node_features: torch.Tensor,
@@ -271,34 +232,34 @@ class TransolverModalFRF(nn.Module):
                 boundary_c_xyz: torch.Tensor | None = None,
                 excitation_index: torch.Tensor | None = None,
                 frequencies: torch.Tensor | None = None,
-                num_graphs: int | None = None):
-        if num_graphs is None:
-            num_graphs = int(batch.max().item()) + 1
-        node_counts = batch.bincount().tolist()  # 整个前向只做 1 次统计
+                num_graphs: int | None = None,
+                node_counts: list | None = None):
+        if node_counts is None:
+            node_counts = batch.bincount().tolist()
 
         # --- 编码 ---
-        latent = self.encode(points, node_features, batch,
-                             edge_index=edge_index, num_graphs=num_graphs,
-                             node_counts=node_counts)
-        global_latent = self.global_pool(latent, batch, num_graphs, node_counts)
+        latent, latent_dense, mask = self.encode(
+            points, node_features, edge_index=edge_index, node_counts=node_counts)
+        global_latent = self.global_pool(latent_dense, mask)
 
-        # --- 固有频率预测 ---
+        # --- 固有频率 ---
         omega_raw = F.softplus(self.omega_head(global_latent)) * F.softplus(self.omega_scale)
-        omega, _ = torch.sort(omega_raw, dim=-1)  # 保证 ω1 < ω2 < ω3
+        omega, _ = torch.sort(omega_raw, dim=-1)
 
-        # --- 模态振型预测 ---
+        # --- 模态振型 ---
         phi_xyz = self.phi_head(latent).view(-1, self.n_modes, 3)
 
-        # --- 方向感知投影（替代硬编码 Z 向） ---
+        # --- 方向感知投影 ---
         phi_response = phi_xyz[..., self.response_dir_index]  # (total_N, K)
         phi_force = phi_xyz[..., self.force_dir_index]        # (total_N, K)
 
-        # --- 阻尼比预测 ---
+        # --- 阻尼比 ---
         if boundary_c_xyz is not None:
-            zeta_phys = self.compute_physics_zeta(phi_xyz, boundary_c_xyz,
-                                                  omega, batch, num_graphs, node_counts)
-            mode_context = self.mode_weighted_pool(latent, phi_xyz,
-                                                   boundary_c_xyz, batch, num_graphs, node_counts)
+            phi_xyz_dense, _ = pad_batch(phi_xyz, node_counts)
+            boundary_c_xyz_dense, _ = pad_batch(boundary_c_xyz, node_counts)
+
+            zeta_phys = self.compute_physics_zeta(phi_xyz_dense, boundary_c_xyz_dense, omega, mask)
+            mode_context = self.mode_weighted_pool(latent_dense, phi_xyz_dense, boundary_c_xyz_dense, mask)
             zeta_residual = self.zeta_mode_residual_head(mode_context).squeeze(-1)  # (B, K)
             zeta = zeta_phys * torch.exp(0.1 * torch.tanh(zeta_residual))
         else:
