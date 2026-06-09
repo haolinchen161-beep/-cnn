@@ -91,7 +91,7 @@ def make_loader(data_dir, filename, batch_size, shuffle, use_edges):
         batch_size=batch_size,
         shuffle=shuffle,
         drop_last=False,
-        num_workers=0,
+        num_workers=4,
         pin_memory=torch.cuda.is_available(),
         collate_fn=collate_mesh_batch,
     )
