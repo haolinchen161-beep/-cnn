@@ -31,14 +31,13 @@ from utils.direction import (
 DEFAULT_CONFIG = {
     'epochs': 300,
     'validation_frequency': 5,
-    'use_frf_loss': True,
+    'use_frf_loss': False,
     'frf_loss_weight': 1.0,
     'gradient_clip': 1.0,
     'modal_loss_weights': {
         'omega': 10.0,
         'zeta': 1.0,
         'phi_resp': 2.0,
-        'phi_xyz': 0.1,
         'mac': 0.2,
     },
     'optimizer': {
