@@ -82,7 +82,8 @@ def modal_loss(outputs: Dict[str, torch.Tensor],
     """
     weights = weights or {}
     batch = batch_data['batch']
-    node_counts = batch.bincount().tolist()
+    # 优先读取 Dataset 传来的 CPU 列表，避免 GPU bincount() 同步
+    node_counts = batch_data.get('node_counts', batch.bincount().tolist())
     num_graphs = len(node_counts)
 
     omega_pred = outputs['modal_omega']
