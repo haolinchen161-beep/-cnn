@@ -171,6 +171,12 @@ class TransolverModalFRF(nn.Module):
             nn.Linear(hidden_dim, 1),
         )
 
+        # 数据驱动阻尼头：纯数据路径，用于训练早期物理路径不稳定时的热启动
+        self.zeta_direct_head = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim), nn.GELU(),
+            nn.Linear(hidden_dim, n_modes),
+        )
+
         self.physics = ModalFRFDecoder(amp_scale=amp_scale)
         self.omega_scale = nn.Parameter(torch.tensor(omega_scale, dtype=torch.float32))
 
@@ -229,7 +235,8 @@ class TransolverModalFRF(nn.Module):
                 excitation_index: torch.Tensor | None = None,
                 frequencies: torch.Tensor | None = None,
                 num_graphs: int | None = None,
-                node_counts: list | None = None):
+                node_counts: list | None = None,
+                physics_alpha: float = 1.0):
         if node_counts is None:
             node_counts = batch.bincount().tolist()
 
@@ -240,9 +247,8 @@ class TransolverModalFRF(nn.Module):
 
         # --- 固有频率 ---
         omega_raw = F.softplus(self.omega_head(global_latent)) * F.softplus(self.omega_scale)
-        # 解除排序绑定，让网络通道自动专精物理特征
-        # 匈牙利匹配会在 loss 计算时动态对齐
-        omega = omega_raw
+        # 强制通道按频率大小排序，给网络提供绝对的锚点
+        omega, _ = torch.sort(omega_raw, dim=-1)
 
         # --- 模态振型（三向） ---
         phi_xyz = self.phi_head(latent).view(-1, self.n_modes, 3)
@@ -251,7 +257,11 @@ class TransolverModalFRF(nn.Module):
         phi_response = phi_xyz[..., self.response_dir_index]  # (total_N, K)
         phi_force = phi_xyz[..., self.force_dir_index]        # (total_N, K)
 
-        # --- 阻尼比（物理耗散 + residual） ---
+        # --- 阻尼比（渐进式物理融合） ---
+        # 1. 数据驱动路径：纯数据预测，用于训练早期热启动
+        zeta_direct = F.softplus(self.zeta_direct_head(global_latent)) + 1e-4  # (B, K)
+
+        # 2. 物理路径：物理耗散基底 + 非线性残差修正
         if boundary_c_xyz is not None:
             phi_xyz_dense, _ = pad_batch(phi_xyz, node_counts)
             boundary_c_xyz_dense, _ = pad_batch(boundary_c_xyz, node_counts)
@@ -260,9 +270,13 @@ class TransolverModalFRF(nn.Module):
             mode_context = self.mode_weighted_pool(latent_dense, phi_xyz_dense, boundary_c_xyz_dense, mask)
             zeta_residual = self.zeta_mode_residual_head(mode_context).squeeze(-1)  # (B, K)
             # 0.5 允许网络进行 ±60% 的修正（exp(0.5)≈1.65, exp(-0.5)≈0.61）
-            zeta = zeta_phys * torch.exp(0.5 * torch.tanh(zeta_residual))
+            zeta_phys_corrected = zeta_phys * torch.exp(0.5 * torch.tanh(zeta_residual))
         else:
-            zeta = F.softplus(self.zeta_residual_head(global_latent)) + 1e-4
+            # 无边界阻尼信息时，物理路径退化为数据路径
+            zeta_phys_corrected = zeta_direct
+
+        # 3. 渐进式融合：alpha=0 纯数据驱动，alpha=1 纯物理路径
+        zeta = (1.0 - physics_alpha) * zeta_direct + physics_alpha * zeta_phys_corrected
 
         # --- FRF 物理重建 ---
         frf = None
