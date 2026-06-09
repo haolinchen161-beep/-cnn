@@ -88,10 +88,8 @@ def modal_loss(outputs: Dict[str, torch.Tensor],
 
     omega_pred = outputs['modal_omega']
     zeta_pred = outputs['modal_zeta']
-    phi_pred = outputs['modal_phi_xyz']
     omega_target = batch_data['modal_omega']
     zeta_target = batch_data['modal_zeta']
-    phi_target = batch_data['modal_phi_xyz']
 
     # 固有频率损失
     loss_omega = relative_l1(omega_pred, omega_target, eps=1e-5)
@@ -108,17 +106,15 @@ def modal_loss(outputs: Dict[str, torch.Tensor],
     zeta_per_mode = torch.mean(
         torch.abs(zeta_pred - zeta_target) / (torch.abs(zeta_target) + 1e-5), dim=0)  # (K,)
 
-    # 方向感知振型损失
-    resp_idx = int(batch_data.get('response_dir_index',
-                                   torch.tensor(2)).flatten()[0].item())
-    phi_resp_pred = phi_pred[..., resp_idx]   # (total_N, K)
-    phi_resp_target = phi_target[..., resp_idx]
+    # Z-only 振型损失
+    phi_resp_pred = outputs['modal_phi_response']  # (total_N, K)
+    phi_resp_target = batch_data['modal_phi_response']
 
     loss_phi_resp = sign_invariant_mse(phi_resp_pred, phi_resp_target, node_counts, normalize=True)
-    loss_phi_xyz = sign_invariant_mse(
-        phi_pred.reshape(phi_pred.shape[0], -1),
-        phi_target.reshape(phi_target.shape[0], -1),
-        node_counts, normalize=True)
+
+    # phi_xyz loss 跳过（Z-only 模式）
+    loss_phi_xyz = phi_resp_pred.new_tensor(0.0)
+
     loss_mac = mac_loss(phi_resp_pred, phi_resp_target, node_counts)
 
     # 逐模态 φ 误差（指针切片版）
@@ -143,14 +139,12 @@ def modal_loss(outputs: Dict[str, torch.Tensor],
         weights.get('omega', 1.0) * loss_omega +
         weights.get('zeta', 0.5) * loss_zeta +
         weights.get('phi_resp', 1.0) * loss_phi_resp +
-        weights.get('phi_xyz', 0.25) * loss_phi_xyz +
         weights.get('mac', 0.2) * loss_mac
     )
     logs = {
         'loss_omega': loss_omega.detach(),
         'loss_zeta': loss_zeta.detach(),
         'loss_phi_resp': loss_phi_resp.detach(),
-        'loss_phi_xyz': loss_phi_xyz.detach(),
         'loss_mac': loss_mac.detach(),
         **{f'omega_k{k}': omega_per_mode[k].detach() for k in range(omega_per_mode.shape[0])},
         **{f'zeta_k{k}': zeta_per_mode[k].detach() for k in range(zeta_per_mode.shape[0])},
