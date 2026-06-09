@@ -80,7 +80,7 @@ class SliceTransolverBlock(nn.Module):
 
     def forward(self, x: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
         # x: (B, N_max, H), mask: (B, N_max)
-        assign_logits = self.assign(x).masked_fill(~mask.unsqueeze(-1), -1e9)
+        assign_logits = self.assign(x).masked_fill(~mask.unsqueeze(-1), -1e4)
         assign = torch.softmax(assign_logits, dim=1).masked_fill(~mask.unsqueeze(-1), 0.0)  # (B, N, S)
 
         # bmm 并行投影到 token 空间
@@ -189,7 +189,7 @@ class TransolverModalFRF(nn.Module):
 
     def global_pool(self, x_dense, mask):
         """对 dense 张量做门控全局池化。"""
-        gate_logits = self.pool_gate(x_dense).squeeze(-1).masked_fill(~mask, -1e9)
+        gate_logits = self.pool_gate(x_dense).squeeze(-1).masked_fill(~mask, -1e4)
         gate = torch.softmax(gate_logits, dim=1).masked_fill(~mask, 0.0)
         return (gate.unsqueeze(-1) * x_dense).sum(dim=1)  # (B, H)
 
@@ -215,7 +215,7 @@ class TransolverModalFRF(nn.Module):
             score = (learned_score
                      + torch.log(modal_energy[..., k] + 1e-8)
                      + 0.1 * boundary_strength)  # (B, N)
-            score = score.masked_fill(~mask, -1e9)
+            score = score.masked_fill(~mask, -1e4)
             w = torch.softmax(score, dim=1).masked_fill(~mask, 0.0)  # (B, N)
             context_modes.append((w.unsqueeze(-1) * latent_dense).sum(dim=1))  # (B, H)
         return torch.stack(context_modes, dim=1)  # (B, K, H)
@@ -240,7 +240,9 @@ class TransolverModalFRF(nn.Module):
 
         # --- 固有频率 ---
         omega_raw = F.softplus(self.omega_head(global_latent)) * F.softplus(self.omega_scale)
-        omega, _ = torch.sort(omega_raw, dim=-1)
+        # 解除排序绑定，让网络通道自动专精物理特征
+        # 匈牙利匹配会在 loss 计算时动态对齐
+        omega = omega_raw
 
         # --- 模态振型（三向） ---
         phi_xyz = self.phi_head(latent).view(-1, self.n_modes, 3)
