@@ -35,10 +35,10 @@ DEFAULT_CONFIG = {
     'frf_loss_weight': 1.0,
     'gradient_clip': 1.0,
     'modal_loss_weights': {
-        'omega': 1.0,
-        'zeta': 0.5,
-        'phi_resp': 1.0,
-        'phi_xyz': 0.25,
+        'omega': 10.0,
+        'zeta': 1.0,
+        'phi_resp': 2.0,
+        'phi_xyz': 0.1,
         'mac': 0.2,
     },
     'optimizer': {
@@ -57,7 +57,7 @@ def parse_args():
     parser.add_argument('--data-dir', default=os.path.join(os.path.dirname(__file__), '..', 'ansys', 'data'))
     parser.add_argument('--output-dir', default=os.path.join(os.path.dirname(__file__), 'output'))
     parser.add_argument('--epochs', type=int, default=DEFAULT_CONFIG['epochs'])
-    parser.add_argument('--batch-size', type=int, default=1, help='5000 节点左右的网格推荐 1-2。')
+    parser.add_argument('--batch-size', type=int, default=2, help='GTX 1650/4GB 推荐 2，显存更多可 3-4。')
     parser.add_argument('--hidden-dim', type=int, default=256)
     parser.add_argument('--layers', type=int, default=6)
     parser.add_argument('--heads', type=int, default=8)
@@ -66,7 +66,7 @@ def parse_args():
     parser.add_argument('--weight-decay', type=float, default=DEFAULT_CONFIG['optimizer']['weight_decay'])
     parser.add_argument('--seed', type=int, default=42)
     parser.add_argument('--device', default='cuda' if torch.cuda.is_available() else 'cpu')
-    parser.add_argument('--fp16', action='store_true')
+    parser.add_argument('--no-fp16', action='store_true', help='禁用混合精度（默认开启 fp16）。')
     parser.add_argument('--no-edges', action='store_true', help='禁用单元连接边 stem。')
     # 方向配置
     parser.add_argument('--response-dir', default=DEFAULT_RESPONSE_DIRECTION,
@@ -151,7 +151,7 @@ def main():
 
     args = Args()
     args.device = cli.device
-    args.fp16 = cli.fp16
+    args.fp16 = not cli.no_fp16
     args.dir = cli.output_dir
 
     ckpt_last = os.path.join(cli.output_dir, 'checkpoint_last')
