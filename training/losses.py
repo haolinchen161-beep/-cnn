@@ -81,8 +81,15 @@ def sign_invariant_mse(pred: torch.Tensor,
         t = target[ptr:ptr + c]
 
         if normalize:
-            p_rms = torch.sqrt(p.pow(2).mean(dim=0) + norm_eps)
-            t_rms = torch.sqrt(t.pow(2).mean(dim=0) + norm_eps)
+            if is_3d:
+                # 3D 向量总能量归一化：联合 XYZ 三向计算统一的 RMS
+                # 避免 X/Y 微小值被独立放大到和 Z 同等权重
+                p_rms = torch.sqrt(p.pow(2).sum(dim=-1).mean(dim=0).unsqueeze(-1) + norm_eps)
+                t_rms = torch.sqrt(t.pow(2).sum(dim=-1).mean(dim=0).unsqueeze(-1) + norm_eps)
+            else:
+                # 1D (如 Z 向振型)，维持原有逻辑
+                p_rms = torch.sqrt(p.pow(2).mean(dim=0) + norm_eps)
+                t_rms = torch.sqrt(t.pow(2).mean(dim=0) + norm_eps)
             p = p / p_rms.clamp_min(norm_eps)
             t = t / t_rms.clamp_min(norm_eps)
 
@@ -179,9 +186,9 @@ def modal_loss(outputs: Dict[str, torch.Tensor],
     phi_resp_pred = phi_pred[..., resp_idx]   # (total_N, K)
     phi_resp_target = phi_target[..., resp_idx]
 
-    loss_phi_resp = sign_invariant_mse(phi_resp_pred, phi_resp_target, node_counts, normalize=True)
+    loss_phi_resp = sign_invariant_mse(phi_resp_pred, phi_resp_target, node_counts, normalize=False)
     # 直接传入 3D 张量，sign_invariant_mse 内部自动处理 3D 符号对齐
-    loss_phi_xyz = sign_invariant_mse(phi_pred, phi_target, node_counts, normalize=True)
+    loss_phi_xyz = sign_invariant_mse(phi_pred, phi_target, node_counts, normalize=False)
     loss_mac = mac_loss(phi_resp_pred, phi_resp_target, node_counts)
 
     # 逐模态 φ 误差（指针切片版）
