@@ -136,11 +136,11 @@ def train(args, config, model_cfg, net, dataloader, optimizer, valloader, schedu
     csv_path = os.path.join(out_dir, 'training_log.csv')
     csv_file = open(csv_path, 'w', newline='', encoding='utf-8')
     csv_writer = csv.writer(csv_file)
-    # CSV 表头（Z-only 模式）
+    # CSV 表头
     csv_header = ['epoch', 'lr',
                   'total',  # 加权总损失
-                  'omega', 'zeta', 'phi_resp', 'mac',  # 原始损失值
-                  'omega%', 'zeta%', 'phi_resp%',  # 损失占比(%)
+                  'omega', 'zeta', 'phi_resp', 'phi_xyz', 'mac',  # 原始损失值
+                  'omega%', 'zeta%', 'phi_resp%', 'phi_xyz%',  # 损失占比(%)
                   'omega_k0', 'omega_k1', 'omega_k2',
                   'zeta_k0', 'zeta_k1', 'zeta_k2',
                   'phi_k0', 'phi_k1', 'phi_k2',
@@ -153,6 +153,7 @@ def train(args, config, model_cfg, net, dataloader, optimizer, valloader, schedu
     w_omega = mw.get('omega', 1.0)
     w_zeta = mw.get('zeta', 0.5)
     w_phi_resp = mw.get('phi_resp', 1.0)
+    w_phi_xyz = mw.get('phi_xyz', 0.25)
     w_mac = mw.get('mac', 0.2)
     w_frf = config.get('frf_loss_weight', 1.0)
 
@@ -166,30 +167,33 @@ def train(args, config, model_cfg, net, dataloader, optimizer, valloader, schedu
         # 当前学习率
         lr = optimizer.param_groups[0]['lr']
 
-        # 计算各损失占比（Z-only 模式）
+        # 计算各损失占比
         raw_o = train_logs.get('loss_omega', 0)
         raw_z = train_logs.get('loss_zeta', 0)
         raw_p = train_logs.get('loss_phi_resp', 0)
+        raw_x = train_logs.get('loss_phi_xyz', 0)
         raw_m = train_logs.get('loss_mac', 0)
         raw_f = train_logs.get('loss_frf', 0)
 
         wv_o = w_omega * raw_o
         wv_z = w_zeta * raw_z
         wv_p = w_phi_resp * raw_p
+        wv_x = w_phi_xyz * raw_x
         wv_m = w_mac * raw_m
         wv_f = w_frf * raw_f
-        total_w = wv_o + wv_z + wv_p + wv_m + wv_f + 1e-12
+        total_w = wv_o + wv_z + wv_p + wv_x + wv_m + wv_f + 1e-12
 
         pct_o = wv_o / total_w * 100
         pct_z = wv_z / total_w * 100
         pct_p = wv_p / total_w * 100
+        pct_x = wv_x / total_w * 100
 
         # 每轮打印（全部百分比形式 + 三阶分开展示 + 学习率）
         omega_pct = ' '.join([f"{train_logs.get(f'omega_k{k}', 0)*100:.1f}%" for k in range(3)])
         zeta_pct = ' '.join([f"{train_logs.get(f'zeta_k{k}', 0)*100:.1f}%" for k in range(3)])
         phi_pct = ' '.join([f"{train_logs.get(f'phi_k{k}', 0)*100:.1f}%" for k in range(3)])
         train_msg = (f"Epoch {epoch:04d} | lr={lr:.1e} | total={total_w:.3e} "
-                     f"[ω={pct_o:.0f}% ζ={pct_z:.0f}% φz={pct_p:.0f}%] "
+                     f"[ω={pct_o:.0f}% ζ={pct_z:.0f}% φz={pct_p:.0f}% φ3={pct_x:.0f}%] "
                      f"ω_k=[{omega_pct}] ζ_k=[{zeta_pct}] φ_k=[{phi_pct}]")
         print(train_msg)
 
@@ -201,7 +205,8 @@ def train(args, config, model_cfg, net, dataloader, optimizer, valloader, schedu
             val_msg = (f"  -> val={metric:.4e} "
                        f"ω_rel={val_logs.get('omega_rel', 0)*100:.1f}% "
                        f"ζ_rel={val_logs.get('zeta_rel', 0)*100:.1f}% "
-                       f"φz={val_logs.get('loss_phi_resp', 0)*100:.1f}%")
+                       f"φz={val_logs.get('loss_phi_resp', 0)*100:.1f}% "
+                       f"φ3={val_logs.get('loss_phi_xyz', 0)*100:.1f}%")
             print(val_msg)
             save_checkpoint(os.path.join(out_dir, 'checkpoint_last'), net, optimizer, epoch, val_logs)
             if metric < best:
@@ -210,8 +215,8 @@ def train(args, config, model_cfg, net, dataloader, optimizer, valloader, schedu
 
         # 写入 CSV
         row = [epoch, f"{lr:.1e}", _r4(total_w),
-               _r4(raw_o), _r4(raw_z), _r4(raw_p), _r4(raw_m),
-               _r4(pct_o), _r4(pct_z), _r4(pct_p),
+               _r4(raw_o), _r4(raw_z), _r4(raw_p), _r4(raw_x), _r4(raw_m),
+               _r4(pct_o), _r4(pct_z), _r4(pct_p), _r4(pct_x),
                *[_r4(train_logs.get(f'omega_k{k}', 0) * 100) for k in range(3)],
                *[_r4(train_logs.get(f'zeta_k{k}', 0) * 100) for k in range(3)],
                *[_r4(train_logs.get(f'phi_k{k}', 0) * 100) for k in range(3)],
