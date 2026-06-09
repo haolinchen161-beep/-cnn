@@ -49,17 +49,20 @@ class TransolverTrainer:
         import time
         self.model.train()
         sums, count = {}, 0
-        t_data = t_fwd = t_bwd = 0.0
+        t_fwd = t_bwd = 0.0
+        t_wait = 0.0  # DataLoader 批次间等待（含 HDF5 读盘）
+        t_loop_start = time.time()
         for batch in loader:
-            t0 = time.time()
+            t_wait += time.time() - t_loop_start  # 等 DataLoader 出下一批的时间
+
             batch = move_batch_to_device(batch, self.device)
-            t_data += time.time() - t0
+            t0 = time.time()
 
             self.optimizer.zero_grad(set_to_none=True)
-            t0 = time.time()
             with torch.cuda.amp.autocast(enabled=self.fp16):
                 outputs = self.forward_batch(batch)
                 loss, logs = total_loss(outputs, batch, config)
+            torch.cuda.synchronize()
             t_fwd += time.time() - t0
 
             t0 = time.time()
@@ -70,14 +73,16 @@ class TransolverTrainer:
                 torch.nn.utils.clip_grad_norm_(self.model.parameters(), grad_clip)
             self.scaler.step(self.optimizer)
             self.scaler.update()
+            torch.cuda.synchronize()
             t_bwd += time.time() - t0
 
             for key, value in logs.items():
                 sums[key] = sums.get(key, 0.0) + float(value.detach().cpu())
             count += 1
+            t_loop_start = time.time()
 
         if count > 0 and epoch % 10 == 0:
-            print(f"  [计时] epoch {epoch}: data={t_data:.1f}s fwd={t_fwd:.1f}s bwd={t_bwd:.1f}s ({count}批)")
+            print(f"  [计时] epoch {epoch}: wait={t_wait:.1f}s fwd={t_fwd:.1f}s bwd={t_bwd:.1f}s ({count}批)")
 
         if self.scheduler is not None:
             self.scheduler.step()
