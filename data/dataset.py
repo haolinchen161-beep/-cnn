@@ -99,10 +99,12 @@ class TransolverModalDataset(Dataset):
                  data_paths: Sequence[str],
                  data_dir: str = '.',
                  use_edges: bool = True,
-                 require_frf: bool = True):
+                 require_frf: bool = True,
+                 min_k2_k3_gap_hz: float = 200.0):
         self.data_dir = data_dir
         self.use_edges = use_edges
         self.require_frf = require_frf
+        self.min_k2_k3_gap_hz = min_k2_k3_gap_hz
         self.samples: List[Tuple[str, str]] = []
         self.feature_names: List[str] = DEFAULT_FEATURE_NAMES
 
@@ -130,10 +132,26 @@ class TransolverModalDataset(Dataset):
 
                 keys = [k for k in h5.keys() if k.startswith('sample_')]
                 keys = sorted(keys, key=lambda k: int(k.split('_')[-1]))
+
+                filtered_count = 0
                 for key in keys:
+                    # 频率差过滤：剔除2-3阶频率差距过小的模态跳转样本
+                    if self.min_k2_k3_gap_hz > 0:
+                        omega_rad = h5[key]['modal_omega'][:]
+                        if len(omega_rad) >= 3:
+                            freqs_hz = omega_rad / (2.0 * np.pi)
+                            gap = freqs_hz[2] - freqs_hz[1]
+                            if gap < self.min_k2_k3_gap_hz:
+                                filtered_count += 1
+                                continue
+
                     self.samples.append((path, key))
+
+                if filtered_count > 0:
+                    print(f"[数据过滤] {os.path.basename(path)}: 剔除 {filtered_count} 个模态跳转样本 (2-3阶频率差 < {self.min_k2_k3_gap_hz} Hz)")
+
         if not self.samples:
-            raise RuntimeError('HDF5 文件中未找到 sample_* 分组。')
+            raise RuntimeError('HDF5 文件中未找到符合条件的 sample_* 分组。')
 
     @property
     def response_direction(self) -> str:
