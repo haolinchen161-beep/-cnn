@@ -259,7 +259,8 @@ class TransolverModalFRF(nn.Module):
             zeta_phys = self.compute_physics_zeta(phi_xyz_dense, boundary_c_xyz_dense, omega, mask)
             mode_context = self.mode_weighted_pool(latent_dense, phi_xyz_dense, boundary_c_xyz_dense, mask)
             zeta_residual = self.zeta_mode_residual_head(mode_context).squeeze(-1)  # (B, K)
-            zeta = zeta_phys * torch.exp(0.1 * torch.tanh(zeta_residual))
+            # 0.5 允许网络进行 ±60% 的修正（exp(0.5)≈1.65, exp(-0.5)≈0.61）
+            zeta = zeta_phys * torch.exp(0.5 * torch.tanh(zeta_residual))
         else:
             zeta = F.softplus(self.zeta_residual_head(global_latent)) + 1e-4
 
