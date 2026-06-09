@@ -24,9 +24,15 @@ def sign_invariant_mse(pred: torch.Tensor,
                        node_counts: list,
                        normalize: bool = True,
                        norm_eps: float = 1e-8) -> torch.Tensor:
-    """逐样本、逐模态符号对齐的振型 MSE（纯 PyTorch 指针切片版）。"""
+    """逐样本、逐模态符号对齐的振型 MSE（纯 PyTorch 指针切片版）。
+
+    对于 3D 张量 (N, K, 3)，符号在节点和坐标轴维度上联合计算，
+    确保每个模态只有一个全局符号，避免独立翻转坐标轴。
+    """
     mse_parts = []
     ptr = 0
+    is_3d = pred.dim() == 3  # (N, K, 3)
+
     for c in node_counts:
         p = pred[ptr:ptr + c]
         t = target[ptr:ptr + c]
@@ -37,10 +43,19 @@ def sign_invariant_mse(pred: torch.Tensor,
             p = p / p_rms.clamp_min(norm_eps)
             t = t / t_rms.clamp_min(norm_eps)
 
-        dot = (p * t).sum(dim=0)
-        sign = torch.where(dot >= 0,
-                           torch.tensor(1.0, device=dot.device),
-                           torch.tensor(-1.0, device=dot.device))
+        # 核心修改：3D 张量在节点和坐标轴维度联合求和，得到唯一全局符号
+        if is_3d:
+            dot = (p * t).sum(dim=(0, 2))  # (K,)
+            sign = torch.where(dot >= 0,
+                               torch.tensor(1.0, device=dot.device),
+                               torch.tensor(-1.0, device=dot.device))
+            sign = sign.unsqueeze(0).unsqueeze(-1)  # (1, K, 1) 广播
+        else:
+            dot = (p * t).sum(dim=0)
+            sign = torch.where(dot >= 0,
+                               torch.tensor(1.0, device=dot.device),
+                               torch.tensor(-1.0, device=dot.device))
+
         mse_parts.append((p - t * sign).pow(2).mean())
         ptr += c
 
@@ -115,10 +130,8 @@ def modal_loss(outputs: Dict[str, torch.Tensor],
     phi_resp_target = phi_target[..., resp_idx]
 
     loss_phi_resp = sign_invariant_mse(phi_resp_pred, phi_resp_target, node_counts, normalize=True)
-    loss_phi_xyz = sign_invariant_mse(
-        phi_pred.reshape(phi_pred.shape[0], -1),
-        phi_target.reshape(phi_target.shape[0], -1),
-        node_counts, normalize=True)
+    # 直接传入 3D 张量，sign_invariant_mse 内部自动处理 3D 符号对齐
+    loss_phi_xyz = sign_invariant_mse(phi_pred, phi_target, node_counts, normalize=True)
     loss_mac = mac_loss(phi_resp_pred, phi_resp_target, node_counts)
 
     # 逐模态 φ 误差（指针切片版）
