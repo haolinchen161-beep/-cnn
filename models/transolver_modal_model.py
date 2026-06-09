@@ -39,7 +39,7 @@ class GraphEdgeConv(nn.Module):
         if edge_index is None or edge_index.numel() == 0:
             return x
         src, dst = edge_index[0].long(), edge_index[1].long()
-        msg = self.msg(torch.cat([x[src], x[dst] - x[src]], dim=-1))
+        msg = self.msg(torch.cat([x[src], x[dst] - x[src]], dim=-1)).to(x.dtype)
         agg = torch.zeros_like(x)
         agg.index_add_(0, dst, msg)
         deg = torch.zeros(x.shape[0], device=x.device, dtype=x.dtype)
@@ -91,9 +91,9 @@ class TransolverModalFRF(nn.Module):
     ----------
     response_direction : str
         响应测量的笛卡尔轴。可选 ``"X"``、``"Y"``、``"Z"``。
-        默认 ``"Y"``（铣削切削平面内方向）。
+        默认 ``"Z"``（薄板面外方向）。
     force_direction : str
-        力激励的笛卡尔轴。默认 ``"Y"``。
+        力激励的笛卡尔轴。默认 ``"Z"``。
     """
 
     def __init__(self,
@@ -106,12 +106,15 @@ class TransolverModalFRF(nn.Module):
                  dropout: float = 0.0,
                  use_edge_stem: bool = True,
                  amp_scale: float = 500000.0,
-                 response_direction: str = "Y",
-                 force_direction: str = "Y"):
+                 response_direction: str = "Z",
+                 force_direction: str = "Z",
+                 omega_scale: float = 8000.0):
         super().__init__()
         self.n_modes = n_modes
         self.hidden_dim = hidden_dim
         self.use_edge_stem = use_edge_stem
+        # 可学习 omega 缩放因子，初始化为典型 omega 值域（~5000 rad/s = 800 Hz）
+        self.omega_scale = nn.Parameter(torch.tensor(omega_scale, dtype=torch.float32))
 
         # ======================= 方向配置 =======================
         _DIR_MAP = {"X": 0, "Y": 1, "Z": 2}
@@ -281,8 +284,8 @@ class TransolverModalFRF(nn.Module):
         global_latent = self.global_pool(latent, batch, num_graphs)
 
         # --- 固有频率预测 ---
-        omega_inc = F.softplus(self.omega_head(global_latent)) + 1e-3
-        omega = torch.cumsum(omega_inc, dim=-1)
+        omega_raw = F.softplus(self.omega_head(global_latent)) * F.softplus(self.omega_scale)
+        omega, _ = torch.sort(omega_raw, dim=-1)  # 保证 ω1 < ω2 < ω3
 
         # --- 模态振型预测 ---
         phi_xyz = self.phi_head(latent).view(-1, self.n_modes, 3)
