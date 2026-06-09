@@ -20,6 +20,7 @@ from __future__ import annotations
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import torch_scatter
 
 from .physics_decoder import ModalFRFDecoder
 
@@ -49,7 +50,7 @@ class GraphEdgeConv(nn.Module):
 
 
 class SliceTransolverBlock(nn.Module):
-    """Transolver 风格 slice attention 块，支持变长批次网格。"""
+    """Transolver 风格 slice attention 块，向量化实现（torch_scatter）。"""
 
     def __init__(self, hidden_dim: int, num_heads: int, num_slices: int, dropout: float = 0.0):
         super().__init__()
@@ -65,23 +66,28 @@ class SliceTransolverBlock(nn.Module):
         )
 
     def forward(self, x: torch.Tensor, batch: torch.Tensor, num_graphs: int) -> torch.Tensor:
-        out = torch.empty_like(x)
-        for g in range(num_graphs):
-            mask = batch == g
-            xg = x[mask]
-            if xg.numel() == 0:
-                continue
-            assign = torch.softmax(self.assign(xg), dim=-1)  # (N_g, S)
-            denom = assign.sum(dim=0).clamp_min(1e-6).unsqueeze(-1)
-            tokens = assign.transpose(0, 1) @ xg / denom  # (S, H)
-            tokens = self.token_norm(tokens).unsqueeze(0)
-            tokens_attn, _ = self.token_attn(tokens, tokens, tokens, need_weights=False)
-            tokens_attn = tokens_attn.squeeze(0)
-            back = assign @ tokens_attn
-            yg = self.node_norm1(xg + back)
-            yg = self.node_norm2(yg + self.ffn(yg))
-            out[mask] = yg
-        return out
+        # 1. 节点→切片软分配（逐图 scatter_softmax）
+        assign_logits = self.assign(x)                          # (total_N, S)
+        assign = torch_scatter.scatter_softmax(assign_logits, batch, dim=0)  # (total_N, S)
+
+        # 2. 切片 token = Σ_i assign_i,s · x_i（逐图 scatter_sum）
+        weighted = assign.unsqueeze(-1) * x.unsqueeze(1)        # (total_N, S, H)
+        tokens = torch_scatter.scatter_sum(weighted, batch, dim=0)  # (B, S, H)
+        denom = torch_scatter.scatter_sum(assign, batch, dim=0).unsqueeze(-1).clamp_min(1e-6)  # (B, S, 1)
+        tokens = tokens / denom                                  # (B, S, H)
+
+        # 3. 切片间注意力（批量 MHA）
+        tokens_norm = self.token_norm(tokens)                    # (B, S, H)
+        tokens_attn, _ = self.token_attn(tokens_norm, tokens_norm, tokens_norm,
+                                          need_weights=False)   # (B, S, H)
+
+        # 4. 切片信息回写节点：back_i = Σ_s assign_i,s · tokens_attn[g(i), s, :]
+        back = (assign.unsqueeze(-1) * tokens_attn[batch]).sum(dim=1)  # (total_N, H)
+
+        # 5. 残差 + FFN
+        y = self.node_norm1(x + back)
+        y = self.node_norm2(y + self.ffn(y))
+        return y
 
 
 class TransolverModalFRF(nn.Module):
@@ -184,84 +190,62 @@ class TransolverModalFRF(nn.Module):
         return x
 
     # ------------------------------------------------------------------
-    # 全局池化
+    # 全局池化（向量化）
     # ------------------------------------------------------------------
     def global_pool(self, x, batch, num_graphs):
-        pooled = []
-        for g in range(num_graphs):
-            mask = batch == g
-            xg = x[mask]
-            gate = torch.softmax(self.pool_gate(xg).squeeze(-1), dim=0)
-            pooled.append((gate.unsqueeze(-1) * xg).sum(dim=0))
-        return torch.stack(pooled, dim=0)
+        gate_logits = self.pool_gate(x).squeeze(-1)                 # (total_N,)
+        gate = torch_scatter.scatter_softmax(gate_logits, batch, dim=0)  # (total_N,)
+        return torch_scatter.scatter_sum(gate.unsqueeze(-1) * x, batch, dim=0)  # (B, H)
 
     # ------------------------------------------------------------------
-    # 物理阻尼基底：材料阻尼 + 边界耗散
+    # 物理阻尼基底：材料阻尼 + 边界耗散（向量化）
     # ------------------------------------------------------------------
     def compute_physics_zeta(self, modal_phi_xyz, boundary_c_xyz, omega, batch, num_graphs):
         """根据材料阻尼与三向边界耗散计算基线阻尼比。
 
         ζ_k = ζ_material + Σ_i Σ_d C_{i,d} · φ_{i,d,k}² / (2 · ω_k)
         """
-        zeta = modal_phi_xyz.new_zeros(num_graphs, self.n_modes)
-        for g in range(num_graphs):
-            mask = batch == g
-            phi = modal_phi_xyz[mask]       # (N_g, K, 3)
-            c = boundary_c_xyz[mask]        # (N_g, 3)
-            diss = (c.unsqueeze(1) * phi.pow(2)).sum(dim=(0, 2))
-            zeta[g] = 0.002 + diss / (2.0 * omega[g].clamp_min(1.0))
+        # diss_i,k = Σ_d C_{i,d} · φ_{i,d,k}²  → (total_N, K)
+        diss_per_node = (boundary_c_xyz.unsqueeze(1) * modal_phi_xyz.pow(2)).sum(dim=-1)  # (total_N, K)
+        diss_per_graph = torch_scatter.scatter_sum(diss_per_node, batch, dim=0)  # (B, K)
+        zeta = 0.002 + diss_per_graph / (2.0 * omega.clamp_min(1.0))
         return zeta
 
     # ------------------------------------------------------------------
-    # 振型加权池化：局部边界感知的 zeta 残差
+    # 振型加权池化：局部边界感知的 zeta 残差（半向量化：逐模态 scatter）
     # ------------------------------------------------------------------
     def mode_weighted_pool(self, latent, phi_xyz, boundary_c_xyz, batch, num_graphs):
-        """按图和模态对节点隐层特征做加权池化，权重由模态能量和局部边界强度决定。
-
-        返回:
-            context: (B, K, H)，B=图数, K=模态阶数, H=隐层维度。
-        """
         n_modes = self.n_modes
         H = latent.shape[-1]
-        device = latent.device
 
-        context = latent.new_zeros(num_graphs, n_modes, H)
+        # 模态能量: (total_N, K)
+        modal_energy = phi_xyz.pow(2).sum(dim=-1)
+        # 边界强度: (total_N,)
+        boundary_strength = torch.log1p(boundary_c_xyz.abs().sum(dim=-1))
 
-        for g in range(num_graphs):
-            mask = batch == g
-            if not torch.any(mask):
-                continue
-            latent_g = latent[mask]              # (N_g, H)
-            phi_g = phi_xyz[mask]                # (N_g, K, 3)
-            c_g = boundary_c_xyz[mask]           # (N_g, 3)
+        context_list = []
+        for k in range(n_modes):
+            # 打分输入: [latent | modal_energy_k | boundary_strength] -> (total_N, H+2)
+            score_input = torch.cat([
+                latent,
+                modal_energy[:, k:k+1],
+                boundary_strength.unsqueeze(-1),
+            ], dim=-1)
+            learned_score = self.zeta_context_gate(score_input).squeeze(-1)  # (total_N,)
 
-            # 模态能量：XYZ 三分量平方和，形状 (N_g, K)
-            modal_energy = phi_g.pow(2).sum(dim=-1)  # (N_g, K)
-
-            # 边界强度：每节点阻尼总量的 log1p，形状 (N_g,)
-            boundary_strength = torch.log1p(c_g.abs().sum(dim=-1))  # (N_g,)
-
-            # 打分输入：[latent | modal_energy | boundary_strength]，按 (节点, 模态)
-            latent_exp = latent_g.unsqueeze(1).expand(-1, n_modes, -1)   # (N_g, K, H)
-            energy_exp = modal_energy.unsqueeze(-1)                       # (N_g, K, 1)
-            boundary_exp = (boundary_strength.unsqueeze(-1)
-                            .unsqueeze(-1).expand(-1, n_modes, 1))       # (N_g, K, 1)
-
-            score_input = torch.cat([latent_exp, energy_exp, boundary_exp], dim=-1)
-            # (N_g, K, H+2) → (N_g, K, 1) → (N_g, K)
-            learned_score = self.zeta_context_gate(score_input).squeeze(-1)  # (N_g, K)
-
-            # 综合得分 = 学习得分 + 物理先验（模态能量 + 边界强度）
+            # 综合得分
             score = (learned_score
-                     + torch.log(modal_energy + 1e-8)
-                     + 0.1 * boundary_strength.unsqueeze(-1))  # (N_g, K)
+                     + torch.log(modal_energy[:, k] + 1e-8)
+                     + 0.1 * boundary_strength)  # (total_N,)
 
-            weight = torch.softmax(score, dim=0)  # 同图内所有节点做 softmax
+            weight = torch_scatter.scatter_softmax(score, batch, dim=0)  # (total_N,)
 
-            # 加权求和：Σ_i w_{i,k} · latent_i  → (K, H)
-            context[g] = (weight.unsqueeze(-1) * latent_g.unsqueeze(1)).sum(dim=0)
+            # 加权池化
+            ctx_k = torch_scatter.scatter_sum(
+                weight.unsqueeze(-1) * latent, batch, dim=0)  # (B, H)
+            context_list.append(ctx_k)
 
-        return context
+        return torch.stack(context_list, dim=1)  # (B, K, H)
 
     # ------------------------------------------------------------------
     # 前向传播
