@@ -111,13 +111,38 @@ def modal_loss(outputs: Dict[str, torch.Tensor],
         0.5 * relative_l1(zeta_pred, zeta_target, eps=1e-5)
     )
 
+    # 逐模态频率和阻尼误差（用于训练日志）
+    omega_per_mode = torch.mean(
+        torch.abs(omega_pred - omega_target) / (torch.abs(omega_target) + 1e-5), dim=0)  # (K,)
+    zeta_per_mode = torch.mean(
+        torch.abs(zeta_pred - zeta_target) / (torch.abs(zeta_target) + 1e-5), dim=0)  # (K,)
+
     # 方向感知振型损失：取 response_dir_index 对应的分量
     resp_idx = int(batch_data.get('response_dir_index',
                                    torch.tensor(2)).flatten()[0].item())
+    phi_resp_pred = phi_pred[..., resp_idx]   # (total_N, K)
+    phi_resp_target = phi_target[..., resp_idx]
     loss_phi_resp = sign_invariant_mse(
-        phi_pred[..., resp_idx], phi_target[..., resp_idx],
+        phi_resp_pred, phi_resp_target,
         batch, num_graphs, normalize=True
     )
+
+    # 逐模态 φ 误差（用于训练日志）
+    phi_per_mode = phi_resp_pred.new_zeros(num_graphs, phi_resp_pred.shape[1])
+    for g in range(num_graphs):
+        mask = batch == g
+        if not torch.any(mask):
+            continue
+        p = phi_resp_pred[mask]
+        t = phi_resp_target[mask]
+        # RMS 归一化
+        p = rms_normalize(p)
+        t = rms_normalize(t)
+        # 逐模态符号对齐
+        dot = torch.sum(p * t, dim=0, keepdim=True)
+        sign = torch.where(dot >= 0, torch.ones_like(dot), -torch.ones_like(dot))
+        phi_per_mode[g] = F.mse_loss(p, t * sign, reduction='none').mean(dim=0)  # (K,)
+    phi_per_mode = phi_per_mode.mean(dim=0)  # (K,) 跨图平均
 
     # 完整 XYZ 三向振型损失（展平为每节点 3*K 维向量后做符号对齐）
     loss_phi_xyz = sign_invariant_mse(
@@ -145,6 +170,9 @@ def modal_loss(outputs: Dict[str, torch.Tensor],
         'loss_phi_resp': loss_phi_resp.detach(),
         'loss_phi_xyz': loss_phi_xyz.detach(),
         'loss_mac': loss_mac.detach(),
+        **{f'omega_k{k}': omega_per_mode[k].detach() for k in range(omega_per_mode.shape[0])},
+        **{f'zeta_k{k}': zeta_per_mode[k].detach() for k in range(zeta_per_mode.shape[0])},
+        **{f'phi_k{k}': phi_per_mode[k].detach() for k in range(phi_per_mode.shape[0])},
     }
     return total, logs
 
