@@ -100,7 +100,7 @@ def main():
     metrics = trainer.evaluate(loader, {
         'use_frf_loss': True,
         'frf_loss_weight': 1.0,
-        'modal_loss_weights': {'omega': 1.0, 'zeta': 0.5, 'phi_resp': 1.0, 'phi_xyz': 0.25, 'mac': 0.2},
+        'modal_loss_weights': {'omega': 1.0, 'zeta': 0.5, 'phi_resp': 1.0, 'mac': 0.2},
     })
 
     all_points, all_freqs = [], []
