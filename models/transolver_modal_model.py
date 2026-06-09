@@ -1,17 +1,16 @@
-"""物理引导 Transolver 风格模型，用于模态 FRF 预测（Dense Padding 极速版）。
+"""物理引导 Transolver 风格模型，用于模态 FRF 预测（Z-only Dense Padding 极速版）。
 
 输入:
     非结构化 ANSYS 节点 + Transolver 节点特征 + 可选网格边。
 输出:
-    模态固有频率、模态阻尼比、逐节点 XYZ 三向振型，以及方向性 FRF。
+    模态固有频率、模态阻尼比、逐节点 Z 向振型，以及 H_ZZ FRF。
 
 全链路使用 Dense Padding + bmm 实现，0 隐式同步，100% 向量化。
 
-方向约定
---------
-模型不再硬编码 Z 方向。改为接受 ``response_direction`` 和 ``force_direction``
-（各为 ``"X"``、``"Y"`` 或 ``"Z"``），内部自动选择正确的笛卡尔轴索引。
-解码出的 FRF 为 H_ab，其中 ``a`` = 响应方向，``b`` = 激励方向。
+Z-only 模式
+-----------
+当前模型仅支持 H_ZZ（Z 向激励 + Z 向响应）。
+阻尼比 ζ 使用学习型预测（不依赖三向振型）。
 """
 from __future__ import annotations
 
@@ -165,17 +164,6 @@ class TransolverModalFRF(nn.Module):
             nn.Linear(hidden_dim, n_modes),
         )
 
-        self.zeta_context_gate = nn.Sequential(
-            nn.Linear(hidden_dim + 2, hidden_dim),
-            nn.GELU(),
-            nn.Linear(hidden_dim, 1),
-        )
-        self.zeta_mode_residual_head = nn.Sequential(
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.GELU(),
-            nn.Linear(hidden_dim, 1),
-        )
-
         self.physics = ModalFRFDecoder(amp_scale=amp_scale)
         self.omega_scale = nn.Parameter(torch.tensor(omega_scale, dtype=torch.float32))
 
@@ -197,33 +185,6 @@ class TransolverModalFRF(nn.Module):
         gate_logits = self.pool_gate(x_dense).squeeze(-1).masked_fill(~mask, float('-inf'))
         gate = torch.softmax(gate_logits, dim=1).masked_fill(~mask, 0.0)
         return (gate.unsqueeze(-1) * x_dense).sum(dim=1)  # (B, H)
-
-    def compute_physics_zeta(self, phi_xyz_dense, boundary_c_xyz_dense, omega, mask):
-        """根据材料阻尼与三向边界耗散计算基线阻尼比（dense 版）。"""
-        diss = (boundary_c_xyz_dense.unsqueeze(2) * phi_xyz_dense.pow(2)).sum(dim=-1)  # (B, N, K)
-        diss_per_graph = diss.masked_fill(~mask.unsqueeze(-1), 0.0).sum(dim=1)  # (B, K)
-        return 0.002 + diss_per_graph / (2.0 * omega.clamp_min(1.0))
-
-    def mode_weighted_pool(self, latent_dense, phi_xyz_dense, boundary_c_xyz_dense, mask):
-        """振型加权池化（dense 版，逐模态 masked softmax）。"""
-        modal_energy = phi_xyz_dense.pow(2).sum(dim=-1)  # (B, N, K)
-        boundary_strength = torch.log1p(boundary_c_xyz_dense.abs().sum(dim=-1))  # (B, N)
-
-        context_modes = []
-        for k in range(self.n_modes):
-            score_input = torch.cat([
-                latent_dense,
-                modal_energy[..., k:k + 1],
-                boundary_strength.unsqueeze(-1),
-            ], dim=-1)
-            learned_score = self.zeta_context_gate(score_input).squeeze(-1)  # (B, N)
-            score = (learned_score
-                     + torch.log(modal_energy[..., k] + 1e-8)
-                     + 0.1 * boundary_strength)  # (B, N)
-            score = score.masked_fill(~mask, float('-inf'))
-            w = torch.softmax(score, dim=1).masked_fill(~mask, 0.0)  # (B, N)
-            context_modes.append((w.unsqueeze(-1) * latent_dense).sum(dim=1))  # (B, H)
-        return torch.stack(context_modes, dim=1)  # (B, K, H)
 
     def forward(self,
                 points: torch.Tensor,
