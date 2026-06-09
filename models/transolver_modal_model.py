@@ -69,25 +69,28 @@ class SliceTransolverBlock(nn.Module):
         assign_logits = self.assign(x)                          # (total_N, S)
         assign = torch_scatter.scatter_softmax(assign_logits, batch, dim=0)  # (total_N, S)
 
-        # 切片 token + 注意力（逐图矩阵乘法，避免 (total_N,S,H) 3D 张量爆炸）
+        # 投影到 token 空间（逐图矩阵乘法，无 3D 中间张量）
         tokens_list, denom_list = [], []
         for g in range(num_graphs):
             mask = (batch == g)
             xg = x[mask]           # (N_g, H)
             ag = assign[mask]      # (N_g, S)
-            # (S, N_g) @ (N_g, H) → (S, H)，极速，无 3D 中间张量
-            tokens_list.append(ag.t() @ xg)
+            tokens_list.append(ag.t() @ xg)                     # (S, N_g) @ (N_g, H) → (S, H)
             denom_list.append(ag.sum(dim=0).clamp_min(1e-6))
         tokens = torch.stack(tokens_list, dim=0)                # (B, S, H)
         denom = torch.stack(denom_list, dim=0).unsqueeze(-1)    # (B, S, 1)
         tokens = tokens / denom
 
-        tokens_norm = self.token_norm(tokens)                    # (B, S, H)
+        # Token 注意力
+        tokens_norm = self.token_norm(tokens)
         tokens_attn, _ = self.token_attn(tokens_norm, tokens_norm, tokens_norm,
                                           need_weights=False)   # (B, S, H)
 
-        # 回写节点：einsum 避免 (total_N,S,H) 具象化
-        back = torch.einsum('ns,nsh->nh', assign, tokens_attn[batch])  # (total_N, H)
+        # 回写节点（逐图矩阵乘法：避免 tokens_attn[batch] 3D 具象化）
+        back = torch.empty_like(x)
+        for g in range(num_graphs):
+            mask = (batch == g)
+            back[mask] = (assign[mask] @ tokens_attn[g]).to(back.dtype)  # (N_g, S) @ (S, H) → (N_g, H)
 
         y = self.node_norm1(x + back)
         y = self.node_norm2(y + self.ffn(y))
