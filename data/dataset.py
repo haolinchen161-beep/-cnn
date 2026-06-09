@@ -108,6 +108,7 @@ class TransolverModalDataset(Dataset):
 
         # 文件级属性缓存（取最后一个文件的属性）
         self._file_attrs: Dict[str, object] = {}
+        self.ram_cache: Dict[int, Dict[str, torch.Tensor]] = {}  # 内存缓存，第 2 epoch 起极速
         self._load_index([os.path.join(data_dir, p) for p in data_paths])
 
     def _load_index(self, paths: Iterable[str]) -> None:
@@ -167,6 +168,10 @@ class TransolverModalDataset(Dataset):
         return len(self.samples)
 
     def __getitem__(self, index: int) -> Dict[str, torch.Tensor]:
+        # 内存缓存命中 → 直接返回（第 2+ epoch 极速）
+        if index in self.ram_cache:
+            return self.ram_cache[index]
+
         path, group_name = self.samples[index]
         with h5py.File(path, 'r') as h5:
             group = h5[group_name]
@@ -280,7 +285,7 @@ class TransolverModalDataset(Dataset):
         if extra_feats:
             node_features = torch.cat([node_features] + extra_feats, dim=-1)
 
-        return {
+        result = {
             'points': points,
             'node_features': node_features,
             'edge_index': edge_index,
@@ -317,6 +322,8 @@ class TransolverModalDataset(Dataset):
             'sample_path': path,
             'sample_group': group_name,
         }
+        self.ram_cache[index] = result
+        return result
 
 
 # 向后兼容别名
