@@ -133,11 +133,11 @@ def train(args, config, model_cfg, net, dataloader, optimizer, valloader, schedu
     csv_path = os.path.join(out_dir, 'training_log.csv')
     csv_file = open(csv_path, 'w', newline='', encoding='utf-8')
     csv_writer = csv.writer(csv_file)
-    # CSV 表头
+    # CSV 表头（Z-only 模式）
     csv_header = ['epoch', 'lr',
                   'total',  # 加权总损失
-                  'omega', 'zeta', 'phi_resp', 'phi_xyz', 'mac',  # 原始损失值
-                  'omega%', 'zeta%', 'phi_resp%', 'phi_xyz%',  # 损失占比(%)
+                  'omega', 'zeta', 'phi_resp', 'mac',  # 原始损失值
+                  'omega%', 'zeta%', 'phi_resp%',  # 损失占比(%)
                   'omega_k0', 'omega_k1', 'omega_k2',
                   'zeta_k0', 'zeta_k1', 'zeta_k2',
                   'phi_k0', 'phi_k1', 'phi_k2',
@@ -150,9 +150,12 @@ def train(args, config, model_cfg, net, dataloader, optimizer, valloader, schedu
     w_omega = mw.get('omega', 1.0)
     w_zeta = mw.get('zeta', 0.5)
     w_phi_resp = mw.get('phi_resp', 1.0)
-    w_phi_xyz = mw.get('phi_xyz', 0.25)
     w_mac = mw.get('mac', 0.2)
     w_frf = config.get('frf_loss_weight', 1.0)
+
+    def _r4(v):
+        """四舍五入到 4 位小数"""
+        return round(float(v), 4) if isinstance(v, (int, float, torch.Tensor)) else v
 
     for epoch in range(start_epoch, epochs):
         train_logs = trainer.train_epoch(dataloader, config, epoch)
@@ -160,33 +163,30 @@ def train(args, config, model_cfg, net, dataloader, optimizer, valloader, schedu
         # 当前学习率
         lr = optimizer.param_groups[0]['lr']
 
-        # 计算各损失占比
+        # 计算各损失占比（Z-only 模式）
         raw_o = train_logs.get('loss_omega', 0)
         raw_z = train_logs.get('loss_zeta', 0)
         raw_p = train_logs.get('loss_phi_resp', 0)
-        raw_p3 = train_logs.get('loss_phi_xyz', 0)
         raw_m = train_logs.get('loss_mac', 0)
         raw_f = train_logs.get('loss_frf', 0)
 
         wv_o = w_omega * raw_o
         wv_z = w_zeta * raw_z
         wv_p = w_phi_resp * raw_p
-        wv_p3 = w_phi_xyz * raw_p3
         wv_m = w_mac * raw_m
         wv_f = w_frf * raw_f
-        total_w = wv_o + wv_z + wv_p + wv_p3 + wv_m + wv_f + 1e-12
+        total_w = wv_o + wv_z + wv_p + wv_m + wv_f + 1e-12
 
         pct_o = wv_o / total_w * 100
         pct_z = wv_z / total_w * 100
         pct_p = wv_p / total_w * 100
-        pct_p3 = wv_p3 / total_w * 100
 
         # 每轮打印（全部百分比形式 + 三阶分开展示 + 学习率）
         omega_pct = ' '.join([f"{train_logs.get(f'omega_k{k}', 0)*100:.1f}%" for k in range(3)])
         zeta_pct = ' '.join([f"{train_logs.get(f'zeta_k{k}', 0)*100:.1f}%" for k in range(3)])
         phi_pct = ' '.join([f"{train_logs.get(f'phi_k{k}', 0)*100:.1f}%" for k in range(3)])
         train_msg = (f"Epoch {epoch:04d} | lr={lr:.1e} | total={total_w:.3e} "
-                     f"[ω={pct_o:.0f}% ζ={pct_z:.0f}% φz={pct_p:.0f}% φ3={pct_p3:.0f}%] "
+                     f"[ω={pct_o:.0f}% ζ={pct_z:.0f}% φz={pct_p:.0f}%] "
                      f"ω_k=[{omega_pct}] ζ_k=[{zeta_pct}] φ_k=[{phi_pct}]")
         print(train_msg)
 
@@ -195,8 +195,10 @@ def train(args, config, model_cfg, net, dataloader, optimizer, valloader, schedu
         if epoch % config.get('validation_frequency', 5) == 0 or epoch == epochs - 1:
             val_logs = trainer.evaluate(valloader, config)
             metric = val_logs.get('loss_total', val_logs.get('loss_modal', float('inf')))
-            val_msg = (f"  -> val={metric:.4e} ω_rel={val_logs.get('omega_rel', 0):.3e} "
-                       f"ζ_rel={val_logs.get('zeta_rel', 0):.3e}")
+            val_msg = (f"  -> val={metric:.4e} "
+                       f"ω_rel={val_logs.get('omega_rel', 0)*100:.1f}% "
+                       f"ζ_rel={val_logs.get('zeta_rel', 0)*100:.1f}% "
+                       f"φz={val_logs.get('loss_phi_resp', 0)*100:.1f}%")
             print(val_msg)
             save_checkpoint(os.path.join(out_dir, 'checkpoint_last'), net, optimizer, epoch, val_logs)
             if metric < best:
@@ -204,19 +206,19 @@ def train(args, config, model_cfg, net, dataloader, optimizer, valloader, schedu
                 save_checkpoint(os.path.join(out_dir, 'checkpoint_best'), net, optimizer, epoch, val_logs)
 
         # 写入 CSV
-        row = [epoch, lr, total_w,
-               raw_o, raw_z, raw_p, raw_p3, raw_m,
-               pct_o, pct_z, pct_p, pct_p3,
-               *[train_logs.get(f'omega_k{k}', 0) for k in range(3)],
-               *[train_logs.get(f'zeta_k{k}', 0) for k in range(3)],
-               *[train_logs.get(f'phi_k{k}', 0) for k in range(3)],
-               raw_f,
-               train_logs.get('loss_frf_complex', 0),
-               train_logs.get('loss_frf_log_amp', 0),
-               train_logs.get('loss_frf_db', 0),
-               val_logs.get('loss_total', '') if val_logs else '',
-               val_logs.get('omega_rel', '') if val_logs else '',
-               val_logs.get('zeta_rel', '') if val_logs else '']
+        row = [epoch, f"{lr:.1e}", _r4(total_w),
+               _r4(raw_o), _r4(raw_z), _r4(raw_p), _r4(raw_m),
+               _r4(pct_o), _r4(pct_z), _r4(pct_p),
+               *[_r4(train_logs.get(f'omega_k{k}', 0) * 100) for k in range(3)],
+               *[_r4(train_logs.get(f'zeta_k{k}', 0) * 100) for k in range(3)],
+               *[_r4(train_logs.get(f'phi_k{k}', 0) * 100) for k in range(3)],
+               _r4(raw_f),
+               _r4(train_logs.get('loss_frf_complex', 0)),
+               _r4(train_logs.get('loss_frf_log_amp', 0)),
+               _r4(train_logs.get('loss_frf_db', 0)),
+               _r4(val_logs.get('loss_total', '')) if val_logs else '',
+               _r4(val_logs.get('omega_rel', '')) if val_logs else '',
+               _r4(val_logs.get('zeta_rel', '')) if val_logs else '']
         csv_writer.writerow(row)
         csv_file.flush()
 
