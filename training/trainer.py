@@ -36,6 +36,8 @@ class TransolverTrainer:
     def forward_batch(self, batch: Dict, config: Dict | None = None) -> Dict[str, torch.Tensor]:
         # 根据 use_frf_loss 决定是否传入 frequencies（节省计算）
         use_frf = True if config is None else config.get('use_frf_loss', False)
+        # 渐进式物理融合权重：训练时由 epoch 计算，评估时默认 1.0（纯物理）
+        physics_alpha = 1.0 if config is None else config.get('physics_alpha', 1.0)
 
         return self.model(
             points=batch['points'],
@@ -47,12 +49,20 @@ class TransolverTrainer:
             frequencies=batch.get('frequencies') if use_frf else None,
             num_graphs=batch.get('num_graphs'),
             node_counts=batch.get('node_counts'),
+            physics_alpha=physics_alpha,
         )
 
     def train_epoch(self, loader, config: Dict, epoch: int = 0) -> Dict[str, float]:
         import time
         self.model.train()
         sums, count = {}, 0
+
+        # 渐进式物理融合：前 warmup_epochs 从 0 线性升到 1
+        # epoch=0 时 alpha≈0（纯数据驱动），epoch=warmup 时 alpha=1（纯物理路径）
+        warmup_epochs = config.get('physics_alpha_warmup', 50)
+        physics_alpha = min(1.0, epoch / max(warmup_epochs, 1))
+        config['physics_alpha'] = physics_alpha
+
         t_fwd = t_bwd = 0.0
         t_wait = 0.0  # DataLoader 批次间等待（含 HDF5 读盘）
         t_loop_start = time.time()
@@ -192,7 +202,7 @@ def train(args, config, model_cfg, net, dataloader, optimizer, valloader, schedu
         omega_pct = ' '.join([f"{train_logs.get(f'omega_k{k}', 0)*100:.1f}%" for k in range(3)])
         zeta_pct = ' '.join([f"{train_logs.get(f'zeta_k{k}', 0)*100:.1f}%" for k in range(3)])
         phi_pct = ' '.join([f"{train_logs.get(f'phi_k{k}', 0)*100:.1f}%" for k in range(3)])
-        train_msg = (f"Epoch {epoch:04d} | lr={lr:.1e} | total={total_w:.3e} "
+        train_msg = (f"Epoch {epoch:04d} | lr={lr:.1e} | α={physics_alpha:.2f} | total={total_w:.3e} "
                      f"[ω={pct_o:.0f}% ζ={pct_z:.0f}% φz={pct_p:.0f}% φ3={pct_x:.0f}%] "
                      f"ω_k=[{omega_pct}] ζ_k=[{zeta_pct}] φ_k=[{phi_pct}]")
         print(train_msg)
