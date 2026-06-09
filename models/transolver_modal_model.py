@@ -66,25 +66,29 @@ class SliceTransolverBlock(nn.Module):
         )
 
     def forward(self, x: torch.Tensor, batch: torch.Tensor, num_graphs: int) -> torch.Tensor:
-        # 1. 节点→切片软分配（逐图 scatter_softmax）
         assign_logits = self.assign(x)                          # (total_N, S)
         assign = torch_scatter.scatter_softmax(assign_logits, batch, dim=0)  # (total_N, S)
 
-        # 2. 切片 token = Σ_i assign_i,s · x_i（逐图 scatter_sum）
-        weighted = assign.unsqueeze(-1) * x.unsqueeze(1)        # (total_N, S, H)
-        tokens = torch_scatter.scatter_sum(weighted, batch, dim=0)  # (B, S, H)
-        denom = torch_scatter.scatter_sum(assign, batch, dim=0).unsqueeze(-1).clamp_min(1e-6)  # (B, S, 1)
-        tokens = tokens / denom                                  # (B, S, H)
+        # 切片 token + 注意力（逐图矩阵乘法，避免 (total_N,S,H) 3D 张量爆炸）
+        tokens_list, denom_list = [], []
+        for g in range(num_graphs):
+            mask = (batch == g)
+            xg = x[mask]           # (N_g, H)
+            ag = assign[mask]      # (N_g, S)
+            # (S, N_g) @ (N_g, H) → (S, H)，极速，无 3D 中间张量
+            tokens_list.append(ag.t() @ xg)
+            denom_list.append(ag.sum(dim=0).clamp_min(1e-6))
+        tokens = torch.stack(tokens_list, dim=0)                # (B, S, H)
+        denom = torch.stack(denom_list, dim=0).unsqueeze(-1)    # (B, S, 1)
+        tokens = tokens / denom
 
-        # 3. 切片间注意力（批量 MHA）
         tokens_norm = self.token_norm(tokens)                    # (B, S, H)
         tokens_attn, _ = self.token_attn(tokens_norm, tokens_norm, tokens_norm,
                                           need_weights=False)   # (B, S, H)
 
-        # 4. 切片信息回写节点：back_i = Σ_s assign_i,s · tokens_attn[g(i), s, :]
-        back = (assign.unsqueeze(-1) * tokens_attn[batch]).sum(dim=1)  # (total_N, H)
+        # 回写节点：einsum 避免 (total_N,S,H) 具象化
+        back = torch.einsum('ns,nsh->nh', assign, tokens_attn[batch])  # (total_N, H)
 
-        # 5. 残差 + FFN
         y = self.node_norm1(x + back)
         y = self.node_norm2(y + self.ffn(y))
         return y
