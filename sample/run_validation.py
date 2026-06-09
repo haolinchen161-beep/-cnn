@@ -38,6 +38,7 @@ DEFAULT_CONFIG = {
         'omega': 10.0,
         'zeta': 1.0,
         'phi_resp': 2.0,
+        'phi_xyz': 0.1,
         'mac': 0.2,
     },
     'optimizer': {
@@ -99,11 +100,6 @@ def make_loader(data_dir, filename, batch_size, shuffle, use_edges):
 
 def main():
     cli = parse_args()
-
-    # Z-only 模型方向检查
-    if cli.response_dir != "Z" or cli.force_dir != "Z":
-        raise ValueError("当前 Z-only 模型只支持 H_ZZ，请使用 --response-dir Z --force-dir Z")
-
     set_seed(cli.seed)
     os.makedirs(cli.output_dir, exist_ok=True)
 
