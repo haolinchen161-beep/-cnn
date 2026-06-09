@@ -33,7 +33,10 @@ class TransolverTrainer:
         self.scaler = torch.cuda.amp.GradScaler(enabled=fp16)
         self.fp16 = fp16
 
-    def forward_batch(self, batch: Dict) -> Dict[str, torch.Tensor]:
+    def forward_batch(self, batch: Dict, config: Dict | None = None) -> Dict[str, torch.Tensor]:
+        # 根据 use_frf_loss 决定是否传入 frequencies（节省计算）
+        use_frf = True if config is None else config.get('use_frf_loss', False)
+
         return self.model(
             points=batch['points'],
             node_features=batch['node_features'],
@@ -41,7 +44,7 @@ class TransolverTrainer:
             edge_index=batch.get('edge_index'),
             boundary_c_xyz=batch.get('boundary_c_xyz'),
             excitation_index=batch.get('excitation_index'),
-            frequencies=batch.get('frequencies'),
+            frequencies=batch.get('frequencies') if use_frf else None,
             num_graphs=batch.get('num_graphs'),
             node_counts=batch.get('node_counts'),
         )
@@ -61,7 +64,7 @@ class TransolverTrainer:
 
             self.optimizer.zero_grad(set_to_none=True)
             with torch.cuda.amp.autocast(enabled=self.fp16):
-                outputs = self.forward_batch(batch)
+                outputs = self.forward_batch(batch, config)
                 loss, logs = total_loss(outputs, batch, config)
             torch.cuda.synchronize()
             t_fwd += time.time() - t0
@@ -96,7 +99,7 @@ class TransolverTrainer:
         omega_rel, zeta_rel = 0.0, 0.0
         for batch in loader:
             batch = move_batch_to_device(batch, self.device)
-            outputs = self.forward_batch(batch)
+            outputs = self.forward_batch(batch, config)
             _, logs = total_loss(outputs, batch, config)
             for key, value in logs.items():
                 sums[key] = sums.get(key, 0.0) + float(value.detach().cpu())
