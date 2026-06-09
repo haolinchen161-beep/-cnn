@@ -3,8 +3,51 @@ from __future__ import annotations
 
 from typing import Dict, Tuple
 
+import numpy as np
 import torch
 import torch.nn.functional as F
+from scipy.optimize import linear_sum_assignment
+
+
+def align_targets_by_mac(phi_pred: torch.Tensor,
+                         phi_target: torch.Tensor,
+                         omega_target: torch.Tensor,
+                         zeta_target: torch.Tensor,
+                         node_counts: list) -> tuple:
+    """基于 MAC 矩阵的匈牙利动态匹配，解决模态跳转引发的物理错位问题。
+
+    对每个样本计算预测振型与目标振型之间的 K×K MAC 矩阵，
+    然后用匈牙利算法找到最优排列，使目标按物理对应关系重新对齐。
+    """
+    aligned_phi_target = torch.empty_like(phi_target)
+    aligned_omega_target = torch.empty_like(omega_target)
+    aligned_zeta_target = torch.empty_like(zeta_target)
+
+    ptr = 0
+    for b, c in enumerate(node_counts):
+        p = phi_pred[ptr:ptr + c]    # (N_c, K, 3)
+        t = phi_target[ptr:ptr + c]  # (N_c, K, 3)
+
+        # 计算 K×K MAC 矩阵
+        # 跨节点(dim=0)与跨XYZ(dim=2)求内积
+        sum_pt = torch.einsum('nki,nmi->km', p, t)  # (K, K)
+        sum_p2 = p.pow(2).sum(dim=(0, 2)).clamp_min(1e-8)  # (K,)
+        sum_t2 = t.pow(2).sum(dim=(0, 2)).clamp_min(1e-8)  # (K,)
+
+        mac = sum_pt.pow(2) / (sum_p2.unsqueeze(1) * sum_t2.unsqueeze(0))  # (K, K)
+
+        # 匈牙利算法：寻找使 MAC 对角线之和最大的最优排列
+        mac_np = mac.detach().cpu().numpy()
+        row_ind, col_ind = linear_sum_assignment(mac_np, maximize=True)
+
+        # 将目标按物理对应关系重新排列
+        aligned_phi_target[ptr:ptr + c] = t[:, col_ind, :]
+        aligned_omega_target[b] = omega_target[b, col_ind]
+        aligned_zeta_target[b] = zeta_target[b, col_ind]
+
+        ptr += c
+
+    return aligned_phi_target, aligned_omega_target, aligned_zeta_target
 
 
 def relative_l1(pred: torch.Tensor, target: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
@@ -104,11 +147,18 @@ def modal_loss(outputs: Dict[str, torch.Tensor],
     omega_pred = outputs['modal_omega']
     zeta_pred = outputs['modal_zeta']
     phi_pred = outputs['modal_phi_xyz']
-    omega_target = batch_data['modal_omega']
-    zeta_target = batch_data['modal_zeta']
-    phi_target = batch_data['modal_phi_xyz']
 
-    # 固有频率损失
+    # 核心修改：通过匈牙利匹配将 Target 在物理上对齐网络预测
+    # 解决模态跳转导致的通道错位问题
+    phi_target, omega_target, zeta_target = align_targets_by_mac(
+        phi_pred.detach(),  # 使用 detach 避免影响计算图
+        batch_data['modal_phi_xyz'],
+        batch_data['modal_omega'],
+        batch_data['modal_zeta'],
+        node_counts
+    )
+
+    # 固有频率损失（现在是在匹配后的通道上算）
     loss_omega = relative_l1(omega_pred, omega_target, eps=1e-5)
 
     # 阻尼比损失
