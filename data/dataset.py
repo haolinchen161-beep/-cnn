@@ -207,7 +207,7 @@ class TransolverModalDataset(Dataset):
             if self.require_frf and 'point_frf' in group:
                 point_frf = torch.from_numpy(group['point_frf'][:]).float()
             else:
-                point_frf = torch.empty(points.shape[0], frequencies.shape[0], 2)
+                point_frf = torch.zeros(points.shape[0], frequencies.shape[0], 2)
 
             # --- 边界条件 ---
             boundary_c_xyz = torch.from_numpy(
