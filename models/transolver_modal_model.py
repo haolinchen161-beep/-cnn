@@ -1,16 +1,13 @@
-"""物理引导 Transolver 风格模型，用于模态 FRF 预测（Z-only Dense Padding 极速版）。
+"""物理引导 Transolver 风格模型，用于模态 FRF 预测（Dense Padding 极速版）。
 
 输入:
     非结构化 ANSYS 节点 + Transolver 节点特征 + 可选网格边。
 输出:
-    模态固有频率、模态阻尼比、逐节点 Z 向振型，以及 H_ZZ FRF。
+    模态固有频率、模态阻尼比、逐节点 XYZ 三向振型，以及方向性 FRF。
 
 全链路使用 Dense Padding + bmm 实现，0 隐式同步，100% 向量化。
 
-Z-only 模式
------------
-当前模型仅支持 H_ZZ（Z 向激励 + Z 向响应）。
-阻尼比 ζ 使用学习型预测（不依赖三向振型）。
+阻尼比 ζ = 物理耗散基底 + 学习残差。
 """
 from __future__ import annotations
 
@@ -158,10 +155,20 @@ class TransolverModalFRF(nn.Module):
             nn.Linear(hidden_dim, hidden_dim), nn.GELU(),
             nn.Linear(hidden_dim, n_modes),
         )
-        # Z-only: 只输出响应方向振型
         self.phi_head = nn.Sequential(
             nn.Linear(hidden_dim, hidden_dim), nn.GELU(),
-            nn.Linear(hidden_dim, n_modes),
+            nn.Linear(hidden_dim, n_modes * 3),
+        )
+
+        self.zeta_context_gate = nn.Sequential(
+            nn.Linear(hidden_dim + 2, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, 1),
+        )
+        self.zeta_mode_residual_head = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, 1),
         )
 
         self.physics = ModalFRFDecoder(amp_scale=amp_scale)
@@ -186,6 +193,33 @@ class TransolverModalFRF(nn.Module):
         gate = torch.softmax(gate_logits, dim=1).masked_fill(~mask, 0.0)
         return (gate.unsqueeze(-1) * x_dense).sum(dim=1)  # (B, H)
 
+    def compute_physics_zeta(self, phi_xyz_dense, boundary_c_xyz_dense, omega, mask):
+        """根据材料阻尼与三向边界耗散计算基线阻尼比（dense 版）。"""
+        diss = (boundary_c_xyz_dense.unsqueeze(2) * phi_xyz_dense.pow(2)).sum(dim=-1)  # (B, N, K)
+        diss_per_graph = diss.masked_fill(~mask.unsqueeze(-1), 0.0).sum(dim=1)  # (B, K)
+        return 0.002 + diss_per_graph / (2.0 * omega.clamp_min(1.0))
+
+    def mode_weighted_pool(self, latent_dense, phi_xyz_dense, boundary_c_xyz_dense, mask):
+        """振型加权池化（dense 版，逐模态 masked softmax）。"""
+        modal_energy = phi_xyz_dense.pow(2).sum(dim=-1)  # (B, N, K)
+        boundary_strength = torch.log1p(boundary_c_xyz_dense.abs().sum(dim=-1))  # (B, N)
+
+        context_modes = []
+        for k in range(self.n_modes):
+            score_input = torch.cat([
+                latent_dense,
+                modal_energy[..., k:k + 1],
+                boundary_strength.unsqueeze(-1),
+            ], dim=-1)
+            learned_score = self.zeta_context_gate(score_input).squeeze(-1)  # (B, N)
+            score = (learned_score
+                     + torch.log(modal_energy[..., k] + 1e-8)
+                     + 0.1 * boundary_strength)  # (B, N)
+            score = score.masked_fill(~mask, float('-inf'))
+            w = torch.softmax(score, dim=1).masked_fill(~mask, 0.0)  # (B, N)
+            context_modes.append((w.unsqueeze(-1) * latent_dense).sum(dim=1))  # (B, H)
+        return torch.stack(context_modes, dim=1)  # (B, K, H)
+
     def forward(self,
                 points: torch.Tensor,
                 node_features: torch.Tensor,
@@ -208,13 +242,24 @@ class TransolverModalFRF(nn.Module):
         omega_raw = F.softplus(self.omega_head(global_latent)) * F.softplus(self.omega_scale)
         omega, _ = torch.sort(omega_raw, dim=-1)
 
-        # --- 模态振型 (Z-only) ---
-        phi_z = self.phi_head(latent).view(-1, self.n_modes)  # (total_N, K)
-        phi_response = phi_z
-        phi_force = phi_z
+        # --- 模态振型（三向） ---
+        phi_xyz = self.phi_head(latent).view(-1, self.n_modes, 3)
 
-        # --- 阻尼比 (学习型，不依赖三向振型) ---
-        zeta = F.softplus(self.zeta_residual_head(global_latent)) + 1e-4
+        # --- 方向感知投影 ---
+        phi_response = phi_xyz[..., self.response_dir_index]  # (total_N, K)
+        phi_force = phi_xyz[..., self.force_dir_index]        # (total_N, K)
+
+        # --- 阻尼比（物理耗散 + residual） ---
+        if boundary_c_xyz is not None:
+            phi_xyz_dense, _ = pad_batch(phi_xyz, node_counts)
+            boundary_c_xyz_dense, _ = pad_batch(boundary_c_xyz, node_counts)
+
+            zeta_phys = self.compute_physics_zeta(phi_xyz_dense, boundary_c_xyz_dense, omega, mask)
+            mode_context = self.mode_weighted_pool(latent_dense, phi_xyz_dense, boundary_c_xyz_dense, mask)
+            zeta_residual = self.zeta_mode_residual_head(mode_context).squeeze(-1)  # (B, K)
+            zeta = zeta_phys * torch.exp(0.1 * torch.tanh(zeta_residual))
+        else:
+            zeta = F.softplus(self.zeta_residual_head(global_latent)) + 1e-4
 
         # --- FRF 物理重建 ---
         frf = None
@@ -229,9 +274,12 @@ class TransolverModalFRF(nn.Module):
             'frf': frf,
             'modal_omega': omega,
             'modal_zeta': zeta,
-            'modal_phi_z': phi_z,
+            'modal_phi_xyz': phi_xyz,
             'modal_phi_response': phi_response,
             'modal_phi_force': phi_force,
             'modal_phi_exc_force': phi_force_exc,
+            'response_dir_index': self.response_dir_index,
+            'force_dir_index': self.force_dir_index,
+            'modal_phi_z': phi_xyz[..., 2],
             'latent': latent,
         }
