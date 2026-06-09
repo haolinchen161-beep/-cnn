@@ -1,11 +1,10 @@
-"""Transolver 模态-FRF 训练的损失函数。"""
+"""Transolver 模态-FRF 训练的损失函数（纯 PyTorch 指针切片版）。"""
 from __future__ import annotations
 
 from typing import Dict, Tuple
 
 import torch
 import torch.nn.functional as F
-import torch_scatter
 
 
 def relative_l1(pred: torch.Tensor, target: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
@@ -14,72 +13,67 @@ def relative_l1(pred: torch.Tensor, target: torch.Tensor, eps: float = 1e-8) -> 
 
 
 def log_l1(pred: torch.Tensor, target: torch.Tensor, eps: float = 1e-4) -> torch.Tensor:
-    """对数空间 L1 损失：|log(pred) - log(target)|。
-
-    eps 默认为 1e-5，避免 1e-12 带来的数值风险。
-    """
+    """对数空间 L1 损失：|log(pred) - log(target)|。"""
     return torch.mean(torch.abs(
         torch.log(pred.clamp_min(eps)) - torch.log(target.clamp_min(eps))
     ))
 
 
-def rms_normalize(x: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
-    """RMS 归一化：x / sqrt(mean(x²) + eps)，防止振型尺度主导训练。"""
-    rms = torch.sqrt(torch.mean(x.pow(2), dim=0, keepdim=True) + eps)
-    return x / rms.clamp_min(eps)
-
-
 def sign_invariant_mse(pred: torch.Tensor,
                        target: torch.Tensor,
-                       batch: torch.Tensor,
-                       num_graphs: int,
+                       node_counts: list,
                        normalize: bool = True,
                        norm_eps: float = 1e-8) -> torch.Tensor:
-    """逐样本、逐模态符号对齐的振型 MSE（向量化版本）。
+    """逐样本、逐模态符号对齐的振型 MSE（纯 PyTorch 指针切片版）。"""
+    mse_parts = []
+    ptr = 0
+    for c in node_counts:
+        p = pred[ptr:ptr + c]
+        t = target[ptr:ptr + c]
 
-    先做 RMS 归一化消除振型尺度的影响，再逐模态确定符号使 MSE 最小。
-    """
-    # RMS 归一化（逐图统计，向量化）
-    if normalize:
-        p_rms = torch.sqrt(torch_scatter.scatter_mean(pred.pow(2), batch, dim=0) + norm_eps)  # (B, D)
-        t_rms = torch.sqrt(torch_scatter.scatter_mean(target.pow(2), batch, dim=0) + norm_eps)
-        pred_n = pred / p_rms[batch].clamp_min(norm_eps)
-        target_n = target / t_rms[batch].clamp_min(norm_eps)
-    else:
-        pred_n, target_n = pred, target
+        if normalize:
+            p_rms = torch.sqrt(p.pow(2).mean(dim=0) + norm_eps)
+            t_rms = torch.sqrt(t.pow(2).mean(dim=0) + norm_eps)
+            p = p / p_rms.clamp_min(norm_eps)
+            t = t / t_rms.clamp_min(norm_eps)
 
-    # 逐图逐模态符号对齐（向量化）
-    dot = torch_scatter.scatter_sum(pred_n * target_n, batch, dim=0)  # (B, D)
-    sign = torch.where(dot >= 0, torch.tensor(1.0, device=dot.device, dtype=dot.dtype),
-                       torch.tensor(-1.0, device=dot.device, dtype=dot.dtype))
+        dot = (p * t).sum(dim=0)
+        sign = torch.where(dot >= 0,
+                           torch.tensor(1.0, device=dot.device),
+                           torch.tensor(-1.0, device=dot.device))
+        mse_parts.append((p - t * sign).pow(2).mean())
+        ptr += c
 
-    # MSE（逐图平均后全局平均）
-    diff = pred_n - target_n * sign[batch]
-    mse_per_graph = torch_scatter.scatter_mean(diff.pow(2).flatten(1), batch, dim=0)  # (B,)
-    mse_per_graph = mse_per_graph.flatten()
-    return mse_per_graph.mean()
+    if not mse_parts:
+        return pred.new_tensor(0.0)
+    return torch.stack(mse_parts).mean()
 
 
 def mac_loss(pred: torch.Tensor,
              target: torch.Tensor,
-             batch: torch.Tensor,
-             num_graphs: int,
+             node_counts: list,
              eps: float = 1e-12) -> torch.Tensor:
-    """1 - MAC 损失，衡量振型之间的模态置信度准则（向量化版本）。"""
-    # 逐图统计（向量化 scatter）
-    sum_pt = torch_scatter.scatter_sum(pred * target, batch, dim=0)      # (B, D)
-    sum_p2 = torch_scatter.scatter_sum(pred.pow(2), batch, dim=0)        # (B, D)
-    sum_t2 = torch_scatter.scatter_sum(target.pow(2), batch, dim=0)      # (B, D)
-    numerator = sum_pt.pow(2)
-    denominator = sum_p2 * sum_t2 + eps
-    mac_per_mode = 1.0 - numerator / denominator
-    return mac_per_mode.mean()
+    """1 - MAC 损失（纯 PyTorch 指针切片版）。"""
+    mac_parts = []
+    ptr = 0
+    for c in node_counts:
+        p = pred[ptr:ptr + c]
+        t = target[ptr:ptr + c]
+        sum_pt = (p * t).sum(dim=0)
+        sum_p2 = p.pow(2).sum(dim=0)
+        sum_t2 = t.pow(2).sum(dim=0)
+        mac_parts.append(1.0 - sum_pt.pow(2) / (sum_p2 * sum_t2 + eps))
+        ptr += c
+
+    if not mac_parts:
+        return pred.new_tensor(0.0)
+    return torch.stack(mac_parts).mean()
 
 
 def modal_loss(outputs: Dict[str, torch.Tensor],
                batch_data: Dict[str, torch.Tensor],
                weights: Dict[str, float] | None = None) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
-    """计算模态参数损失。
+    """计算模态参数损失（纯 PyTorch 指针切片版）。
 
     目标:
         modal_omega      (B, K), rad/s
@@ -88,7 +82,8 @@ def modal_loss(outputs: Dict[str, torch.Tensor],
     """
     weights = weights or {}
     batch = batch_data['batch']
-    num_graphs = int(batch_data.get('num_graphs', int(batch.max().item()) + 1))
+    node_counts = batch.bincount().tolist()
+    num_graphs = len(node_counts)
 
     omega_pred = outputs['modal_omega']
     zeta_pred = outputs['modal_zeta']
@@ -97,55 +92,51 @@ def modal_loss(outputs: Dict[str, torch.Tensor],
     zeta_target = batch_data['modal_zeta']
     phi_target = batch_data['modal_phi_xyz']
 
-    # 固有频率损失：使用 relative_l1（非 log_l1），更数值稳定
+    # 固有频率损失
     loss_omega = relative_l1(omega_pred, omega_target, eps=1e-5)
 
-    # 阻尼比损失：混合 log_l1 + relative_l1，兼顾量级与数值稳定性
+    # 阻尼比损失
     loss_zeta = (
         0.5 * log_l1(zeta_pred, zeta_target, eps=1e-5) +
         0.5 * relative_l1(zeta_pred, zeta_target, eps=1e-5)
     )
 
-    # 逐模态频率和阻尼误差（用于训练日志）
+    # 逐模态误差（用于日志）
     omega_per_mode = torch.mean(
         torch.abs(omega_pred - omega_target) / (torch.abs(omega_target) + 1e-5), dim=0)  # (K,)
     zeta_per_mode = torch.mean(
         torch.abs(zeta_pred - zeta_target) / (torch.abs(zeta_target) + 1e-5), dim=0)  # (K,)
 
-    # 方向感知振型损失：取 response_dir_index 对应的分量
+    # 方向感知振型损失
     resp_idx = int(batch_data.get('response_dir_index',
                                    torch.tensor(2)).flatten()[0].item())
     phi_resp_pred = phi_pred[..., resp_idx]   # (total_N, K)
     phi_resp_target = phi_target[..., resp_idx]
-    loss_phi_resp = sign_invariant_mse(
-        phi_resp_pred, phi_resp_target,
-        batch, num_graphs, normalize=True
-    )
 
-    # 逐模态 φ 误差（向量化）
-    p_rms = torch.sqrt(torch_scatter.scatter_mean(phi_resp_pred.pow(2), batch, dim=0) + 1e-8)  # (B, K)
-    t_rms = torch.sqrt(torch_scatter.scatter_mean(phi_resp_target.pow(2), batch, dim=0) + 1e-8)
-    p_n = phi_resp_pred / p_rms[batch].clamp_min(1e-8)
-    t_n = phi_resp_target / t_rms[batch].clamp_min(1e-8)
-    dot = torch_scatter.scatter_sum(p_n * t_n, batch, dim=0)  # (B, K)
-    sign = torch.where(dot >= 0, torch.ones_like(dot, device=dot.device),
-                       -torch.ones_like(dot, device=dot.device))
-    phi_per_mode = torch_scatter.scatter_mean(
-        (p_n - t_n * sign[batch]).pow(2), batch, dim=0)  # (B, K)
-    phi_per_mode = phi_per_mode.mean(dim=0)  # (K,) 跨图平均
-
-    # 完整 XYZ 三向振型损失（展平为每节点 3*K 维向量后做符号对齐）
+    loss_phi_resp = sign_invariant_mse(phi_resp_pred, phi_resp_target, node_counts, normalize=True)
     loss_phi_xyz = sign_invariant_mse(
         phi_pred.reshape(phi_pred.shape[0], -1),
         phi_target.reshape(phi_target.shape[0], -1),
-        batch, num_graphs, normalize=True
-    )
+        node_counts, normalize=True)
+    loss_mac = mac_loss(phi_resp_pred, phi_resp_target, node_counts)
 
-    # MAC 损失：使用响应方向振型
-    loss_mac = mac_loss(
-        phi_pred[..., resp_idx], phi_target[..., resp_idx],
-        batch, num_graphs
-    )
+    # 逐模态 φ 误差（指针切片版）
+    phi_per_mode_parts = []
+    ptr = 0
+    for c in node_counts:
+        p = phi_resp_pred[ptr:ptr + c]
+        t = phi_resp_target[ptr:ptr + c]
+        p_rms = torch.sqrt(p.pow(2).mean(dim=0) + 1e-8)
+        t_rms = torch.sqrt(t.pow(2).mean(dim=0) + 1e-8)
+        p_n = p / p_rms.clamp_min(1e-8)
+        t_n = t / t_rms.clamp_min(1e-8)
+        dot = (p_n * t_n).sum(dim=0)
+        sign = torch.where(dot >= 0,
+                           torch.tensor(1.0, device=dot.device),
+                           torch.tensor(-1.0, device=dot.device))
+        phi_per_mode_parts.append((p_n - t_n * sign).pow(2).mean(dim=0))
+        ptr += c
+    phi_per_mode = torch.stack(phi_per_mode_parts).mean(dim=0)  # (K,)
 
     total = (
         weights.get('omega', 1.0) * loss_omega +
@@ -171,7 +162,6 @@ def frf_loss(frf_pred: torch.Tensor, frf_target: torch.Tensor) -> Tuple[torch.Te
     """复数 FRF 损失：复数 L1 + 对数幅值 + dB 项。"""
     loss_complex = F.l1_loss(frf_pred, frf_target)
 
-    # 幅值 clamp 使用 1e-8（非 1e-12），防止梯度爆炸
     amp_pred = torch.linalg.norm(frf_pred, dim=-1).clamp_min(1e-8)
     amp_target = torch.linalg.norm(frf_target, dim=-1).clamp_min(1e-8)
 
