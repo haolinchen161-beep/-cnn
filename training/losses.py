@@ -5,6 +5,7 @@ from typing import Dict, Tuple
 
 import torch
 import torch.nn.functional as F
+import torch_scatter
 
 
 def relative_l1(pred: torch.Tensor, target: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
@@ -12,7 +13,7 @@ def relative_l1(pred: torch.Tensor, target: torch.Tensor, eps: float = 1e-8) -> 
     return torch.mean(torch.abs(pred - target) / (torch.abs(target) + eps))
 
 
-def log_l1(pred: torch.Tensor, target: torch.Tensor, eps: float = 1e-5) -> torch.Tensor:
+def log_l1(pred: torch.Tensor, target: torch.Tensor, eps: float = 1e-4) -> torch.Tensor:
     """对数空间 L1 损失：|log(pred) - log(target)|。
 
     eps 默认为 1e-5，避免 1e-12 带来的数值风险。
@@ -34,30 +35,29 @@ def sign_invariant_mse(pred: torch.Tensor,
                        num_graphs: int,
                        normalize: bool = True,
                        norm_eps: float = 1e-8) -> torch.Tensor:
-    """逐样本、逐模态符号对齐的振型 MSE。
+    """逐样本、逐模态符号对齐的振型 MSE（向量化版本）。
 
     先做 RMS 归一化消除振型尺度的影响，再逐模态确定符号使 MSE 最小。
     """
-    losses = []
-    for g in range(num_graphs):
-        mask = batch == g
-        if not torch.any(mask):
-            continue
-        p = pred[mask]
-        t = target[mask]
+    # RMS 归一化（逐图统计，向量化）
+    if normalize:
+        p_rms = torch.sqrt(torch_scatter.scatter_mean(pred.pow(2), batch, dim=0) + norm_eps)  # (B, D)
+        t_rms = torch.sqrt(torch_scatter.scatter_mean(target.pow(2), batch, dim=0) + norm_eps)
+        pred_n = pred / p_rms[batch].clamp_min(norm_eps)
+        target_n = target / t_rms[batch].clamp_min(norm_eps)
+    else:
+        pred_n, target_n = pred, target
 
-        # RMS 归一化：防止振型幅值尺度主导训练
-        if normalize:
-            p = rms_normalize(p, eps=norm_eps)
-            t = rms_normalize(t, eps=norm_eps)
+    # 逐图逐模态符号对齐（向量化）
+    dot = torch_scatter.scatter_sum(pred_n * target_n, batch, dim=0)  # (B, D)
+    sign = torch.where(dot >= 0, torch.tensor(1.0, device=dot.device, dtype=dot.dtype),
+                       torch.tensor(-1.0, device=dot.device, dtype=dot.dtype))
 
-        # 逐模态符号对齐：φ 和 -φ 物理等价
-        dot = torch.sum(p * t, dim=0, keepdim=True)
-        sign = torch.where(dot >= 0, torch.ones_like(dot), -torch.ones_like(dot))
-        losses.append(F.mse_loss(p, t * sign))
-    if not losses:
-        return pred.new_tensor(0.0)
-    return torch.stack(losses).mean()
+    # MSE（逐图平均后全局平均）
+    diff = pred_n - target_n * sign[batch]
+    mse_per_graph = torch_scatter.scatter_mean(diff.pow(2).flatten(1), batch, dim=0)  # (B,)
+    mse_per_graph = mse_per_graph.flatten()
+    return mse_per_graph.mean()
 
 
 def mac_loss(pred: torch.Tensor,
@@ -65,20 +65,15 @@ def mac_loss(pred: torch.Tensor,
              batch: torch.Tensor,
              num_graphs: int,
              eps: float = 1e-12) -> torch.Tensor:
-    """1 - MAC 损失，衡量振型之间的模态置信度准则。"""
-    losses = []
-    for g in range(num_graphs):
-        mask = batch == g
-        if not torch.any(mask):
-            continue
-        p = pred[mask]
-        t = target[mask]
-        numerator = torch.sum(p * t, dim=0).pow(2)
-        denominator = torch.sum(p.pow(2), dim=0) * torch.sum(t.pow(2), dim=0) + eps
-        losses.append(1.0 - numerator / denominator)
-    if not losses:
-        return pred.new_tensor(0.0)
-    return torch.cat(losses).mean()
+    """1 - MAC 损失，衡量振型之间的模态置信度准则（向量化版本）。"""
+    # 逐图统计（向量化 scatter）
+    sum_pt = torch_scatter.scatter_sum(pred * target, batch, dim=0)      # (B, D)
+    sum_p2 = torch_scatter.scatter_sum(pred.pow(2), batch, dim=0)        # (B, D)
+    sum_t2 = torch_scatter.scatter_sum(target.pow(2), batch, dim=0)      # (B, D)
+    numerator = sum_pt.pow(2)
+    denominator = sum_p2 * sum_t2 + eps
+    mac_per_mode = 1.0 - numerator / denominator
+    return mac_per_mode.mean()
 
 
 def modal_loss(outputs: Dict[str, torch.Tensor],
@@ -127,21 +122,16 @@ def modal_loss(outputs: Dict[str, torch.Tensor],
         batch, num_graphs, normalize=True
     )
 
-    # 逐模态 φ 误差（用于训练日志）
-    phi_per_mode = phi_resp_pred.new_zeros(num_graphs, phi_resp_pred.shape[1])
-    for g in range(num_graphs):
-        mask = batch == g
-        if not torch.any(mask):
-            continue
-        p = phi_resp_pred[mask]
-        t = phi_resp_target[mask]
-        # RMS 归一化
-        p = rms_normalize(p)
-        t = rms_normalize(t)
-        # 逐模态符号对齐
-        dot = torch.sum(p * t, dim=0, keepdim=True)
-        sign = torch.where(dot >= 0, torch.ones_like(dot), -torch.ones_like(dot))
-        phi_per_mode[g] = F.mse_loss(p, t * sign, reduction='none').mean(dim=0)  # (K,)
+    # 逐模态 φ 误差（向量化）
+    p_rms = torch.sqrt(torch_scatter.scatter_mean(phi_resp_pred.pow(2), batch, dim=0) + 1e-8)  # (B, K)
+    t_rms = torch.sqrt(torch_scatter.scatter_mean(phi_resp_target.pow(2), batch, dim=0) + 1e-8)
+    p_n = phi_resp_pred / p_rms[batch].clamp_min(1e-8)
+    t_n = phi_resp_target / t_rms[batch].clamp_min(1e-8)
+    dot = torch_scatter.scatter_sum(p_n * t_n, batch, dim=0)  # (B, K)
+    sign = torch.where(dot >= 0, torch.ones_like(dot, device=dot.device),
+                       -torch.ones_like(dot, device=dot.device))
+    phi_per_mode = torch_scatter.scatter_mean(
+        (p_n - t_n * sign[batch]).pow(2), batch, dim=0)  # (B, K)
     phi_per_mode = phi_per_mode.mean(dim=0)  # (K,) 跨图平均
 
     # 完整 XYZ 三向振型损失（展平为每节点 3*K 维向量后做符号对齐）
