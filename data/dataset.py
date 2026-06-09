@@ -413,6 +413,7 @@ def collate_mesh_batch(batch: Sequence[Dict[str, torch.Tensor]]) -> Dict[str, to
         'excitation_index': excitation_index,
         'contact_node_index': contact_node_index,
         # 元数据
+        'node_counts': [item['points'].shape[0] for item in batch],  # CPU 侧已知，避免 GPU bincount 同步
         'num_graphs': len(batch),
         'sample_path': [item['sample_path'] for item in batch],
         'sample_group': [item['sample_group'] for item in batch],
