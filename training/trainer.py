@@ -96,19 +96,19 @@ class TransolverTrainer:
     def evaluate(self, loader, config: Dict) -> Dict[str, float]:
         self.model.eval()
         sums, count = {}, 0
-        omega_rel, zeta_rel = 0.0, 0.0
         for batch in loader:
             batch = move_batch_to_device(batch, self.device)
             outputs = self.forward_batch(batch, config)
+            # total_loss 内部已执行匈牙利匹配，返回对齐后的 logs
             _, logs = total_loss(outputs, batch, config)
             for key, value in logs.items():
                 sums[key] = sums.get(key, 0.0) + float(value.detach().cpu())
-            omega_rel += float((torch.abs(outputs['modal_omega'] - batch['modal_omega']) / batch['modal_omega'].abs().clamp_min(1e-8)).mean().cpu())
-            zeta_rel += float((torch.abs(outputs['modal_zeta'] - batch['modal_zeta']) / batch['modal_zeta'].abs().clamp_min(1e-8)).mean().cpu())
             count += 1
         metrics = {key: value / max(1, count) for key, value in sums.items()}
-        metrics['omega_rel'] = omega_rel / max(1, count)
-        metrics['zeta_rel'] = zeta_rel / max(1, count)
+        # 从对齐后的 loss 中提取真实的 ω_rel 和 zeta_rel
+        metrics['omega_rel'] = metrics.get('loss_omega', 0.0)
+        zeta_k_sum = sum([metrics.get(f'zeta_k{k}', 0.0) for k in range(3)])
+        metrics['zeta_rel'] = zeta_k_sum / 3.0
         return metrics
 
 
