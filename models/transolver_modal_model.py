@@ -159,9 +159,10 @@ class TransolverModalFRF(nn.Module):
             nn.Linear(hidden_dim, hidden_dim), nn.GELU(),
             nn.Linear(hidden_dim, n_modes),
         )
+        # Z-only: 只输出响应方向振型
         self.phi_head = nn.Sequential(
             nn.Linear(hidden_dim, hidden_dim), nn.GELU(),
-            nn.Linear(hidden_dim, n_modes * 3),
+            nn.Linear(hidden_dim, n_modes),
         )
 
         self.zeta_context_gate = nn.Sequential(
@@ -246,24 +247,13 @@ class TransolverModalFRF(nn.Module):
         omega_raw = F.softplus(self.omega_head(global_latent)) * F.softplus(self.omega_scale)
         omega, _ = torch.sort(omega_raw, dim=-1)
 
-        # --- 模态振型 ---
-        phi_xyz = self.phi_head(latent).view(-1, self.n_modes, 3)
+        # --- 模态振型 (Z-only) ---
+        phi_z = self.phi_head(latent).view(-1, self.n_modes)  # (total_N, K)
+        phi_response = phi_z
+        phi_force = phi_z
 
-        # --- 方向感知投影 ---
-        phi_response = phi_xyz[..., self.response_dir_index]  # (total_N, K)
-        phi_force = phi_xyz[..., self.force_dir_index]        # (total_N, K)
-
-        # --- 阻尼比 ---
-        if boundary_c_xyz is not None:
-            phi_xyz_dense, _ = pad_batch(phi_xyz, node_counts)
-            boundary_c_xyz_dense, _ = pad_batch(boundary_c_xyz, node_counts)
-
-            zeta_phys = self.compute_physics_zeta(phi_xyz_dense, boundary_c_xyz_dense, omega, mask)
-            mode_context = self.mode_weighted_pool(latent_dense, phi_xyz_dense, boundary_c_xyz_dense, mask)
-            zeta_residual = self.zeta_mode_residual_head(mode_context).squeeze(-1)  # (B, K)
-            zeta = zeta_phys * torch.exp(0.1 * torch.tanh(zeta_residual))
-        else:
-            zeta = F.softplus(self.zeta_residual_head(global_latent)) + 1e-4
+        # --- 阻尼比 (学习型，不依赖三向振型) ---
+        zeta = F.softplus(self.zeta_residual_head(global_latent)) + 1e-4
 
         # --- FRF 物理重建 ---
         frf = None
@@ -278,15 +268,9 @@ class TransolverModalFRF(nn.Module):
             'frf': frf,
             'modal_omega': omega,
             'modal_zeta': zeta,
-            'modal_phi_xyz': phi_xyz,
+            'modal_phi_z': phi_z,
             'modal_phi_response': phi_response,
             'modal_phi_force': phi_force,
             'modal_phi_exc_force': phi_force_exc,
-            'response_dir_index': self.response_dir_index,
-            'force_dir_index': self.force_dir_index,
-            'modal_phi_z': phi_response if self.response_dir_index == 2 else phi_xyz[..., 2],
-            'modal_phi_exc_z': (phi_force_exc if self.force_dir_index == 2
-                                else (phi_xyz[..., 2][excitation_index.long()]
-                                      if excitation_index is not None else None)),
             'latent': latent,
         }
