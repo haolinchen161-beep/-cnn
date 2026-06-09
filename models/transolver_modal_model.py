@@ -65,18 +65,19 @@ class SliceTransolverBlock(nn.Module):
             nn.Linear(hidden_dim * 4, hidden_dim), nn.Dropout(dropout),
         )
 
-    def forward(self, x: torch.Tensor, batch: torch.Tensor, num_graphs: int) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, batch: torch.Tensor, num_graphs: int, node_counts: list) -> torch.Tensor:
         assign_logits = self.assign(x)                          # (total_N, S)
         assign = torch_scatter.scatter_softmax(assign_logits, batch, dim=0)  # (total_N, S)
 
-        # 投影到 token 空间（逐图矩阵乘法，无 3D 中间张量）
+        # 投影到 token 空间（指针切片，0 拷贝，0 CPU-GPU 同步）
         tokens_list, denom_list = [], []
-        for g in range(num_graphs):
-            mask = (batch == g)
-            xg = x[mask]           # (N_g, H)
-            ag = assign[mask]      # (N_g, S)
-            tokens_list.append(ag.t() @ xg)                     # (S, N_g) @ (N_g, H) → (S, H)
+        ptr = 0
+        for count in node_counts:
+            xg = x[ptr:ptr + count]           # (count, H) — 视图，0 开销
+            ag = assign[ptr:ptr + count]      # (count, S) — 视图
+            tokens_list.append(ag.t() @ xg)                     # (S, count) @ (count, H) → (S, H)
             denom_list.append(ag.sum(dim=0).clamp_min(1e-6))
+            ptr += count
         tokens = torch.stack(tokens_list, dim=0)                # (B, S, H)
         denom = torch.stack(denom_list, dim=0).unsqueeze(-1)    # (B, S, 1)
         tokens = tokens / denom
@@ -86,11 +87,12 @@ class SliceTransolverBlock(nn.Module):
         tokens_attn, _ = self.token_attn(tokens_norm, tokens_norm, tokens_norm,
                                           need_weights=False)   # (B, S, H)
 
-        # 回写节点（逐图矩阵乘法：避免 tokens_attn[batch] 3D 具象化）
+        # 回写节点（指针切片，0 拷贝）
         back = torch.empty_like(x)
-        for g in range(num_graphs):
-            mask = (batch == g)
-            back[mask] = (assign[mask] @ tokens_attn[g]).to(back.dtype)  # (N_g, S) @ (S, H) → (N_g, H)
+        ptr = 0
+        for g, count in enumerate(node_counts):
+            back[ptr:ptr + count] = (assign[ptr:ptr + count] @ tokens_attn[g]).to(back.dtype)
+            ptr += count
 
         y = self.node_norm1(x + back)
         y = self.node_norm2(y + self.ffn(y))
@@ -186,14 +188,16 @@ class TransolverModalFRF(nn.Module):
     # ------------------------------------------------------------------
     # 编码
     # ------------------------------------------------------------------
-    def encode(self, points, node_features, batch, edge_index=None, num_graphs=None):
+    def encode(self, points, node_features, batch, edge_index=None, num_graphs=None, node_counts=None):
         if num_graphs is None:
             num_graphs = int(batch.max().item()) + 1
+        if node_counts is None:
+            node_counts = batch.bincount().tolist()
         x = self.input_proj(torch.cat([points, node_features], dim=-1))
         if self.use_edge_stem and edge_index is not None:
             x = self.edge_stem(x, edge_index)
         for block in self.blocks:
-            x = block(x, batch, num_graphs)
+            x = block(x, batch, num_graphs, node_counts)
         return x
 
     # ------------------------------------------------------------------
@@ -268,10 +272,12 @@ class TransolverModalFRF(nn.Module):
                 num_graphs: int | None = None):
         if num_graphs is None:
             num_graphs = int(batch.max().item()) + 1
+        node_counts = batch.bincount().tolist()  # 整个前向只做 1 次统计
 
         # --- 编码 ---
         latent = self.encode(points, node_features, batch,
-                             edge_index=edge_index, num_graphs=num_graphs)
+                             edge_index=edge_index, num_graphs=num_graphs,
+                             node_counts=node_counts)
         global_latent = self.global_pool(latent, batch, num_graphs)
 
         # --- 固有频率预测 ---
