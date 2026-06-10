@@ -128,6 +128,7 @@ class DeepONetPhiHead(nn.Module):
         out_dim = n_modes * 3 * rank
         branch_in_dim = hidden_dim + branch_extra_dim
 
+        self.branch_extra_norm = nn.LayerNorm(branch_extra_dim) if branch_extra_dim > 0 else None
         self.branch = nn.Sequential(
             nn.Linear(branch_in_dim, hidden_dim), nn.GELU(), nn.Dropout(dropout),
             nn.Linear(hidden_dim, hidden_dim), nn.GELU(),
@@ -147,7 +148,11 @@ class DeepONetPhiHead(nn.Module):
         if self.branch_extra_dim > 0:
             if global_features is None:
                 global_features = global_latent.new_zeros(B, self.branch_extra_dim)
-            branch_input = torch.cat([global_latent, global_features.to(global_latent.dtype)], dim=-1)
+            # 统计特征来自原始 node_features，可能有 NaN/Inf 或尺度较大；进入 branch 前先稳定化。
+            gf = global_features.float()
+            gf = torch.nan_to_num(gf, nan=0.0, posinf=20.0, neginf=-20.0).clamp(-20.0, 20.0)
+            gf = self.branch_extra_norm(gf).to(global_latent.dtype)
+            branch_input = torch.cat([global_latent, gf], dim=-1)
         else:
             branch_input = global_latent
         return self.branch(branch_input).view(B, self.n_modes, 3, self.rank)
@@ -298,20 +303,24 @@ class TransolverModalFRF(nn.Module):
     def global_feature_summary(self, node_features: torch.Tensor, node_counts: list) -> torch.Tensor:
         """显式全局统计特征：mean/std/min/max(node_features)。
 
-        这相当于把旧固支板模型中 branch 直接看到的全局几何/材料/边界参数，
-        以统计形式注入 DeepONet branch，避免只依赖 Transolver pooled latent。
+        统计全部用 float32 计算，并在统计前后做 nan_to_num/clamp。
+        这样保留“Branch 直接看到全局参数”的结构启发，同时避免 fp16 下
+        NaN/Inf 或极端节点特征把 branch 输入污染。
         """
-        feat_dense, mask = pad_batch(node_features, node_counts)
+        feat = node_features.float()
+        feat = torch.nan_to_num(feat, nan=0.0, posinf=20.0, neginf=-20.0).clamp(-20.0, 20.0)
+        feat_dense, mask = pad_batch(feat, node_counts)
         mask_f = mask.unsqueeze(-1).to(feat_dense.dtype)
         denom = mask_f.sum(dim=1).clamp_min(1.0)
         mean = (feat_dense * mask_f).sum(dim=1) / denom
         var = ((feat_dense - mean.unsqueeze(1)).pow(2) * mask_f).sum(dim=1) / denom
         std = torch.sqrt(var.clamp_min(0.0) + 1e-8)
-        large = 1.0e4
+        large = 20.0
         fmin = feat_dense.masked_fill(~mask.unsqueeze(-1), large).min(dim=1).values
         fmax = feat_dense.masked_fill(~mask.unsqueeze(-1), -large).max(dim=1).values
         summary = torch.cat([mean, std, fmin, fmax], dim=-1)
-        return torch.nan_to_num(summary, nan=0.0, posinf=large, neginf=-large)
+        summary = torch.nan_to_num(summary, nan=0.0, posinf=large, neginf=-large)
+        return summary.clamp(-large, large)
 
     def compute_physics_zeta(self, phi_xyz_dense, boundary_c_xyz_dense, omega, mask):
         """根据材料阻尼与三向边界耗散计算基线阻尼比（dense 版）。"""
