@@ -70,7 +70,7 @@ def parse_args():
     p.add_argument('--resume', action='store_true')
     p.add_argument('--seed', type=int, default=42)
     p.add_argument('--device', default='cuda' if torch.cuda.is_available() else 'cpu')
-    p.add_argument('--no-fp16', action='store_true')
+    p.add_argument('--fp16', action='store_true', help='Enable mixed precision. Default is off for stability.')
     p.add_argument('--no-edges', action='store_true')
     p.add_argument('--response-dir', default=DEFAULT_RESPONSE_DIRECTION, choices=['X', 'Y', 'Z'])
     p.add_argument('--force-dir', default=DEFAULT_FORCE_DIRECTION, choices=['X', 'Y', 'Z'])
@@ -214,7 +214,7 @@ def train_stage1(args, net, loader, trainset, response_idx):
         torch.save({'model_state_dict': net.state_dict(), 'coeff_table_state_dict': coeff_table.state_dict()}, os.path.join(out, 'checkpoint_trunk'))
         return net, coeff_table.weight.detach().cpu()
 
-    scaler = torch.cuda.amp.GradScaler(enabled=not args.no_fp16)
+    scaler = torch.cuda.amp.GradScaler(enabled=args.fp16)
     csv_path = os.path.join(out, 'stage1_log.csv')
     append = args.resume and os.path.exists(csv_path) and start > 0
     with open(csv_path, 'a' if append else 'w', newline='', encoding='utf-8') as f:
@@ -229,7 +229,7 @@ def train_stage1(args, net, loader, trainset, response_idx):
                 batch = move_batch_to_device(batch, args.device)
                 ids = sample_ids(batch, smap, args.device)
                 opt.zero_grad(set_to_none=True)
-                with torch.cuda.amp.autocast(enabled=not args.no_fp16):
+                with torch.cuda.amp.autocast(enabled=args.fp16):
                     loss, logs = stage1_loss(net, coeff_table, batch, ids, response_idx)
                 scaler.scale(loss).backward()
                 scaler.unscale_(opt)
@@ -277,7 +277,7 @@ def train_epoch_supervised(trainer, loader, config, epoch, stage_name, args, coe
     for batch in loader:
         batch = move_batch_to_device(batch, trainer.device)
         trainer.optimizer.zero_grad(set_to_none=True)
-        with torch.cuda.amp.autocast(enabled=trainer.fp16):
+        with torch.cuda.amp.autocast(enabled=args.fp16):
             outputs = trainer.forward_batch(batch, config)
             loss, logs = total_loss(outputs, batch, config)
             cd = loss.new_tensor(0.0)
@@ -314,7 +314,7 @@ def train_supervised_stage(args, config, net, trainloader, trainset, valloader, 
         set_requires_grad(net.phi_head.trunk, False)
     opt = torch.optim.AdamW([p for p in net.parameters() if p.requires_grad], lr=lr, weight_decay=args.weight_decay)
     sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=max(epochs,1), eta_min=1e-6)
-    trainer = TransolverTrainer(net, opt, device=args.device, scheduler=sched, fp16=not args.no_fp16)
+    trainer = TransolverTrainer(net, opt, device=args.device, scheduler=sched, fp16=args.fp16)
     best = float('inf')
     start = 0
     last = os.path.join(out, 'checkpoint_last')
@@ -378,7 +378,7 @@ def main():
     print('='*72)
     print(f'Staged DeepONet phi training ({label})')
     print('='*72)
-    print(f'device={args.device} data={args.data_dir} output={args.output_dir} phi_rank={args.phi_rank}')
+    print(f'device={args.device} data={args.data_dir} output={args.output_dir} phi_rank={args.phi_rank} fp16={args.fp16}')
     print(f'epochs stage1={args.stage1_epochs} stage2={args.stage2_epochs} stage3={args.stage3_epochs} coeff_distill={args.coeff_distill_epochs}@{args.coeff_distill_weight} resume={args.resume}')
     trainset, trainloader = make_loader(args.data_dir, 'train.h5', args.batch_size, True, not args.no_edges)
     valset, valloader = make_loader(args.data_dir, 'val.h5', 1, False, not args.no_edges)
@@ -407,7 +407,7 @@ def main():
     if args.stage3_epochs > 0:
         net = train_supervised_stage(args, cfg, net, trainloader, trainset, valloader, 'stage3_finetune', args.stage3_epochs, args.lr_stage3, False, None)
     if args.stage2_epochs > 0 or args.stage3_epochs > 0:
-        trainer = TransolverTrainer(net, torch.optim.AdamW([p for p in net.parameters() if p.requires_grad], lr=1e-6), device=args.device, fp16=not args.no_fp16)
+        trainer = TransolverTrainer(net, torch.optim.AdamW([p for p in net.parameters() if p.requires_grad], lr=1e-6), device=args.device, fp16=args.fp16)
         print(f'test metrics ({label}): {trainer.evaluate(testloader, cfg)}')
     print(f'done, time={time.time()-t0:.1f}s')
 
