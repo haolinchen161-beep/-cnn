@@ -202,7 +202,8 @@ def train(args, config, model_cfg, net, dataloader, optimizer, valloader, schedu
         omega_pct = ' '.join([f"{train_logs.get(f'omega_k{k}', 0)*100:.1f}%" for k in range(3)])
         zeta_pct = ' '.join([f"{train_logs.get(f'zeta_k{k}', 0)*100:.1f}%" for k in range(3)])
         phi_pct = ' '.join([f"{train_logs.get(f'phi_k{k}', 0)*100:.1f}%" for k in range(3)])
-        train_msg = (f"Epoch {epoch:04d} | lr={lr:.1e} | α={physics_alpha:.2f} | total={total_w:.3e} "
+        alpha = config.get('physics_alpha', 1.0)
+        train_msg = (f"Epoch {epoch:04d} | lr={lr:.1e} | α={alpha:.2f} | total={total_w:.3e} "
                      f"[ω={pct_o:.0f}% ζ={pct_z:.0f}% φz={pct_p:.0f}% φ3={pct_x:.0f}%] "
                      f"ω_k=[{omega_pct}] ζ_k=[{zeta_pct}] φ_k=[{phi_pct}]")
         print(train_msg)
