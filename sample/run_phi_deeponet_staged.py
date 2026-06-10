@@ -241,6 +241,9 @@ def coeff_loss_norm(pred, target, eps=1e-6):
 def branch_coeff_from_batch(net, batch):
     _, dense, mask = net.encode(batch['points'], batch['node_features'], edge_index=batch.get('edge_index'), node_counts=batch.get('node_counts'))
     glob = net.global_pool(dense, mask)
+    if hasattr(net, 'global_feature_summary'):
+        branch_features = net.global_feature_summary(batch['node_features'], batch.get('node_counts'))
+        return net.phi_head.branch_coeff(glob, branch_features)
     return net.phi_head.branch_coeff(glob)
 
 
