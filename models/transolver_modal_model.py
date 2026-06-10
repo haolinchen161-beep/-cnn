@@ -246,9 +246,29 @@ class TransolverModalFRF(nn.Module):
         global_latent = self.global_pool(latent_dense, mask)
 
         # --- 固有频率 ---
-        omega_raw = F.softplus(self.omega_head(global_latent)) * F.softplus(self.omega_scale)
-        # 强制通道按频率大小排序，给网络提供绝对的锚点
-        omega, _ = torch.sort(omega_raw, dim=-1)
+        # ------------------------------------------------------------------
+        # 天然有序输出：Base + Delta 单调性约束
+        # ------------------------------------------------------------------
+        # 每个通道保持固定物理身份：
+        #   channel 0 -> mode 1
+        #   channel 1 -> mode 2
+        #   channel 2 -> mode 3
+        #
+        # 避免 torch.sort 只重排 omega，却没有同步重排 phi/zeta 的通道撕裂问题。
+        omega_raw = F.softplus(self.omega_head(global_latent))  # (B, K)
+
+        omega_first = omega_raw[:, :1]      # (B, 1)
+        omega_delta = omega_raw[:, 1:]      # (B, K-1)
+
+        if omega_delta.shape[1] > 0:
+            omega_unit = torch.cat(
+                [omega_first, omega_first + torch.cumsum(omega_delta, dim=-1)],
+                dim=-1,
+            )
+        else:
+            omega_unit = omega_first
+
+        omega = omega_unit * F.softplus(self.omega_scale)
 
         # --- 模态振型（三向） ---
         phi_xyz = self.phi_head(latent).view(-1, self.n_modes, 3)
