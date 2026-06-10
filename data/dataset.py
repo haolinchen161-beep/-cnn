@@ -11,6 +11,10 @@ import os
 
 W_MM, L_MM = 60, 160  # Y=60mm, X=160mm (1mm/pixel)
 
+# 输入图像逐通道归一化 (train.h5 统计, 避免 CNN 第一层输入不平衡)
+IMG_MEAN = torch.tensor([0.2142, 0.0044, 0.0315, 0.0005, 1.0001, 1.0000]).view(6, 1, 1)
+IMG_STD  = torch.tensor([0.3508, 0.0620, 0.4267, 0.0121, 0.0284, 0.0171]).view(6, 1, 1)
+
 
 class GeometricHDF5Dataset(Dataset):
     """HDF5 数据集 (2.5D 投影 + per-sample-group 格式)。"""
@@ -32,12 +36,68 @@ class GeometricHDF5Dataset(Dataset):
             with h5py.File(fp, 'r') as f:
                 for key in sorted(f.keys(), key=lambda k: int(k.split('_')[-1])):
                     if key.startswith('sample_'):
+                        # 过滤极端间隙: 太小→模态混淆, 太大→离群
+                        omega = f[key]['modal_omega'][:]
+                        fhz = omega / (2.0 * np.pi)
+                        g32 = fhz[2] - fhz[1]
+                        if g32 < 150.0 or g32 > 900.0:
+                            continue
                         self._samples.append((fp, key))
         if len(self._samples) == 0:
             raise RuntimeError(f"No per-sample-group data: {full_paths}")
 
     def undo_normalize(self, frf):
         return torch.sinh(frf)
+
+    def _build_node_xyz(self, points):
+        """归一化节点坐标到 [-1,1]"""
+        return torch.stack([
+            points[:, 0] / 0.160 * 2 - 1,
+            points[:, 1] / 0.060 * 2 - 1,
+            points[:, 2] / 0.010 * 2 - 1,
+        ], dim=-1).float()
+
+    def _build_global_features(self, points, point_features):
+        """从节点特征构建全局特征向量 [G]"""
+        if point_features is None:
+            return torch.zeros(20, dtype=torch.float32)
+
+        E_ratio = point_features[0, 0]
+        prxy = point_features[0, 1]
+        rho_ratio = point_features[0, 2]
+        is_fixed = point_features[:, 3]
+        logK = point_features[:, 4]
+        logC = point_features[:, 5]
+        z_h = point_features[:, 6]
+
+        spring_mask = logK > 0
+        fixed_mask = is_fixed > 0
+        corner_mask = is_fixed > 0.75
+        side_mask = (is_fixed > 0.25) & (is_fixed < 0.75)
+
+        def safe_mean(x):
+            return x.mean() if x.numel() > 0 else torch.tensor(0.0, dtype=torch.float32)
+        def safe_std(x):
+            return x.std(unbiased=False) if x.numel() > 0 else torch.tensor(0.0, dtype=torch.float32)
+        def safe_min(x):
+            return x.min() if x.numel() > 0 else torch.tensor(0.0, dtype=torch.float32)
+        def safe_max(x):
+            return x.max() if x.numel() > 0 else torch.tensor(0.0, dtype=torch.float32)
+
+        spring_logK = logK[spring_mask]
+        spring_logC = logC[spring_mask]
+
+        return torch.stack([
+            E_ratio, prxy, rho_ratio,
+            z_h.mean(), z_h.std(unbiased=False), z_h.min(), z_h.max(),
+            spring_mask.float().mean(),
+            fixed_mask.float().mean(),
+            corner_mask.float().mean(),
+            side_mask.float().mean(),
+            safe_mean(spring_logK), safe_std(spring_logK), safe_min(spring_logK), safe_max(spring_logK),
+            safe_mean(spring_logC), safe_std(spring_logC), safe_min(spring_logC), safe_max(spring_logC),
+            torch.tensor(float(points.shape[0]), dtype=torch.float32) / 10000.0,
+        ]).float()
 
     def _project_to_image(self, points, point_features):
         """将 3D 节点投影为 [6, 60, 160] 物理图像。
@@ -109,8 +169,9 @@ class GeometricHDF5Dataset(Dataset):
             out['modal_omega_norm'] = out['modal_omega'].clone() / OMEGA_MAX
             out['modal_omega_target'] = out.pop('modal_omega')  # 保留物理值用于评估
 
-        # 2.5D 投影
+        # 2.5D 投影 + 逐通道归一化
         image_tensor = self._project_to_image(points, point_feat)
+        image_tensor = (image_tensor - IMG_MEAN) / (IMG_STD + 1e-8)
 
         # 坐标归一化到 [-1, 1]
         query_coords = torch.stack([
@@ -135,6 +196,18 @@ class GeometricHDF5Dataset(Dataset):
         # modal_omega 为归一化值(训练), modal_omega_phys 为物理值(评估)
         if 'modal_omega_target' in out:
             result['modal_omega_phys'] = out.pop('modal_omega_target')
+
+        # ---- CNN-ModalV2 新增字段 ----
+        result['node_xyz'] = self._build_node_xyz(points)
+        result['node_features'] = point_feat.float() if point_feat is not None else torch.zeros(points.shape[0], 7)
+        result['global_features'] = self._build_global_features(points, point_feat)
+
+        if 'modal_omega_phys' in result:
+            result['modal_freq_hz'] = result['modal_omega_phys'] / (2.0 * torch.pi)
+
+        if 'modal_zeta' in result:
+            result['modal_log_zeta'] = torch.log(torch.clamp(result['modal_zeta'], min=1e-8))
+
         return result
 
 
@@ -169,6 +242,10 @@ def collate_geometry_batch(batch):
         'frequencies': frequencies,
         'batch': batch_tensor,
     }
+    # CNN-ModalV2 新增字段
+    out['node_xyz'] = torch.cat([item['node_xyz'] for item in batch], dim=0)
+    out['node_features'] = torch.cat([item['node_features'] for item in batch], dim=0)
+    out['global_features'] = torch.stack([item['global_features'] for item in batch])
     modal = _stack_modal(batch)
     if modal:
         out.update(modal)
@@ -186,4 +263,8 @@ def _stack_modal(batch):
     result['modal_phi'] = torch.cat([item['modal_phi'] for item in batch], dim=0)
     if 'modal_omega_phys' in batch[0]:
         result['modal_omega_phys'] = torch.stack([item['modal_omega_phys'] for item in batch])
+    if 'modal_freq_hz' in batch[0] and batch[0]['modal_freq_hz'] is not None:
+        result['modal_freq_hz'] = torch.stack([item['modal_freq_hz'] for item in batch])
+    if 'modal_log_zeta' in batch[0] and batch[0]['modal_log_zeta'] is not None:
+        result['modal_log_zeta'] = torch.stack([item['modal_log_zeta'] for item in batch])
     return result
