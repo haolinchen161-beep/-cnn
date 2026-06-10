@@ -15,12 +15,15 @@ CONFIG = {
     'epochs': 2000,
     'validation_frequency': 5,
 
-    # 两阶段
-    'phase1_epochs': 300,    # CNN收敛快, 300轮够
-    'frf_loss_weight': 0.05,      # FRF预热目标权重
-    'omega_loss_weight': 200.0,    # ω 损失权重
-    'zeta_loss_weight': 10.0,      # ζ 损失权重
-    'phi_loss_weight': 100.0,      # φ 损失权重
+    # 阶段控制
+    'enable_phase2': True,           # 开启 FRF 联合训练
+    'phase2_min_epoch': 200,         # 200 轮模态预训练后进 Phase2
+    'freq_warmup_epochs': 80,        # 前80轮 omega_w=300, phi_w=0.01
+    'zeta_warmup_epochs': 40,        # 前40轮 zeta_w=0 (防 spike)
+
+    # FRF 弱约束: dB空间 MSE×0.5 ≈ 10-20 损失贡献 (总损失 ~200-400 的 5-10%)
+    'frf_loss_weight': 0.5,
+    'frf_warmup_epochs': 50,
 
     'freq_min': 1.0, 'freq_max': 5000.0,
     'data_path_train': ['train.h5'],
@@ -28,22 +31,19 @@ CONFIG = {
     'data_path_test': ['test.h5'],
 
     'augmentation': {
-        'enabled': False,  # 图像数据暂不增强
+        'enabled': False,
     },
 
     'optimizer': {
         'name': 'AdamW',
         'kwargs': {'lr': 0.001, 'weight_decay': 0.0003, 'betas': (0.9, 0.999)},
         'gradient_clip': 2.0,
-        'gradient_clip_transolver': 3.0,
-        'gradient_clip_head_phi': 5.0,
-        'gradient_clip_modal': 2.0,
     },
 }
 
 MODEL_CFG = {
     'encoder_kwargs': {
-        'in_ch': 6, 'hidden': 512, 'n_modes': 3,
+        'in_ch': 6, 'hidden': 768, 'n_modes': 3,
         'amp_scale': 500000.0, 'freq_min': 1.0, 'freq_max': 5000.0,
     },
     'decoder_kwargs': {},
@@ -99,23 +99,36 @@ def main():
         img = batch['image_tensor'].to(args.device)
         coords = batch['query_coords'].to(args.device)
         batch_idx = batch['batch'].to(args.device)
+        nx = batch.get('node_xyz'); nf = batch.get('node_features')
+        nx = nx.to(args.device) if nx is not None else None
+        nf = nf.to(args.device) if nf is not None else None
         phi_exc = batch.get('modal_phi_exc')
         phi_exc = phi_exc.to(args.device) if phi_exc is not None else None
-        frf_p, op, zp, pp = net(img, coords, batch['frequencies'].to(args.device), phi_exc, batch_idx)
-    print(f"  FRF={list(frf_p.shape)}, omega={list(op.shape)}, phi={list(pp.shape)}")
+        frf_p, omega_p, log_z, zeta_p, phi_p = net(
+            img, coords, batch['frequencies'].to(args.device), phi_exc, batch_idx,
+            node_xyz=nx, node_features=nf)
+    print(f"  FRF={list(frf_p.shape)}, omega_phys={list(omega_p.shape)}, phi={list(phi_p.shape)}")
+    print(f"  omega_phys[0] rad/s: {omega_p[0].tolist()}")
+    print(f"  freq_hz[0]: {[f'{w/(2*torch.pi):.1f}' for w in omega_p[0].tolist()]}")
 
     # 初始Loss
     print("\n--- Step 4: Initial Loss ---")
     with torch.no_grad():
-        init_loss, _, _, _ = modal_loss(op, batch['modal_omega_norm'].to(args.device),
-            zp, batch['modal_zeta'].to(args.device),
-            pp, batch['modal_phi'].to(args.device), batch_idx=batch_idx)
-    print(f"  Init loss: {init_loss.item():.0f}")
+        init_loss, l_w, l_z, l_p, mac_val = modal_loss(
+            omega_p, batch['modal_omega_phys'].to(args.device),
+            log_z, batch['modal_zeta'].to(args.device),
+            phi_p, batch['modal_phi'].to(args.device),
+            batch_idx=batch_idx,
+            omega_weight=1.0, zeta_weight=0.0, phi_weight=3.0)
+    mac_str = '/'.join(f'{x:.3f}' for x in mac_val.tolist())
+    print(f"  Init loss: {init_loss.item():.0f} MAC=[{mac_str}]")
+    print(f"  ω pred[0] Hz: {[f'{x/(2*torch.pi):.0f}' for x in omega_p[0].tolist()]}")
+    print(f"  ω true[0] Hz: {[f'{x/(2*torch.pi):.0f}' for x in batch['modal_omega_phys'][0].tolist()]}")
 
     # 训练
     print("\n--- Step 5: Train ---")
     optimizer = torch.optim.AdamW(net.parameters(), **CONFIG['optimizer']['kwargs'])
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=CONFIG['epochs'], eta_min=1e-6)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=500, eta_min=1e-6)
     start_epoch = 0
     ckpt_path = os.path.join(args.dir, "checkpoint_last")
     if os.path.exists(ckpt_path):
