@@ -35,26 +35,26 @@ DEFAULT_CONFIG = {
     'frf_loss_weight': 1.0,
     'gradient_clip': 1.0,
 
-    'physics_alpha_warmup': 50,
+    'physics_alpha_warmup': 999999,
 
     'modal_loss_weights': {
         # 频率和阻尼
         'omega': 10.0,
-        'zeta': 1.0,
+        'zeta': 0.2,
 
-        # 响应方向振型：内部已经包含 shape + scale + participation
-        'phi_resp': 1.0,
+        # 响应方向振型：shape only
+        'phi_resp': 3.0,
 
-        # 完整三向振型：内部包含 xyz shape + 少量 energy
+        # 完整三向振型
         'phi_xyz': 0.5,
 
-        # MAC 只作为辅助，避免弱 Z 模态被 MAC 过度惩罚
-        'mac': 0.05,
+        # 关闭 MAC
+        'mac': 0.0,
 
-        # 内部比例项
-        'phi_resp_scale_ratio': 0.3,
-        'participation_ratio': 0.3,
-        'phi_xyz_energy_ratio': 0.1,
+        # 关闭内部比例项
+        'phi_resp_scale_ratio': 0.0,
+        'participation_ratio': 0.0,
+        'phi_xyz_energy_ratio': 0.0,
     },
 
     'optimizer': {
@@ -174,7 +174,7 @@ def main():
     start_epoch = 0
     if os.path.exists(ckpt_last):
         ckpt = torch.load(ckpt_last, map_location=cli.device)
-        net.load_state_dict(ckpt['model_state_dict'])
+        net.load_state_dict(ckpt['model_state_dict'], strict=False)
         if ckpt.get('optimizer_state_dict') is not None:
             optimizer.load_state_dict(ckpt['optimizer_state_dict'])
         start_epoch = int(ckpt.get('epoch', -1)) + 1
@@ -186,7 +186,7 @@ def main():
 
     best_path = os.path.join(cli.output_dir, 'checkpoint_best')
     if os.path.exists(best_path):
-        net.load_state_dict(torch.load(best_path, map_location=cli.device)['model_state_dict'])
+        net.load_state_dict(torch.load(best_path, map_location=cli.device)['model_state_dict'], strict=False)
     metrics = evaluate(args, config, net, testloader, verbose=True)
     print(f'训练完成, 耗时 {elapsed:.1f}s')
     print(f'测试指标 ({frf_label}): {metrics}')
