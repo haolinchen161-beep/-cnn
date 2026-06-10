@@ -25,7 +25,7 @@ import torch.nn as nn
 
 from data.dataset import TransolverModalDataset, collate_mesh_batch
 from models import build_geometric_model
-from training.losses import phi_1d_shape_scale_loss, sign_invariant_mse, total_loss
+from training.losses import phi_1d_shape_scale_loss, sign_invariant_mse
 from training.trainer import TransolverTrainer, move_batch_to_device, save_checkpoint
 from utils.direction import (
     DEFAULT_FORCE_DIRECTION,
@@ -74,6 +74,8 @@ def parse_args():
     parser.add_argument('--lr-stage2', type=float, default=1e-4)
     parser.add_argument('--lr-stage3', type=float, default=5e-5)
     parser.add_argument('--weight-decay', type=float, default=1e-4)
+    parser.add_argument('--branch-init-clamp', type=float, default=20.0,
+                        help='用 stage1 coeff_table 初始化 branch 时的系数裁剪范围。')
     parser.add_argument('--seed', type=int, default=42)
     parser.add_argument('--device', default='cuda' if torch.cuda.is_available() else 'cpu')
     parser.add_argument('--no-fp16', action='store_true')
@@ -117,6 +119,61 @@ def batch_sample_ids(batch: Dict, sample_index_map: Dict[Tuple[str, str], int], 
 def set_requires_grad(module: nn.Module, flag: bool) -> None:
     for p in module.parameters():
         p.requires_grad = flag
+
+
+def sanitize_coeff_weight(coeff_weight: torch.Tensor, clamp_value: float) -> torch.Tensor:
+    coeff_weight = coeff_weight.detach().float().cpu()
+    coeff_weight = torch.nan_to_num(
+        coeff_weight,
+        nan=0.0,
+        posinf=float(clamp_value),
+        neginf=-float(clamp_value),
+    )
+    return coeff_weight.clamp(-float(clamp_value), float(clamp_value))
+
+
+def init_branch_from_coeff_weight(net: nn.Module,
+                                  coeff_weight: torch.Tensor,
+                                  clamp_value: float = 20.0) -> None:
+    """用 stage1 的 coeff_table 稳定初始化 stage2 的 branch 输出层。
+
+    stage1 结束后，trunk 已经适配了 coeff_table 的尺度。若 stage2 直接使用随机
+    branch，随机 coeff × frozen trunk 可能在 fp16 下溢出/上溢，导致 phi loss NaN。
+    这里把 branch 最后一层初始化为输出 coeff_table 的均值，小随机权重保留梯度通路。
+    """
+    coeff_weight = sanitize_coeff_weight(coeff_weight, clamp_value)
+    coeff_mean = coeff_weight.mean(dim=0)
+
+    final = net.phi_head.branch[-1]
+    if not isinstance(final, nn.Linear):
+        raise TypeError('phi_head.branch[-1] 必须是 nn.Linear，才能进行 coeff 均值初始化。')
+    if final.bias is None or final.bias.numel() != coeff_mean.numel():
+        raise ValueError('branch 输出维度与 coeff_table 维度不一致，请检查 phi_rank/n_modes。')
+
+    with torch.no_grad():
+        nn.init.normal_(final.weight, mean=0.0, std=1e-5)
+        final.bias.copy_(coeff_mean.to(device=final.bias.device, dtype=final.bias.dtype))
+
+    print(
+        '[stage2 init] branch 最后一层已用 stage1 coeff_table 均值初始化 | '
+        f'coeff_mean_abs={coeff_mean.abs().mean().item():.4f}, '
+        f'coeff_std={coeff_weight.std().item():.4f}, '
+        f'coeff_max_abs={coeff_weight.abs().max().item():.4f}'
+    )
+
+
+def load_stage1_checkpoint_if_available(args, net):
+    ckpt_path = os.path.join(args.output_dir, 'stage1_trunk', 'checkpoint_trunk')
+    if not os.path.exists(ckpt_path):
+        print('[stage1 load] 未找到 stage1_trunk/checkpoint_trunk，将不加载 trunk/coeff_table。')
+        return net, None
+
+    ckpt = torch.load(ckpt_path, map_location=args.device)
+    net.load_state_dict(ckpt['model_state_dict'], strict=False)
+    coeff_state = ckpt.get('coeff_table_state_dict') or {}
+    coeff_weight = coeff_state.get('weight')
+    print(f'[stage1 load] 已加载 {ckpt_path}')
+    return net, coeff_weight
 
 
 def stage1_phi_loss(net: nn.Module,
@@ -236,7 +293,7 @@ def train_stage1(args, net, trainloader, trainset, response_idx: int):
         'model_state_dict': net.state_dict(),
         'coeff_table_state_dict': coeff_table.state_dict(),
     }, os.path.join(out_dir, 'checkpoint_trunk'))
-    return net
+    return net, coeff_table.weight.detach().cpu()
 
 
 def train_supervised_stage(args, config, net, trainloader, valloader, stage_name: str,
@@ -251,11 +308,6 @@ def train_supervised_stage(args, config, net, trainloader, valloader, stage_name
     trainable_params = [p for p in net.parameters() if p.requires_grad]
     optimizer = torch.optim.AdamW(trainable_params, lr=lr, weight_decay=args.weight_decay)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=max(epochs, 1), eta_min=1e-6)
-
-    stage_args = Args()
-    stage_args.device = args.device
-    stage_args.fp16 = not args.no_fp16
-    stage_args.dir = out_dir
 
     trainer = TransolverTrainer(net, optimizer, device=args.device, scheduler=scheduler, fp16=not args.no_fp16)
     best = float('inf')
@@ -366,11 +418,19 @@ def main():
     print(f'模型参数: {sum(p.numel() for p in net.parameters()):,}')
 
     t0 = time.time()
+    coeff_weight = None
 
     if args.stage1_epochs > 0:
-        net = train_stage1(args, net, trainloader, trainset, response_idx)
+        net, coeff_weight = train_stage1(args, net, trainloader, trainset, response_idx)
+    else:
+        net, coeff_weight = load_stage1_checkpoint_if_available(args, net)
 
     if args.stage2_epochs > 0:
+        if coeff_weight is not None:
+            init_branch_from_coeff_weight(net, coeff_weight, clamp_value=args.branch_init_clamp)
+        else:
+            print('[stage2 init] 没有 coeff_table，branch 将保持随机初始化；这可能导致 stage2 NaN。')
+
         net = train_supervised_stage(
             args, config, net, trainloader, valloader,
             stage_name='stage2_frozen_trunk',
@@ -390,12 +450,12 @@ def main():
 
     # 最终测试用 stage3 best；如果没有 stage3，就用 stage2 best；如果只有 stage1，则只保存 trunk，不做测试。
     if args.stage2_epochs > 0 or args.stage3_epochs > 0:
-        eval_args = Args()
-        eval_args.device = args.device
-        eval_args.fp16 = not args.no_fp16
-        eval_args.dir = args.output_dir
-        trainer = TransolverTrainer(net, torch.optim.AdamW([p for p in net.parameters() if p.requires_grad], lr=1e-6),
-                                    device=args.device, fp16=not args.no_fp16)
+        trainer = TransolverTrainer(
+            net,
+            torch.optim.AdamW([p for p in net.parameters() if p.requires_grad], lr=1e-6),
+            device=args.device,
+            fp16=not args.no_fp16,
+        )
         metrics = trainer.evaluate(testloader, config)
         print(f'测试指标 ({frf_label}): {metrics}')
 
