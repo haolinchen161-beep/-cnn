@@ -107,7 +107,7 @@ class DeepONetPhiHead(nn.Module):
 
     三阶段训练版本采用更标准的 DeepONet 划分：
     - trunk 只看节点坐标和节点物理/几何特征，学习可冻结的空间基；
-    - branch 从整件工件的 global latent 预测每阶/每方向的模态系数；
+    - branch 从整件工件的 global latent + 显式全局统计特征预测模态系数；
     - 二者点乘得到逐节点 XYZ 三向振型。
 
     注意：这里 trunk 不再依赖 node_latent。这样阶段1才能在没有 Transolver
@@ -119,14 +119,17 @@ class DeepONetPhiHead(nn.Module):
                  node_feat_dim: int,
                  n_modes: int = 3,
                  rank: int = 64,
-                 dropout: float = 0.0):
+                 dropout: float = 0.0,
+                 branch_extra_dim: int = 0):
         super().__init__()
         self.n_modes = n_modes
         self.rank = rank
+        self.branch_extra_dim = branch_extra_dim
         out_dim = n_modes * 3 * rank
+        branch_in_dim = hidden_dim + branch_extra_dim
 
         self.branch = nn.Sequential(
-            nn.Linear(hidden_dim, hidden_dim), nn.GELU(), nn.Dropout(dropout),
+            nn.Linear(branch_in_dim, hidden_dim), nn.GELU(), nn.Dropout(dropout),
             nn.Linear(hidden_dim, hidden_dim), nn.GELU(),
             nn.Linear(hidden_dim, out_dim),
         )
@@ -138,9 +141,16 @@ class DeepONetPhiHead(nn.Module):
         )
         self.norm = 1.0 / math.sqrt(float(rank))
 
-    def branch_coeff(self, global_latent: torch.Tensor) -> torch.Tensor:
+    def branch_coeff(self, global_latent: torch.Tensor,
+                     global_features: torch.Tensor | None = None) -> torch.Tensor:
         B = global_latent.shape[0]
-        return self.branch(global_latent).view(B, self.n_modes, 3, self.rank)
+        if self.branch_extra_dim > 0:
+            if global_features is None:
+                global_features = global_latent.new_zeros(B, self.branch_extra_dim)
+            branch_input = torch.cat([global_latent, global_features.to(global_latent.dtype)], dim=-1)
+        else:
+            branch_input = global_latent
+        return self.branch(branch_input).view(B, self.n_modes, 3, self.rank)
 
     def trunk_basis(self, points: torch.Tensor, node_features: torch.Tensor) -> torch.Tensor:
         N = points.shape[0]
@@ -156,9 +166,10 @@ class DeepONetPhiHead(nn.Module):
                 node_latent: torch.Tensor,
                 points: torch.Tensor,
                 node_features: torch.Tensor,
-                batch: torch.Tensor) -> torch.Tensor:
+                batch: torch.Tensor,
+                global_features: torch.Tensor | None = None) -> torch.Tensor:
         # node_latent 保留在接口中是为了兼容 TransolverModalFRF.forward，当前 trunk 不使用它。
-        coeff = self.branch_coeff(global_latent)
+        coeff = self.branch_coeff(global_latent, global_features)
         basis = self.trunk_basis(points, node_features)
         return self.combine(coeff, basis, batch)
 
@@ -193,6 +204,8 @@ class TransolverModalFRF(nn.Module):
             raise ValueError("当前 CNN-style omega gap head 只支持 n_modes=3")
         self.n_modes = n_modes
         self.use_edge_stem = use_edge_stem
+        self.node_feat_dim = in_dim
+        self.branch_stats_dim = in_dim * 4  # mean/std/min/max of node_features
 
         _DIR_MAP = {"X": 0, "Y": 1, "Z": 2}
         self.response_dir_index = _DIR_MAP[response_direction.upper()]
@@ -241,6 +254,7 @@ class TransolverModalFRF(nn.Module):
             n_modes=n_modes,
             rank=phi_rank,
             dropout=dropout,
+            branch_extra_dim=self.branch_stats_dim,
         )
 
         self.zeta_context_gate = nn.Sequential(
@@ -280,6 +294,24 @@ class TransolverModalFRF(nn.Module):
         gate_logits = self.pool_gate(x_dense).squeeze(-1).masked_fill(~mask, -1e4)
         gate = torch.softmax(gate_logits, dim=1).masked_fill(~mask, 0.0)
         return (gate.unsqueeze(-1) * x_dense).sum(dim=1)  # (B, H)
+
+    def global_feature_summary(self, node_features: torch.Tensor, node_counts: list) -> torch.Tensor:
+        """显式全局统计特征：mean/std/min/max(node_features)。
+
+        这相当于把旧固支板模型中 branch 直接看到的全局几何/材料/边界参数，
+        以统计形式注入 DeepONet branch，避免只依赖 Transolver pooled latent。
+        """
+        feat_dense, mask = pad_batch(node_features, node_counts)
+        mask_f = mask.unsqueeze(-1).to(feat_dense.dtype)
+        denom = mask_f.sum(dim=1).clamp_min(1.0)
+        mean = (feat_dense * mask_f).sum(dim=1) / denom
+        var = ((feat_dense - mean.unsqueeze(1)).pow(2) * mask_f).sum(dim=1) / denom
+        std = torch.sqrt(var.clamp_min(0.0) + 1e-8)
+        large = 1.0e4
+        fmin = feat_dense.masked_fill(~mask.unsqueeze(-1), large).min(dim=1).values
+        fmax = feat_dense.masked_fill(~mask.unsqueeze(-1), -large).max(dim=1).values
+        summary = torch.cat([mean, std, fmin, fmax], dim=-1)
+        return torch.nan_to_num(summary, nan=0.0, posinf=large, neginf=-large)
 
     def compute_physics_zeta(self, phi_xyz_dense, boundary_c_xyz_dense, omega, mask):
         """根据材料阻尼与三向边界耗散计算基线阻尼比（dense 版）。"""
@@ -326,6 +358,7 @@ class TransolverModalFRF(nn.Module):
         latent, latent_dense, mask = self.encode(
             points, node_features, edge_index=edge_index, node_counts=node_counts)
         global_latent = self.global_pool(latent_dense, mask)
+        branch_features = self.global_feature_summary(node_features, node_counts)
 
         # --- 固有频率 ---
         # CNN 同款单调 gap head：w1 + gap21 + gap32
@@ -341,14 +374,10 @@ class TransolverModalFRF(nn.Module):
         omega = torch.cat([w1, w2, w3], dim=-1)  # (B, 3), rad/s
 
         # --- 模态振型（三向）---
-        # DeepONet branch-trunk head: global latent 给模态系数，points/node_features 给空间基
-        phi_xyz = self.phi_head(
-            global_latent=global_latent,
-            node_latent=latent,
-            points=points,
-            node_features=node_features,
-            batch=batch,
-        )
+        # DeepONet branch-trunk head: global latent + node feature stats 给模态系数
+        modal_phi_coeff = self.phi_head.branch_coeff(global_latent, branch_features)
+        basis = self.phi_head.trunk_basis(points, node_features)
+        phi_xyz = self.phi_head.combine(modal_phi_coeff, basis, batch)
 
         # --- 方向感知投影 ---
         phi_response = phi_xyz[..., self.response_dir_index]  # (total_N, K)
@@ -392,6 +421,8 @@ class TransolverModalFRF(nn.Module):
             'modal_phi_response': phi_response,
             'modal_phi_force': phi_force,
             'modal_phi_exc_force': phi_force_exc,
+            'modal_phi_coeff': modal_phi_coeff,
+            'branch_global_features': branch_features,
             'response_dir_index': self.response_dir_index,
             'force_dir_index': self.force_dir_index,
             'modal_phi_z': phi_xyz[..., 2],
