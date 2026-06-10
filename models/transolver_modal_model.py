@@ -123,9 +123,10 @@ class TransolverModalFRF(nn.Module):
                  use_edge_stem: bool = True,
                  amp_scale: float = 500000.0,
                  response_direction: str = "Z",
-                 force_direction: str = "Z",
-                 omega_scale: float = 8000.0):
+                 force_direction: str = "Z"):
         super().__init__()
+        if n_modes != 3:
+            raise ValueError("当前 CNN-style omega gap head 只支持 n_modes=3")
         self.n_modes = n_modes
         self.use_edge_stem = use_edge_stem
 
@@ -151,6 +152,21 @@ class TransolverModalFRF(nn.Module):
             nn.Linear(hidden_dim, hidden_dim), nn.GELU(),
             nn.Linear(hidden_dim, n_modes),
         )
+        # 频率 gap head 标定常量，单位 rad/s
+        # 基于当前数据集，并保留 f3 - f2 >= 200Hz 的过滤条件
+        self.register_buffer("omega_w1_base", torch.tensor(4712.389, dtype=torch.float32))      # 2π × 750 Hz
+        self.register_buffer("omega_w1_scale", torch.tensor(1817.471, dtype=torch.float32))
+
+        self.register_buffer("omega_gap21_min", torch.tensor(4398.230, dtype=torch.float32))    # 2π × 700 Hz
+        self.register_buffer("omega_gap21_scale", torch.tensor(6290.185, dtype=torch.float32))
+
+        self.register_buffer("omega_gap32_min", torch.tensor(1256.637, dtype=torch.float32))    # 2π × 200 Hz
+        self.register_buffer("omega_gap32_scale", torch.tensor(2923.069, dtype=torch.float32))
+
+        # 让初始 out≈0，使初始频率接近数据均值，同时保留梯度通路
+        nn.init.normal_(self.omega_head[-1].weight, mean=0.0, std=1e-3)
+        nn.init.zeros_(self.omega_head[-1].bias)
+
         self.zeta_residual_head = nn.Sequential(
             nn.Linear(hidden_dim, hidden_dim), nn.GELU(),
             nn.Linear(hidden_dim, n_modes),
@@ -178,7 +194,6 @@ class TransolverModalFRF(nn.Module):
         )
 
         self.physics = ModalFRFDecoder(amp_scale=amp_scale)
-        self.omega_scale = nn.Parameter(torch.tensor(omega_scale, dtype=torch.float32))
 
     def encode(self, points, node_features, edge_index=None, node_counts=None):
         """编码：拼接输入 → edge stem → dense padding → slice blocks → unpadding。"""
@@ -246,8 +261,17 @@ class TransolverModalFRF(nn.Module):
         global_latent = self.global_pool(latent_dense, mask)
 
         # --- 固有频率 ---
-        # 直接预测，不排序，不累加
-        omega = F.softplus(self.omega_head(global_latent)) * F.softplus(self.omega_scale)  # (B, K)
+        # CNN 同款单调 gap head：w1 + gap21 + gap32
+        out = self.omega_head(global_latent)
+
+        w1 = F.softplus(out[:, 0:1]) * self.omega_w1_scale + self.omega_w1_base
+        gap21 = F.softplus(out[:, 1:2]) * self.omega_gap21_scale + self.omega_gap21_min
+        gap32 = F.softplus(out[:, 2:3]) * self.omega_gap32_scale + self.omega_gap32_min
+
+        w2 = w1 + gap21
+        w3 = w2 + gap32
+
+        omega = torch.cat([w1, w2, w3], dim=-1)  # (B, 3), rad/s
 
         # --- 模态振型（三向） ---
         phi_xyz = self.phi_head(latent).view(-1, self.n_modes, 3)
