@@ -91,93 +91,292 @@ def mac_loss(pred: torch.Tensor,
         return pred.new_tensor(0.0)
     return torch.stack(mac_parts).mean()
 
+def phi_1d_shape_scale_loss(pred: torch.Tensor,
+                            target: torch.Tensor,
+                            node_counts: list,
+                            eps: float = 1e-8):
+    """目标方向 1D 振型的 shape + scale 解耦损失。
+
+    pred/target:
+        (total_N, K)，例如 Z/Z 训练时的 phi_z。
+
+    返回:
+        shape_loss:
+            RMS 归一化后的形状误差，解决弱 Z 分量被忽略的问题。
+
+        scale_loss:
+            log-RMS 尺度误差，解决形状对了但幅值错的问题。
+
+        per_mode_shape:
+            每阶 shape 误差，用于日志 phi_k0/1/2。
+
+        per_mode_scale:
+            每阶 scale 误差，用于额外日志。
+    """
+    shape_parts = []
+    scale_parts = []
+    per_mode_shape_parts = []
+    per_mode_scale_parts = []
+
+    ptr = 0
+    for c in node_counts:
+        p = pred[ptr:ptr + c]      # (N_b, K)
+        t = target[ptr:ptr + c]    # (N_b, K)
+
+        p_rms = torch.sqrt(p.pow(2).mean(dim=0) + eps)  # (K,)
+        t_rms = torch.sqrt(t.pow(2).mean(dim=0) + eps)  # (K,)
+
+        # ---------- shape：归一化后比较空间形状 ----------
+        p_n = p / p_rms.clamp_min(eps)
+        t_n = t / t_rms.clamp_min(eps)
+
+        dot = (p_n * t_n).sum(dim=0)
+        sign = torch.where(dot >= 0, torch.ones_like(dot), -torch.ones_like(dot))
+
+        per_mode_shape = (p_n - t_n * sign).pow(2).mean(dim=0)  # (K,)
+
+        # ---------- scale：log-RMS，避免大幅值再次掩蔽小幅值 ----------
+        per_mode_scale = torch.abs(
+            torch.log(p_rms.clamp_min(eps)) -
+            torch.log(t_rms.clamp_min(eps))
+        )  # (K,)
+
+        shape_parts.append(per_mode_shape.mean())
+        scale_parts.append(per_mode_scale.mean())
+        per_mode_shape_parts.append(per_mode_shape)
+        per_mode_scale_parts.append(per_mode_scale)
+
+        ptr += c
+
+    if not shape_parts:
+        zero = pred.new_tensor(0.0)
+        return zero, zero, zero, zero
+
+    shape_loss = torch.stack(shape_parts).mean()
+    scale_loss = torch.stack(scale_parts).mean()
+    per_mode_shape = torch.stack(per_mode_shape_parts).mean(dim=0)
+    per_mode_scale = torch.stack(per_mode_scale_parts).mean(dim=0)
+
+    return shape_loss, scale_loss, per_mode_shape, per_mode_scale
+
+
+def phi_participation_loss(phi_resp_pred: torch.Tensor,
+                           phi_resp_target: torch.Tensor,
+                           phi_force_pred: torch.Tensor,
+                           phi_force_target: torch.Tensor,
+                           excitation_index: torch.Tensor,
+                           node_counts: list,
+                           eps: float = 1e-8):
+    """FRF 分子参与因子损失。
+
+    对 H_ab:
+        participation(node, k) = phi_response_a(node, k) * phi_force_b(exc, k)
+
+    这个量直接对应模态叠加 FRF 的分子项，比单独监督 phi_resp 更接近最终目标。
+    """
+    loss_parts = []
+    per_mode_parts = []
+
+    ptr = 0
+    for b, c in enumerate(node_counts):
+        p_resp = phi_resp_pred[ptr:ptr + c]      # (N_b, K)
+        t_resp = phi_resp_target[ptr:ptr + c]    # (N_b, K)
+
+        # excitation_index 在 collate 后是全局节点索引，不是局部索引
+        exc_global = excitation_index[b].long()
+
+        p_exc = phi_force_pred[exc_global]       # (K,)
+        t_exc = phi_force_target[exc_global]     # (K,)
+
+        part_pred = p_resp * p_exc.unsqueeze(0)      # (N_b, K)
+        part_target = t_resp * t_exc.unsqueeze(0)    # (N_b, K)
+
+        # 每阶按目标 participation RMS 归一化，避免强模态再次掩蔽弱模态
+        part_scale = torch.sqrt(part_target.pow(2).mean(dim=0) + eps)
+        per_mode = ((part_pred - part_target) / part_scale.clamp_min(eps)).pow(2).mean(dim=0)
+
+        loss_parts.append(per_mode.mean())
+        per_mode_parts.append(per_mode)
+
+        ptr += c
+
+    if not loss_parts:
+        zero = phi_resp_pred.new_tensor(0.0)
+        return zero, zero
+
+    loss = torch.stack(loss_parts).mean()
+    per_mode = torch.stack(per_mode_parts).mean(dim=0)
+
+    return loss, per_mode
 
 def modal_loss(outputs: Dict[str, torch.Tensor],
                batch_data: Dict[str, torch.Tensor],
                weights: Dict[str, float] | None = None) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
-    """计算模态参数损失（纯 PyTorch 指针切片版）。
+    """计算模态参数损失。
 
-    目标:
-        modal_omega      (B, K), rad/s
-        modal_zeta       (B, K)
-        modal_phi_xyz    (total_N, K, 3)
+    新版逻辑:
+    1. omega / zeta 保持原监督。
+    2. 响应方向 phi_resp 拆成 shape + scale。
+    3. 增加 participation loss，直接监督 FRF 分子项。
+    4. phi_xyz 拆成 normalized shape + raw energy。
+    5. 保留 loss_phi_resp / loss_phi_xyz 旧 key，兼容 trainer 日志。
     """
     weights = weights or {}
     batch = batch_data['batch']
-    # 优先读取 Dataset 传来的 CPU 列表，避免 GPU bincount() 同步
     node_counts = batch_data.get('node_counts', batch.bincount().tolist())
-    num_graphs = len(node_counts)
 
     omega_pred = outputs['modal_omega']
     zeta_pred = outputs['modal_zeta']
     phi_pred = outputs['modal_phi_xyz']
 
-    # 直接使用干净目标（200Hz 频率差过滤器已剔除模态跳转样本）
     phi_target = batch_data['modal_phi_xyz']
     omega_target = batch_data['modal_omega']
     zeta_target = batch_data['modal_zeta']
 
-    # 固有频率损失
+    # ------------------------------------------------------------
+    # 1. 频率损失
+    # ------------------------------------------------------------
     loss_omega = relative_l1(omega_pred, omega_target, eps=1e-5)
 
-    # 阻尼比损失
+    # ------------------------------------------------------------
+    # 2. 阻尼损失
+    # ------------------------------------------------------------
     loss_zeta = (
         0.5 * log_l1(zeta_pred, zeta_target, eps=1e-5) +
         0.5 * relative_l1(zeta_pred, zeta_target, eps=1e-5)
     )
 
-    # 逐模态误差（用于日志）
     omega_per_mode = torch.mean(
-        torch.abs(omega_pred - omega_target) / (torch.abs(omega_target) + 1e-5), dim=0)  # (K,)
+        torch.abs(omega_pred - omega_target) / (torch.abs(omega_target) + 1e-5),
+        dim=0,
+    )
     zeta_per_mode = torch.mean(
-        torch.abs(zeta_pred - zeta_target) / (torch.abs(zeta_target) + 1e-5), dim=0)  # (K,)
+        torch.abs(zeta_pred - zeta_target) / (torch.abs(zeta_target) + 1e-5),
+        dim=0,
+    )
 
-    # 方向感知振型损失
-    resp_idx = int(batch_data.get('response_dir_index',
-                                   torch.tensor(2)).flatten()[0].item())
-    phi_resp_pred = phi_pred[..., resp_idx]   # (total_N, K)
-    phi_resp_target = phi_target[..., resp_idx]
+    # ------------------------------------------------------------
+    # 3. 提取响应方向和激励方向
+    # ------------------------------------------------------------
+    resp_idx = int(batch_data.get(
+        'response_dir_index',
+        torch.tensor(2, device=phi_pred.device)
+    ).flatten()[0].item())
 
-    loss_phi_resp = sign_invariant_mse(phi_resp_pred, phi_resp_target, node_counts, normalize=False)
-    # 直接传入 3D 张量，sign_invariant_mse 内部自动处理 3D 符号对齐
-    loss_phi_xyz = sign_invariant_mse(phi_pred, phi_target, node_counts, normalize=False)
+    force_idx = int(batch_data.get(
+        'force_dir_index',
+        torch.tensor(resp_idx, device=phi_pred.device)
+    ).flatten()[0].item())
+
+    phi_resp_pred = phi_pred[..., resp_idx]       # (total_N, K)
+    phi_resp_target = phi_target[..., resp_idx]   # (total_N, K)
+
+    phi_force_pred = phi_pred[..., force_idx]     # (total_N, K)
+    phi_force_target = phi_target[..., force_idx] # (total_N, K)
+
+    # ------------------------------------------------------------
+    # 4. 响应方向 shape + scale
+    # ------------------------------------------------------------
+    loss_phi_resp_shape, loss_phi_resp_scale, phi_per_mode, z_scale_per_mode = \
+        phi_1d_shape_scale_loss(
+            phi_resp_pred,
+            phi_resp_target,
+            node_counts,
+        )
+
+    # ------------------------------------------------------------
+    # 5. FRF 分子 participation loss
+    # ------------------------------------------------------------
+    if 'excitation_index' in batch_data:
+        loss_participation, part_per_mode = phi_participation_loss(
+            phi_resp_pred=phi_resp_pred,
+            phi_resp_target=phi_resp_target,
+            phi_force_pred=phi_force_pred,
+            phi_force_target=phi_force_target,
+            excitation_index=batch_data['excitation_index'],
+            node_counts=node_counts,
+        )
+    else:
+        loss_participation = phi_pred.new_tensor(0.0)
+        part_per_mode = phi_pred.new_zeros(phi_pred.shape[1])
+
+    # ------------------------------------------------------------
+    # 6. 完整 XYZ 振型：shape + energy
+    # ------------------------------------------------------------
+    loss_phi_xyz_shape = sign_invariant_mse(
+        phi_pred,
+        phi_target,
+        node_counts,
+        normalize=True,
+    )
+
+    loss_phi_xyz_energy = sign_invariant_mse(
+        phi_pred,
+        phi_target,
+        node_counts,
+        normalize=False,
+    )
+
+    # ------------------------------------------------------------
+    # 7. MAC，保留辅助，但权重建议很小
+    # ------------------------------------------------------------
     loss_mac = mac_loss(phi_resp_pred, phi_resp_target, node_counts)
 
-    # 逐模态 φ 误差（指针切片版）
-    phi_per_mode_parts = []
-    ptr = 0
-    for c in node_counts:
-        p = phi_resp_pred[ptr:ptr + c]
-        t = phi_resp_target[ptr:ptr + c]
-        p_rms = torch.sqrt(p.pow(2).mean(dim=0) + 1e-8)
-        t_rms = torch.sqrt(t.pow(2).mean(dim=0) + 1e-8)
-        p_n = p / p_rms.clamp_min(1e-8)
-        t_n = t / t_rms.clamp_min(1e-8)
-        dot = (p_n * t_n).sum(dim=0)
-        sign = torch.where(dot >= 0,
-                           torch.tensor(1.0, device=dot.device),
-                           torch.tensor(-1.0, device=dot.device))
-        phi_per_mode_parts.append((p_n - t_n * sign).pow(2).mean(dim=0))
-        ptr += c
-    phi_per_mode = torch.stack(phi_per_mode_parts).mean(dim=0)  # (K,)
+    # ------------------------------------------------------------
+    # 8. 组合 legacy loss，兼容 trainer 原有日志
+    # ------------------------------------------------------------
+    resp_scale_ratio = weights.get('phi_resp_scale_ratio', 0.3)
+    participation_ratio = weights.get('participation_ratio', 0.3)
+    xyz_energy_ratio = weights.get('phi_xyz_energy_ratio', 0.1)
 
-    total = (
-        weights.get('omega', 1.0) * loss_omega +
-        weights.get('zeta', 0.5) * loss_zeta +
-        weights.get('phi_resp', 1.0) * loss_phi_resp +
-        weights.get('phi_xyz', 0.25) * loss_phi_xyz +
-        weights.get('mac', 0.2) * loss_mac
+    loss_phi_resp = (
+        loss_phi_resp_shape +
+        resp_scale_ratio * loss_phi_resp_scale +
+        participation_ratio * loss_participation
     )
+
+    loss_phi_xyz = (
+        loss_phi_xyz_shape +
+        xyz_energy_ratio * loss_phi_xyz_energy
+    )
+
+    # ------------------------------------------------------------
+    # 9. 总损失
+    # ------------------------------------------------------------
+    total = (
+        weights.get('omega', 10.0) * loss_omega +
+        weights.get('zeta', 1.0) * loss_zeta +
+        weights.get('phi_resp', 1.0) * loss_phi_resp +
+        weights.get('phi_xyz', 0.5) * loss_phi_xyz +
+        weights.get('mac', 0.05) * loss_mac
+    )
+
+    # ------------------------------------------------------------
+    # 10. 日志
+    # ------------------------------------------------------------
     logs = {
         'loss_omega': loss_omega.detach(),
         'loss_zeta': loss_zeta.detach(),
+
+        # 保留旧 key，trainer.py 依赖这些字段
         'loss_phi_resp': loss_phi_resp.detach(),
         'loss_phi_xyz': loss_phi_xyz.detach(),
         'loss_mac': loss_mac.detach(),
+
+        # 新增细分日志
+        'loss_phi_resp_shape': loss_phi_resp_shape.detach(),
+        'loss_phi_resp_scale': loss_phi_resp_scale.detach(),
+        'loss_phi_participation': loss_participation.detach(),
+        'loss_phi_xyz_shape': loss_phi_xyz_shape.detach(),
+        'loss_phi_xyz_energy': loss_phi_xyz_energy.detach(),
+
         **{f'omega_k{k}': omega_per_mode[k].detach() for k in range(omega_per_mode.shape[0])},
         **{f'zeta_k{k}': zeta_per_mode[k].detach() for k in range(zeta_per_mode.shape[0])},
         **{f'phi_k{k}': phi_per_mode[k].detach() for k in range(phi_per_mode.shape[0])},
+        **{f'z_scale_k{k}': z_scale_per_mode[k].detach() for k in range(z_scale_per_mode.shape[0])},
+        **{f'part_k{k}': part_per_mode[k].detach() for k in range(part_per_mode.shape[0])},
     }
+
     return total, logs
 
 
