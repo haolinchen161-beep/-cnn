@@ -20,6 +20,19 @@ import torch.nn.functional as F
 from .physics_decoder import ModalFRFDecoder
 
 
+def sanitize_feature_tensor(x: torch.Tensor, clamp_value: float = 20.0) -> torch.Tensor:
+    """Remove NaN/Inf and clamp feature scale before any network layer.
+
+    Node features contain log stiffness/damping and derived geometry flags.  A single
+    NaN/Inf value can poison the Transolver encoder, branch coeff distillation, and
+    omega loss at epoch 0.  Keep this operation inside the model so every caller
+    (stage1 trunk, stage2 encoder, evaluation) uses the same safe path.
+    """
+    y = x.float()
+    y = torch.nan_to_num(y, nan=0.0, posinf=float(clamp_value), neginf=-float(clamp_value))
+    return y.clamp(-float(clamp_value), float(clamp_value))
+
+
 # ======================= Dense Padding 工具 =======================
 def pad_batch(x: torch.Tensor, node_counts: list):
     """将 (total_N, H) 填充为 (B, N_max, H)，解锁 Tensor Core bmm。"""
@@ -145,26 +158,32 @@ class DeepONetPhiHead(nn.Module):
     def branch_coeff(self, global_latent: torch.Tensor,
                      global_features: torch.Tensor | None = None) -> torch.Tensor:
         B = global_latent.shape[0]
+        global_latent = torch.nan_to_num(global_latent.float(), nan=0.0, posinf=20.0, neginf=-20.0).clamp(-20.0, 20.0).to(global_latent.dtype)
         if self.branch_extra_dim > 0:
             if global_features is None:
                 global_features = global_latent.new_zeros(B, self.branch_extra_dim)
             # 统计特征来自原始 node_features，可能有 NaN/Inf 或尺度较大；进入 branch 前先稳定化。
-            gf = global_features.float()
-            gf = torch.nan_to_num(gf, nan=0.0, posinf=20.0, neginf=-20.0).clamp(-20.0, 20.0)
+            gf = sanitize_feature_tensor(global_features, 20.0)
             gf = self.branch_extra_norm(gf).to(global_latent.dtype)
             branch_input = torch.cat([global_latent, gf], dim=-1)
         else:
             branch_input = global_latent
-        return self.branch(branch_input).view(B, self.n_modes, 3, self.rank)
+        out = self.branch(branch_input)
+        out = torch.nan_to_num(out.float(), nan=0.0, posinf=20.0, neginf=-20.0).clamp(-20.0, 20.0).to(branch_input.dtype)
+        return out.view(B, self.n_modes, 3, self.rank)
 
     def trunk_basis(self, points: torch.Tensor, node_features: torch.Tensor) -> torch.Tensor:
         N = points.shape[0]
-        trunk_in = torch.cat([points, node_features], dim=-1)
-        return self.trunk(trunk_in).view(N, self.n_modes, 3, self.rank)
+        feat = sanitize_feature_tensor(node_features, 20.0).to(points.dtype)
+        trunk_in = torch.cat([points, feat], dim=-1)
+        out = self.trunk(trunk_in)
+        out = torch.nan_to_num(out.float(), nan=0.0, posinf=20.0, neginf=-20.0).clamp(-20.0, 20.0).to(trunk_in.dtype)
+        return out.view(N, self.n_modes, 3, self.rank)
 
     def combine(self, coeff: torch.Tensor, basis: torch.Tensor, batch: torch.Tensor) -> torch.Tensor:
         coeff_n = coeff[batch.long()]  # (N, K, 3, R)
-        return (coeff_n * basis).sum(dim=-1) * self.norm  # (N, K, 3)
+        phi = (coeff_n * basis).sum(dim=-1) * self.norm  # (N, K, 3)
+        return torch.nan_to_num(phi.float(), nan=0.0, posinf=20.0, neginf=-20.0).clamp(-20.0, 20.0).to(basis.dtype)
 
     def forward(self,
                 global_latent: torch.Tensor,
@@ -283,13 +302,17 @@ class TransolverModalFRF(nn.Module):
 
     def encode(self, points, node_features, edge_index=None, node_counts=None):
         """编码：拼接输入 → edge stem → dense padding → slice blocks → unpadding。"""
-        x = self.input_proj(torch.cat([points, node_features], dim=-1))
+        feat = sanitize_feature_tensor(node_features, 20.0).to(points.dtype)
+        x = self.input_proj(torch.cat([points, feat], dim=-1))
+        x = torch.nan_to_num(x.float(), nan=0.0, posinf=20.0, neginf=-20.0).clamp(-20.0, 20.0).to(points.dtype)
         if self.use_edge_stem and edge_index is not None and edge_index.numel() > 0:
             x = self.edge_stem(x, edge_index)
+            x = torch.nan_to_num(x.float(), nan=0.0, posinf=20.0, neginf=-20.0).clamp(-20.0, 20.0).to(points.dtype)
 
         x_dense, mask = pad_batch(x, node_counts)
         for block in self.blocks:
             x_dense = block(x_dense, mask)
+            x_dense = torch.nan_to_num(x_dense.float(), nan=0.0, posinf=20.0, neginf=-20.0).clamp(-20.0, 20.0).to(x.dtype)
 
         latent_flat = unpad_batch(x_dense, node_counts)
         return latent_flat, x_dense, mask
@@ -297,8 +320,10 @@ class TransolverModalFRF(nn.Module):
     def global_pool(self, x_dense, mask):
         """对 dense 张量做门控全局池化。"""
         gate_logits = self.pool_gate(x_dense).squeeze(-1).masked_fill(~mask, -1e4)
+        gate_logits = torch.nan_to_num(gate_logits.float(), nan=0.0, posinf=20.0, neginf=-20.0).clamp(-20.0, 20.0).to(x_dense.dtype)
         gate = torch.softmax(gate_logits, dim=1).masked_fill(~mask, 0.0)
-        return (gate.unsqueeze(-1) * x_dense).sum(dim=1)  # (B, H)
+        pooled = (gate.unsqueeze(-1) * x_dense).sum(dim=1)  # (B, H)
+        return torch.nan_to_num(pooled.float(), nan=0.0, posinf=20.0, neginf=-20.0).clamp(-20.0, 20.0).to(x_dense.dtype)
 
     def global_feature_summary(self, node_features: torch.Tensor, node_counts: list) -> torch.Tensor:
         """显式全局统计特征：mean/std/min/max(node_features)。
@@ -307,8 +332,7 @@ class TransolverModalFRF(nn.Module):
         这样保留“Branch 直接看到全局参数”的结构启发，同时避免 fp16 下
         NaN/Inf 或极端节点特征把 branch 输入污染。
         """
-        feat = node_features.float()
-        feat = torch.nan_to_num(feat, nan=0.0, posinf=20.0, neginf=-20.0).clamp(-20.0, 20.0)
+        feat = sanitize_feature_tensor(node_features, 20.0)
         feat_dense, mask = pad_batch(feat, node_counts)
         mask_f = mask.unsqueeze(-1).to(feat_dense.dtype)
         denom = mask_f.sum(dim=1).clamp_min(1.0)
@@ -363,15 +387,18 @@ class TransolverModalFRF(nn.Module):
         if node_counts is None:
             node_counts = batch.bincount().tolist()
 
+        node_features_safe = sanitize_feature_tensor(node_features, 20.0).to(points.dtype)
+
         # --- 编码 ---
         latent, latent_dense, mask = self.encode(
-            points, node_features, edge_index=edge_index, node_counts=node_counts)
+            points, node_features_safe, edge_index=edge_index, node_counts=node_counts)
         global_latent = self.global_pool(latent_dense, mask)
-        branch_features = self.global_feature_summary(node_features, node_counts)
+        branch_features = self.global_feature_summary(node_features_safe, node_counts)
 
         # --- 固有频率 ---
         # CNN 同款单调 gap head：w1 + gap21 + gap32
         out = self.omega_head(global_latent)
+        out = torch.nan_to_num(out.float(), nan=0.0, posinf=20.0, neginf=-20.0).clamp(-20.0, 20.0).to(global_latent.dtype)
 
         w1 = F.softplus(out[:, 0:1]) * self.omega_w1_scale + self.omega_w1_base
         gap21 = F.softplus(out[:, 1:2]) * self.omega_gap21_scale + self.omega_gap21_min
@@ -381,11 +408,12 @@ class TransolverModalFRF(nn.Module):
         w3 = w2 + gap32
 
         omega = torch.cat([w1, w2, w3], dim=-1)  # (B, 3), rad/s
+        omega = torch.nan_to_num(omega.float(), nan=1.0, posinf=60000.0, neginf=1.0).clamp(1.0, 60000.0).to(global_latent.dtype)
 
         # --- 模态振型（三向）---
         # DeepONet branch-trunk head: global latent + node feature stats 给模态系数
         modal_phi_coeff = self.phi_head.branch_coeff(global_latent, branch_features)
-        basis = self.phi_head.trunk_basis(points, node_features)
+        basis = self.phi_head.trunk_basis(points, node_features_safe)
         phi_xyz = self.phi_head.combine(modal_phi_coeff, basis, batch)
 
         # --- 方向感知投影 ---
@@ -395,9 +423,11 @@ class TransolverModalFRF(nn.Module):
         # --- 阻尼比（渐进式物理融合） ---
         # 1. 数据驱动路径：纯数据预测，用于训练早期热启动
         zeta_direct = F.softplus(self.zeta_direct_head(global_latent)) + 1e-4  # (B, K)
+        zeta_direct = torch.nan_to_num(zeta_direct.float(), nan=0.003, posinf=1.0, neginf=1e-4).clamp(1e-4, 1.0).to(global_latent.dtype)
 
         # 2. 物理路径：物理耗散基底 + 非线性残差修正
         if boundary_c_xyz is not None:
+            boundary_c_xyz = torch.nan_to_num(boundary_c_xyz.float(), nan=0.0, posinf=1e6, neginf=-1e6).clamp(-1e6, 1e6).to(phi_xyz.dtype)
             phi_xyz_dense, _ = pad_batch(phi_xyz, node_counts)
             boundary_c_xyz_dense, _ = pad_batch(boundary_c_xyz, node_counts)
 
@@ -406,12 +436,14 @@ class TransolverModalFRF(nn.Module):
             zeta_residual = self.zeta_mode_residual_head(mode_context).squeeze(-1)  # (B, K)
             # 0.5 允许网络进行 ±60% 的修正（exp(0.5)≈1.65, exp(-0.5)≈0.61）
             zeta_phys_corrected = zeta_phys * torch.exp(0.5 * torch.tanh(zeta_residual))
+            zeta_phys_corrected = torch.nan_to_num(zeta_phys_corrected.float(), nan=0.003, posinf=1.0, neginf=1e-4).clamp(1e-4, 1.0).to(global_latent.dtype)
         else:
             # 无边界阻尼信息时，物理路径退化为数据路径
             zeta_phys_corrected = zeta_direct
 
         # 3. 渐进式融合：alpha=0 纯数据驱动，alpha=1 纯物理路径
         zeta = (1.0 - physics_alpha) * zeta_direct + physics_alpha * zeta_phys_corrected
+        zeta = torch.nan_to_num(zeta.float(), nan=0.003, posinf=1.0, neginf=1e-4).clamp(1e-4, 1.0).to(global_latent.dtype)
 
         # --- FRF 物理重建 ---
         frf = None
