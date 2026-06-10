@@ -109,7 +109,7 @@ class TransolverTrainer:
         for batch in loader:
             batch = move_batch_to_device(batch, self.device)
             outputs = self.forward_batch(batch, config)
-            # total_loss 内部已执行匈牙利匹配，返回对齐后的 logs
+            # total_loss 返回当前 loss 结构下的评估日志
             _, logs = total_loss(outputs, batch, config)
             for key, value in logs.items():
                 sums[key] = sums.get(key, 0.0) + float(value.detach().cpu())
@@ -210,7 +210,7 @@ def train(args, config, model_cfg, net, dataloader, optimizer, valloader, schedu
         phi_pct = ' '.join([f"{train_logs.get(f'phi_k{k}', 0)*100:.1f}%" for k in range(3)])
         alpha = config.get('physics_alpha', 1.0)
         train_msg = (f"Epoch {epoch:04d} | lr={lr:.1e} | α={alpha:.2f} | total={total_w:.3e} "
-                     f"[ω={pct_o:.0f}% ζ={pct_z:.0f}% φz={pct_p:.0f}% φ3={pct_x:.0f}%] "
+                     f"[ω={pct_o:.0f}% ζ={pct_z:.0f}% φ_resp={pct_p:.0f}% φ_xyz={pct_x:.0f}%] "
                      f"ω_k=[{omega_pct}] ζ_k=[{zeta_pct}] φ_k=[{phi_pct}]")
         print(train_msg)
 
@@ -222,8 +222,8 @@ def train(args, config, model_cfg, net, dataloader, optimizer, valloader, schedu
             val_msg = (f"  -> val={metric:.4e} "
                        f"ω_rel={val_logs.get('omega_rel', 0)*100:.1f}% "
                        f"ζ_rel={val_logs.get('zeta_rel', 0)*100:.1f}% "
-                       f"φz={val_logs.get('loss_phi_resp', 0)*100:.1f}% "
-                       f"φ3={val_logs.get('loss_phi_xyz', 0)*100:.1f}%")
+                       f"φ_resp={val_logs.get('loss_phi_resp', 0):.4f} "
+                       f"φ_xyz={val_logs.get('loss_phi_xyz', 0):.4f}")
             print(val_msg)
             save_checkpoint(os.path.join(out_dir, 'checkpoint_last'), net, optimizer, epoch, val_logs)
             if metric < best:
