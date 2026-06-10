@@ -11,6 +11,8 @@
 """
 from __future__ import annotations
 
+import math
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -100,6 +102,59 @@ class SliceTransolverBlock(nn.Module):
         return y.masked_fill(~mask.unsqueeze(-1), 0.0)
 
 
+class DeepONetPhiHead(nn.Module):
+    """低秩 branch-trunk 振型头。
+
+    Branch 从整件工件的 global latent 预测每阶/每方向的模态系数；
+    Trunk 从节点 latent、坐标和节点特征预测空间基函数；
+    二者点乘得到逐节点 XYZ 三向振型。
+
+    这不是额外 loss，而是对振型场输出形式加结构约束，避免直接
+    Linear head 在高阶弱 Z 分量上过于自由。
+    """
+
+    def __init__(self,
+                 hidden_dim: int,
+                 node_feat_dim: int,
+                 n_modes: int = 3,
+                 rank: int = 96,
+                 dropout: float = 0.0):
+        super().__init__()
+        self.n_modes = n_modes
+        self.rank = rank
+        out_dim = n_modes * 3 * rank
+
+        self.branch = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim), nn.GELU(), nn.Dropout(dropout),
+            nn.Linear(hidden_dim, hidden_dim), nn.GELU(),
+            nn.Linear(hidden_dim, out_dim),
+        )
+        self.trunk = nn.Sequential(
+            nn.Linear(hidden_dim + 3 + node_feat_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim), nn.GELU(), nn.Dropout(dropout),
+            nn.Linear(hidden_dim, hidden_dim), nn.GELU(),
+            nn.Linear(hidden_dim, out_dim),
+        )
+        self.norm = 1.0 / math.sqrt(float(rank))
+
+    def forward(self,
+                global_latent: torch.Tensor,
+                node_latent: torch.Tensor,
+                points: torch.Tensor,
+                node_features: torch.Tensor,
+                batch: torch.Tensor) -> torch.Tensor:
+        B = global_latent.shape[0]
+        N = points.shape[0]
+
+        coeff = self.branch(global_latent).view(B, self.n_modes, 3, self.rank)
+        trunk_in = torch.cat([node_latent, points, node_features], dim=-1)
+        basis = self.trunk(trunk_in).view(N, self.n_modes, 3, self.rank)
+
+        coeff_n = coeff[batch.long()]  # (N, K, 3, R)
+        phi_xyz = (coeff_n * basis).sum(dim=-1) * self.norm  # (N, K, 3)
+        return phi_xyz
+
+
 class TransolverModalFRF(nn.Module):
     """Transolver 编码器 + 模态预测头 + 可微 FRF 解码器（Dense Padding 版）。
 
@@ -123,7 +178,8 @@ class TransolverModalFRF(nn.Module):
                  use_edge_stem: bool = True,
                  amp_scale: float = 500000.0,
                  response_direction: str = "Z",
-                 force_direction: str = "Z"):
+                 force_direction: str = "Z",
+                 phi_rank: int = 96):
         super().__init__()
         if n_modes != 3:
             raise ValueError("当前 CNN-style omega gap head 只支持 n_modes=3")
@@ -171,9 +227,12 @@ class TransolverModalFRF(nn.Module):
             nn.Linear(hidden_dim, hidden_dim), nn.GELU(),
             nn.Linear(hidden_dim, n_modes),
         )
-        self.phi_head = nn.Sequential(
-            nn.Linear(hidden_dim, hidden_dim), nn.GELU(),
-            nn.Linear(hidden_dim, n_modes * 3),
+        self.phi_head = DeepONetPhiHead(
+            hidden_dim=hidden_dim,
+            node_feat_dim=in_dim,
+            n_modes=n_modes,
+            rank=phi_rank,
+            dropout=dropout,
         )
 
         self.zeta_context_gate = nn.Sequential(
@@ -273,8 +332,15 @@ class TransolverModalFRF(nn.Module):
 
         omega = torch.cat([w1, w2, w3], dim=-1)  # (B, 3), rad/s
 
-        # --- 模态振型（三向） ---
-        phi_xyz = self.phi_head(latent).view(-1, self.n_modes, 3)
+        # --- 模态振型（三向）---
+        # DeepONet branch-trunk head: global latent 给模态系数，node latent/坐标/特征给空间基
+        phi_xyz = self.phi_head(
+            global_latent=global_latent,
+            node_latent=latent,
+            points=points,
+            node_features=node_features,
+            batch=batch,
+        )
 
         # --- 方向感知投影 ---
         phi_response = phi_xyz[..., self.response_dir_index]  # (total_N, K)
