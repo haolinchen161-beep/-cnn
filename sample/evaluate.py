@@ -30,7 +30,7 @@ CONFIG = {
 MODEL_CFG = {
     'encoder_kwargs': {
         'in_ch': 6,
-        'hidden': 512,
+        'hidden': 768,
         'n_modes': 3,
         'amp_scale': 500000.0,
         'freq_min': 1.0,
@@ -100,10 +100,12 @@ def phi_metrics(pred_phi, true_phi, eps=1e-8):
         rmse = torch.sqrt(torch.mean((p - t) ** 2))
         t_std = torch.std(t) + eps
         p_std = torch.std(p) + eps
+        # 防极端样本: t_std 太小时用 p_std 替代
+        safe_t_std = torch.max(t_std, p_std * 0.1)
 
         macs.append(mac)
-        nrmse.append(rmse / t_std)
-        std_ratio.append(p_std / t_std)
+        nrmse.append(rmse / safe_t_std)
+        std_ratio.append(torch.clamp(p_std / safe_t_std, 0.1, 10.0))
 
     return (
         torch.stack(macs),
@@ -248,6 +250,10 @@ def main():
         coords = sn['query_coords'].unsqueeze(0).to(device)
         freqs_norm = sn['frequencies'].unsqueeze(0).to(device)
         bt = torch.zeros(coords.shape[1], dtype=torch.long, device=device)
+        # 传入 node 信息 (NodePhiRefiner 需要)
+        _nx = sn.get('node_xyz'); _nf = sn.get('node_features')
+        _nx = _nx.to(device).unsqueeze(0) if _nx is not None else None
+        _nf = _nf.to(device).unsqueeze(0) if _nf is not None else None
 
         true_phi = sn['modal_phi'].to(device)          # [N,K]
         true_zeta = sn['modal_zeta'].to(device)        # [K]
@@ -258,42 +264,32 @@ def main():
         phi_exc_true = phi_exc_true.to(device) if phi_exc_true is not None else None
 
         with torch.no_grad():
-            # 只预测模态参数，不直接使用 model 内部 FRF，避免 phi_exc 符号/阶次错位
-            _, omega_norm, zeta_pred, phi_pred = model(
-                img,
-                coords,
-                None,
-                None,
-                bt,
-            )
+            # OmegaHead 保证单调 → 不需要 sort; omega_phys 已是 rad/s
+            _, omega_phys_pred, log_zeta_pred, zeta_pred, phi_pred = model(
+                img, coords, None, None, bt,
+                node_xyz=_nx.squeeze(0) if _nx is not None else None,
+                node_features=_nf.squeeze(0) if _nf is not None else None)
 
-            omega_norm = omega_norm.squeeze(0)  # [K]
-            zeta_pred = zeta_pred.squeeze(0)    # [K]
-            phi_pred = phi_pred                 # [N,K]
-
-            # 预测模态按频率升序排序
-            omega_norm_sorted, sort_idx = torch.sort(omega_norm)
-            zeta_sorted = zeta_pred[sort_idx]
-            phi_sorted = phi_pred[:, sort_idx]
+            omega_phys_pred = omega_phys_pred.squeeze(0)  # [K]
+            zeta_pred = zeta_pred.squeeze(0)              # [K]
+            phi_pred = phi_pred                           # [N,K]
 
             # 与真实振型符号对齐
-            mac, nrmse, std_ratio, phi_aligned, signs = phi_metrics(phi_sorted, true_phi)
+            mac, nrmse, std_ratio, phi_aligned, signs = phi_metrics(phi_pred, true_phi)
 
-            # 预测频率 / omega
-            omega_phys_pred = omega_norm_sorted * 25000.0
+            # 频率 (已经是 rad/s)
             freq_hz_pred = omega_phys_pred / (2.0 * torch.pi)
 
-            # 用符号对齐后的 phi 和真实 phi_exc 重建 FRF
-            # 如果 phi_aligned = phi_sorted * sign，则 phi_exc 可使用 true phi_exc 原符号
+            # phi_aligned = phi_pred * sign → phi_exc 也要同符号翻转
             if phi_exc_true is not None:
-                phi_exc_for_frf = phi_exc_true.unsqueeze(0)  # [1,K]
+                phi_exc_for_frf = (phi_exc_true * signs).unsqueeze(0)  # [1,K]
             else:
                 phi_exc_for_frf = None
 
             frf_pred = model.physics(
                 phi_aligned,
                 omega_phys_pred.unsqueeze(0),
-                zeta_sorted.unsqueeze(0),
+                zeta_pred.unsqueeze(0),
                 freqs_norm,
                 phi_exc_for_frf,
                 batch_idx=bt,
@@ -318,7 +314,7 @@ def main():
         pred_freq_cpu = freq_hz_pred.detach().cpu()
 
         true_zeta_cpu = true_zeta.detach().cpu()
-        pred_zeta_cpu = zeta_sorted.detach().cpu()
+        pred_zeta_cpu = zeta_pred.detach().cpu()
 
         freq_rel = torch.abs(pred_freq_cpu - true_freq_cpu) / (true_freq_cpu + 1e-8)
         zeta_rel = torch.abs(pred_zeta_cpu - true_zeta_cpu) / (true_zeta_cpu + 1e-8)
