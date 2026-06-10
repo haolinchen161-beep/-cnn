@@ -193,7 +193,13 @@ def phi_participation_loss(phi_resp_pred: torch.Tensor,
 
         # 每阶按目标 participation RMS 归一化，避免强模态再次掩蔽弱模态
         part_scale = torch.sqrt(part_target.pow(2).mean(dim=0) + eps)
-        per_mode = ((part_pred - part_target) / part_scale.clamp_min(eps)).pow(2).mean(dim=0)
+
+        # 防爆：如果某阶 participation 极小，用当前样本各模态平均尺度的 5% 托底
+        # 避免除以接近 0 的数导致 loss / 梯度突然爆炸
+        scale_floor = (0.05 * part_scale.detach().mean()).clamp_min(eps)
+        part_scale = part_scale.clamp_min(scale_floor)
+
+        per_mode = ((part_pred - part_target) / part_scale).pow(2).mean(dim=0)
 
         loss_parts.append(per_mode.mean())
         per_mode_parts.append(per_mode)
