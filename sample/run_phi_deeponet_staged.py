@@ -128,6 +128,27 @@ def sanitize_coeff(w: torch.Tensor, clamp_value: float):
     return w.clamp(-float(clamp_value), float(clamp_value))
 
 
+def load_compatible_model_state(net: nn.Module, state_dict: Dict[str, torch.Tensor], label: str = 'checkpoint'):
+    """Load only parameters whose names and tensor shapes still match.
+
+    This keeps old stage1 trunk checkpoints usable after changing the branch input size.
+    PyTorch strict=False still errors on same-name shape mismatches, so we filter first.
+    """
+    current = net.state_dict()
+    compatible = {}
+    skipped = []
+    for k, v in state_dict.items():
+        if k in current and tuple(current[k].shape) == tuple(v.shape):
+            compatible[k] = v
+        else:
+            skipped.append(k)
+    missing, unexpected = net.load_state_dict(compatible, strict=False)
+    print(f'[{label}] loaded compatible params: {len(compatible)}, skipped mismatched/unexpected: {len(skipped)}')
+    if skipped:
+        print(f'[{label}] skipped examples: {skipped[:8]}')
+    return missing, unexpected, skipped
+
+
 def init_branch_from_coeff(net: nn.Module, coeff_weight: torch.Tensor, clamp_value: float):
     w = sanitize_coeff(coeff_weight, clamp_value)
     mean = w.mean(dim=0)
@@ -146,7 +167,7 @@ def load_stage1(args, net):
         print('[stage1 load] checkpoint_trunk not found')
         return net, None
     ckpt = torch.load(path, map_location=args.device)
-    net.load_state_dict(ckpt['model_state_dict'], strict=False)
+    load_compatible_model_state(net, ckpt['model_state_dict'], label='stage1 load')
     coeff = (ckpt.get('coeff_table_state_dict') or {}).get('weight')
     print(f'[stage1 load] loaded {path}')
     return net, coeff
@@ -181,7 +202,7 @@ def train_stage1(args, net, loader, trainset, response_idx):
     last = os.path.join(out, 'checkpoint_last')
     if args.resume and os.path.exists(last):
         ckpt = torch.load(last, map_location=args.device)
-        net.load_state_dict(ckpt['model_state_dict'], strict=False)
+        load_compatible_model_state(net, ckpt['model_state_dict'], label='stage1 resume')
         coeff_table.load_state_dict(ckpt['coeff_table_state_dict'])
         if ckpt.get('optimizer_state_dict'):
             opt.load_state_dict(ckpt['optimizer_state_dict'])
@@ -299,7 +320,7 @@ def train_supervised_stage(args, config, net, trainloader, trainset, valloader, 
     last = os.path.join(out, 'checkpoint_last')
     if args.resume and os.path.exists(last):
         ckpt = torch.load(last, map_location=args.device)
-        net.load_state_dict(ckpt['model_state_dict'], strict=False)
+        load_compatible_model_state(net, ckpt['model_state_dict'], label=f'{stage_name} resume')
         if ckpt.get('optimizer_state_dict'):
             opt.load_state_dict(ckpt['optimizer_state_dict'])
         if ckpt.get('scheduler_state_dict'):
@@ -310,7 +331,8 @@ def train_supervised_stage(args, config, net, trainloader, trainset, valloader, 
     if start >= epochs:
         best_path = os.path.join(out, 'checkpoint_best')
         if os.path.exists(best_path):
-            net.load_state_dict(torch.load(best_path, map_location=args.device)['model_state_dict'], strict=False)
+            best_ckpt = torch.load(best_path, map_location=args.device)
+            load_compatible_model_state(net, best_ckpt['model_state_dict'], label=f'{stage_name} best')
         return net
 
     smap = sample_map(trainset) if coeff_weight is not None else None
@@ -342,7 +364,8 @@ def train_supervised_stage(args, config, net, trainloader, trainset, valloader, 
             f.flush()
     best_path = os.path.join(out, 'checkpoint_best')
     if os.path.exists(best_path):
-        net.load_state_dict(torch.load(best_path, map_location=args.device)['model_state_dict'], strict=False)
+        best_ckpt = torch.load(best_path, map_location=args.device)
+        load_compatible_model_state(net, best_ckpt['model_state_dict'], label=f'{stage_name} best')
     return net
 
 
