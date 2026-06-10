@@ -34,13 +34,29 @@ DEFAULT_CONFIG = {
     'use_frf_loss': False,
     'frf_loss_weight': 1.0,
     'gradient_clip': 1.0,
+
+    'physics_alpha_warmup': 50,
+
     'modal_loss_weights': {
+        # 频率和阻尼
         'omega': 10.0,
         'zeta': 1.0,
-        'phi_resp': 2.0,
-        'phi_xyz': 0.1,
-        'mac': 0.2,
+
+        # 响应方向振型：内部已经包含 shape + scale + participation
+        'phi_resp': 1.0,
+
+        # 完整三向振型：内部包含 xyz shape + 少量 energy
+        'phi_xyz': 0.5,
+
+        # MAC 只作为辅助，避免弱 Z 模态被 MAC 过度惩罚
+        'mac': 0.05,
+
+        # 内部比例项
+        'phi_resp_scale_ratio': 0.3,
+        'participation_ratio': 0.3,
+        'phi_xyz_energy_ratio': 0.1,
     },
+
     'optimizer': {
         'lr': 1e-4,
         'weight_decay': 1e-4,
