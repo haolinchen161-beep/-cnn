@@ -26,7 +26,7 @@ import torch.nn as nn
 from data.dataset import TransolverModalDataset, collate_mesh_batch
 from models import build_geometric_model
 from training.losses import phi_1d_shape_scale_loss, sign_invariant_mse
-from training.trainer import TransolverTrainer, move_batch_to_device, save_checkpoint
+from training.trainer import TransolverTrainer, move_batch_to_device
 from utils.direction import (
     DEFAULT_FORCE_DIRECTION,
     DEFAULT_RESPONSE_DIRECTION,
@@ -76,6 +76,8 @@ def parse_args():
     parser.add_argument('--weight-decay', type=float, default=1e-4)
     parser.add_argument('--branch-init-clamp', type=float, default=20.0,
                         help='用 stage1 coeff_table 初始化 branch 时的系数裁剪范围。')
+    parser.add_argument('--resume', action='store_true',
+                        help='从各阶段 checkpoint_last 继续训练。注意：不要从已经出现 NaN 的 stage2 checkpoint 恢复。')
     parser.add_argument('--seed', type=int, default=42)
     parser.add_argument('--device', default='cuda' if torch.cuda.is_available() else 'cpu')
     parser.add_argument('--no-fp16', action='store_true')
@@ -119,6 +121,25 @@ def batch_sample_ids(batch: Dict, sample_index_map: Dict[Tuple[str, str], int], 
 def set_requires_grad(module: nn.Module, flag: bool) -> None:
     for p in module.parameters():
         p.requires_grad = flag
+
+
+def save_stage_checkpoint(path: str,
+                          net: nn.Module,
+                          optimizer,
+                          scheduler,
+                          epoch: int,
+                          metrics: Dict[str, float],
+                          best: float | None = None) -> None:
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    torch.save({
+        'epoch': epoch,
+        'model_state_dict': net.state_dict(),
+        'optimizer_state_dict': optimizer.state_dict() if optimizer is not None else None,
+        'scheduler_state_dict': scheduler.state_dict() if scheduler is not None else None,
+        'metrics': metrics,
+        'best': best,
+        'loss': metrics.get('loss_total', metrics.get('loss_modal', 0.0)) if isinstance(metrics, dict) else 0.0,
+    }, path)
 
 
 def sanitize_coeff_weight(coeff_weight: torch.Tensor, clamp_value: float) -> torch.Tensor:
@@ -174,6 +195,10 @@ def load_stage1_checkpoint_if_available(args, net):
     coeff_weight = coeff_state.get('weight')
     print(f'[stage1 load] 已加载 {ckpt_path}')
     return net, coeff_weight
+
+
+def stage_checkpoint_exists(args, stage_name: str) -> bool:
+    return os.path.exists(os.path.join(args.output_dir, stage_name, 'checkpoint_last'))
 
 
 def stage1_phi_loss(net: nn.Module,
@@ -234,14 +259,38 @@ def train_stage1(args, net, trainloader, trainset, response_idx: int):
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
         optimizer, T_max=max(args.stage1_epochs, 1), eta_min=1e-6
     )
+
+    start_epoch = 0
+    ckpt_last = os.path.join(out_dir, 'checkpoint_last')
+    if args.resume and os.path.exists(ckpt_last):
+        ckpt = torch.load(ckpt_last, map_location=args.device)
+        net.load_state_dict(ckpt['model_state_dict'], strict=False)
+        coeff_table.load_state_dict(ckpt['coeff_table_state_dict'])
+        if ckpt.get('optimizer_state_dict') is not None:
+            optimizer.load_state_dict(ckpt['optimizer_state_dict'])
+        if ckpt.get('scheduler_state_dict') is not None:
+            scheduler.load_state_dict(ckpt['scheduler_state_dict'])
+        start_epoch = int(ckpt.get('epoch', -1)) + 1
+        print(f'[stage1 resume] 从 epoch {start_epoch} 继续训练')
+
+    if start_epoch >= args.stage1_epochs:
+        print(f'[stage1 resume] stage1 已完成到 epoch {start_epoch - 1}，跳过 stage1 训练')
+        torch.save({
+            'model_state_dict': net.state_dict(),
+            'coeff_table_state_dict': coeff_table.state_dict(),
+        }, os.path.join(out_dir, 'checkpoint_trunk'))
+        return net, coeff_table.weight.detach().cpu()
+
     scaler = torch.cuda.amp.GradScaler(enabled=not args.no_fp16)
 
     csv_path = os.path.join(out_dir, 'stage1_log.csv')
-    with open(csv_path, 'w', newline='', encoding='utf-8') as f:
+    append_log = args.resume and os.path.exists(csv_path) and start_epoch > 0
+    with open(csv_path, 'a' if append_log else 'w', newline='', encoding='utf-8') as f:
         writer = csv.writer(f)
-        writer.writerow(['epoch', 'lr', 'loss', 'z_shape', 'xyz_shape', 'phi_k0', 'phi_k1', 'phi_k2'])
+        if not append_log:
+            writer.writerow(['epoch', 'lr', 'loss', 'z_shape', 'xyz_shape', 'phi_k0', 'phi_k1', 'phi_k2'])
 
-        for epoch in range(args.stage1_epochs):
+        for epoch in range(start_epoch, args.stage1_epochs):
             net.train()
             sums, count = {}, 0
             for batch in trainloader:
@@ -281,10 +330,16 @@ def train_stage1(args, net, trainloader, trainset, response_idx: int):
             f.flush()
 
             if epoch % 10 == 0 or epoch == args.stage1_epochs - 1:
+                save_stage_checkpoint(
+                    os.path.join(out_dir, 'checkpoint_last'),
+                    net, optimizer, scheduler, epoch, row,
+                )
                 torch.save({
                     'epoch': epoch,
                     'model_state_dict': net.state_dict(),
                     'coeff_table_state_dict': coeff_table.state_dict(),
+                    'optimizer_state_dict': optimizer.state_dict(),
+                    'scheduler_state_dict': scheduler.state_dict(),
                     'metrics': row,
                 }, os.path.join(out_dir, 'checkpoint_last'))
 
@@ -311,14 +366,35 @@ def train_supervised_stage(args, config, net, trainloader, valloader, stage_name
 
     trainer = TransolverTrainer(net, optimizer, device=args.device, scheduler=scheduler, fp16=not args.no_fp16)
     best = float('inf')
+    start_epoch = 0
+    ckpt_last = os.path.join(out_dir, 'checkpoint_last')
+    if args.resume and os.path.exists(ckpt_last):
+        ckpt = torch.load(ckpt_last, map_location=args.device)
+        net.load_state_dict(ckpt['model_state_dict'], strict=False)
+        if ckpt.get('optimizer_state_dict') is not None:
+            optimizer.load_state_dict(ckpt['optimizer_state_dict'])
+        if ckpt.get('scheduler_state_dict') is not None:
+            scheduler.load_state_dict(ckpt['scheduler_state_dict'])
+        best = float(ckpt.get('best', float('inf')) or float('inf'))
+        start_epoch = int(ckpt.get('epoch', -1)) + 1
+        print(f'[{stage_name} resume] 从 epoch {start_epoch} 继续训练，best={best:.6f}')
+
+    if start_epoch >= epochs:
+        print(f'[{stage_name} resume] 已完成到 epoch {start_epoch - 1}，跳过该阶段')
+        best_path = os.path.join(out_dir, 'checkpoint_best')
+        if os.path.exists(best_path):
+            net.load_state_dict(torch.load(best_path, map_location=args.device)['model_state_dict'], strict=False)
+        return net
 
     csv_path = os.path.join(out_dir, f'{stage_name}_log.csv')
-    with open(csv_path, 'w', newline='', encoding='utf-8') as f:
+    append_log = args.resume and os.path.exists(csv_path) and start_epoch > 0
+    with open(csv_path, 'a' if append_log else 'w', newline='', encoding='utf-8') as f:
         writer = csv.writer(f)
-        writer.writerow(['epoch', 'lr', 'train_total', 'train_omega', 'train_phi_resp', 'train_phi_xyz',
-                         'phi_k0', 'phi_k1', 'phi_k2', 'val_total', 'omega_rel', 'zeta_rel', 'val_phi_resp', 'val_phi_xyz'])
+        if not append_log:
+            writer.writerow(['epoch', 'lr', 'train_total', 'train_omega', 'train_phi_resp', 'train_phi_xyz',
+                             'phi_k0', 'phi_k1', 'phi_k2', 'val_total', 'omega_rel', 'zeta_rel', 'val_phi_resp', 'val_phi_xyz'])
 
-        for epoch in range(epochs):
+        for epoch in range(start_epoch, epochs):
             train_logs = trainer.train_epoch(trainloader, config, epoch)
             lr_now = optimizer.param_groups[0]['lr']
 
@@ -326,10 +402,10 @@ def train_supervised_stage(args, config, net, trainloader, valloader, stage_name
             if epoch % config.get('validation_frequency', 5) == 0 or epoch == epochs - 1:
                 val_logs = trainer.evaluate(valloader, config)
                 metric = val_logs.get('loss_total', val_logs.get('loss_modal', float('inf')))
-                save_checkpoint(os.path.join(out_dir, 'checkpoint_last'), net, optimizer, epoch, val_logs)
+                save_stage_checkpoint(os.path.join(out_dir, 'checkpoint_last'), net, optimizer, scheduler, epoch, val_logs, best=best)
                 if metric < best:
                     best = metric
-                    save_checkpoint(os.path.join(out_dir, 'checkpoint_best'), net, optimizer, epoch, val_logs)
+                    save_stage_checkpoint(os.path.join(out_dir, 'checkpoint_best'), net, optimizer, scheduler, epoch, val_logs, best=best)
 
             msg = (
                 f"[{stage_name}] epoch {epoch:04d} | lr={lr_now:.1e} | "
@@ -386,6 +462,7 @@ def main():
     print(f'输出: {args.output_dir}')
     print(f'phi_rank: {args.phi_rank}')
     print(f'epochs: stage1={args.stage1_epochs}, stage2={args.stage2_epochs}, stage3={args.stage3_epochs}')
+    print(f'resume: {args.resume}')
 
     trainset, trainloader = make_loader(args.data_dir, 'train.h5', args.batch_size, True, not args.no_edges)
     valset, valloader = make_loader(args.data_dir, 'val.h5', 1, False, not args.no_edges)
@@ -426,7 +503,10 @@ def main():
         net, coeff_weight = load_stage1_checkpoint_if_available(args, net)
 
     if args.stage2_epochs > 0:
-        if coeff_weight is not None:
+        stage2_has_ckpt = stage_checkpoint_exists(args, 'stage2_frozen_trunk')
+        if args.resume and stage2_has_ckpt:
+            print('[stage2 init] 检测到 stage2 checkpoint_last，跳过 branch 均值初始化，直接恢复 stage2。')
+        elif coeff_weight is not None:
             init_branch_from_coeff_weight(net, coeff_weight, clamp_value=args.branch_init_clamp)
         else:
             print('[stage2 init] 没有 coeff_table，branch 将保持随机初始化；这可能导致 stage2 NaN。')
