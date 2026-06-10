@@ -161,7 +161,8 @@ def train(args, config, model_cfg, net, dataloader, optimizer, valloader, schedu
                   'part_k0', 'part_k1', 'part_k2',
 
                   'frf', 'frf_complex', 'frf_log_amp', 'frf_db',
-                  'val_total', 'omega_rel', 'zeta_rel']
+                  'val_total', 'omega_rel', 'zeta_rel',
+                  'val_phi_k0', 'val_phi_k1', 'val_phi_k2']
     csv_writer.writerow(csv_header)
 
     # 损失权重
@@ -219,11 +220,16 @@ def train(args, config, model_cfg, net, dataloader, optimizer, valloader, schedu
         if epoch % config.get('validation_frequency', 5) == 0 or epoch == epochs - 1:
             val_logs = trainer.evaluate(valloader, config)
             metric = val_logs.get('loss_total', val_logs.get('loss_modal', float('inf')))
+            val_omega_k = ' '.join(f"{val_logs.get(f'omega_k{k}', 0)*100:.1f}%" for k in range(3))
+            val_zeta_k = ' '.join(f"{val_logs.get(f'zeta_k{k}', 0)*100:.1f}%" for k in range(3))
+            val_phi_k = ' '.join(f"{val_logs.get(f'phi_k{k}', 0)*100:.1f}%" for k in range(3))
             val_msg = (f"  -> val={metric:.4e} "
                        f"ω_rel={val_logs.get('omega_rel', 0)*100:.1f}% "
                        f"ζ_rel={val_logs.get('zeta_rel', 0)*100:.1f}% "
+                       f"ω_k=[{val_omega_k}] ζ_k=[{val_zeta_k}] "
                        f"φ_resp={val_logs.get('loss_phi_resp', 0):.4f} "
-                       f"φ_xyz={val_logs.get('loss_phi_xyz', 0):.4f}")
+                       f"φ_xyz={val_logs.get('loss_phi_xyz', 0):.4f} "
+                       f"φ_k=[{val_phi_k}]")
             print(val_msg)
             save_checkpoint(os.path.join(out_dir, 'checkpoint_last'), net, optimizer, epoch, val_logs)
             if metric < best:
@@ -253,7 +259,8 @@ def train(args, config, model_cfg, net, dataloader, optimizer, valloader, schedu
                _r4(train_logs.get('loss_frf_db', 0)),
                _r4(val_logs.get('loss_total', '')) if val_logs else '',
                _r4(val_logs.get('omega_rel', '')) if val_logs else '',
-               _r4(val_logs.get('zeta_rel', '')) if val_logs else '']
+               _r4(val_logs.get('zeta_rel', '')) if val_logs else '',
+               *[_r4(val_logs.get(f'phi_k{k}', 0) * 100) if val_logs else '' for k in range(3)]]
         csv_writer.writerow(row)
         csv_file.flush()
 
