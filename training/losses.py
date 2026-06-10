@@ -1,52 +1,108 @@
 """
 losses.py — 模态参数损失 + 排序对齐 + db/CDF FRF损失。
+CNN-ModalV2: 物理单位直接计算，OmegaHead 单调保证无需 sort。
 """
 import torch
 import torch.nn.functional as F
 
 
-def modal_loss(omega_pred, omega_target,
-               zeta_pred, zeta_target,
+def _mac_per_graph(phi_pred, phi_target):
+    """单图 MAC: phi [N,K] → mac [K]。目标: 最小化 1-MAC。"""
+    num = torch.sum(phi_pred * phi_target, dim=0) ** 2
+    den = torch.sum(phi_pred ** 2, dim=0) * torch.sum(phi_target ** 2, dim=0) + 1e-8
+    return num / den
+
+
+def modal_loss(omega_phys_pred, omega_phys_target,
+               log_zeta_pred, zeta_target,
                phi_pred, phi_target, batch_idx=None,
-               omega_weight=200.0, zeta_weight=10.0, phi_weight=100.0):
+               omega_weight=200.0, zeta_weight=100.0, phi_weight=1.0):
+    """
+    CNN-ModalV2 模态损失。
 
-    # 排序: 强制 ω₁<ω₂<ω₃
-    omega_pred_sorted, sort_idx = torch.sort(omega_pred, dim=-1)          # [B,K]
-    zeta_pred_sorted = torch.gather(zeta_pred, dim=-1, index=sort_idx)   # [B,K]
+    Args:
+        omega_phys_pred:  [B,K] 物理 rad/s (OmegaHead 已保证单调)
+        omega_phys_target:[B,K] 物理 rad/s
+        log_zeta_pred:    [B,K] 对数阻尼
+        zeta_target:      [B,K] 物理阻尼比
+        phi_pred:         [N,K] 或 [B,N,K] 预测振型
+        phi_target:       [N,K] 或 [B,N,K] 真实振型
+        batch_idx:        [N,]   批次索引 (phi 为 [N,K] 时)
+    """
 
-    # phi 排序: sort_idx[batch_idx] 将 (B,K)→(total_N,K)
-    if phi_pred.dim() == 2:
-        sort_idx_phi = sort_idx[batch_idx]                                # [total_N,K]
-        phi_pred_sorted = torch.gather(phi_pred, dim=-1, index=sort_idx_phi)
-    else:  # [B,N,K]
-        sort_idx_phi = sort_idx.unsqueeze(1).expand(-1, phi_pred.shape[1], -1)
-        phi_pred_sorted = torch.gather(phi_pred, dim=-1, index=sort_idx_phi)
-        phi_pred_sorted = phi_pred_sorted.view(-1, phi_pred_sorted.shape[-1])
+    # ====================================================
+    # 1. 频率损失: Hz-space smooth_l1 + peak-sensitive
+    #    smooth_l1 在 Hz 空间有恒定梯度 (|error|>1Hz → grad=1)
+    # ====================================================
+    f_pred_hz = omega_phys_pred / (2.0 * torch.pi)
+    f_true_hz = omega_phys_target / (2.0 * torch.pi)
+
+    # Hz 空间 smooth_l1 — 永不衰减的恒定梯度引擎
+    loss_freq_hz = F.smooth_l1_loss(f_pred_hz, f_true_hz)
+
+    # 峰值敏感: 阻尼越小惩罚越重
+    rel = torch.abs(omega_phys_pred - omega_phys_target) / (omega_phys_target + 1e-8)
+    peak_sensitive = rel / (zeta_target + 1e-8)
+    peak_sensitive = torch.clamp(peak_sensitive, max=100.0)
+
+    loss_omega = (loss_freq_hz + 0.1 * peak_sensitive.mean()) * omega_weight
+
+    # ====================================================
+    # 2. 对数域阻尼损失
+    # ====================================================
+    log_zeta_target = torch.log(zeta_target + 1e-8)
+    loss_zeta = F.smooth_l1_loss(log_zeta_pred, log_zeta_target) * zeta_weight
+
+    # ====================================================
+    # 3. 振型损失: MSE(归一化) + MAC + Std Ratio
+    #    phi 真实值极小 → 先 std 归一化再算 MSE，否则梯度近乎零
+    # ====================================================
+    if phi_pred.dim() == 3:
+        phi_pred = phi_pred.view(-1, phi_pred.shape[-1])
         phi_target = phi_target.view(-1, phi_target.shape[-1])
 
-    # 标量损失
-    mode_w = torch.tensor([1.0, 1.5, 2.0], device=omega_pred.device).unsqueeze(0)
-    loss_omega = torch.mean(((omega_pred_sorted - omega_target) / (omega_target + 1e-8))**2 * mode_w) * omega_weight
-    loss_zeta  = torch.mean(((zeta_pred_sorted - zeta_target) / (zeta_target + 1e-8))**2 * mode_w) * zeta_weight
+    # 符号对齐
+    dot = torch.sum(phi_pred * phi_target, dim=0, keepdim=True)
+    sign = torch.sign(dot + 1e-8)
+    aligned_target = phi_target * sign
 
-    # 振型损失
+    # 逐模态归一化到 unit std，再算 MSE (解决 phi 真实值过小问题)
+    p_std = torch.std(phi_pred, dim=0) + 1e-8
+    t_std = torch.std(phi_target, dim=0) + 1e-8
+    phi_pred_norm = phi_pred / p_std
+    phi_target_norm = aligned_target / t_std
+    raw_phi_mse = F.mse_loss(phi_pred_norm, phi_target_norm)
+
+    # MAC: 尺度无关，直接算 (按图)
     if batch_idx is not None:
-        raw_phi_mse = 0.0
-        num_graphs = int(batch_idx.max().item()) + 1
-        for i in range(num_graphs):
+        n_graphs = int(batch_idx.max().item()) + 1
+        mac_loss_total = 0.0
+        for i in range(n_graphs):
             mask = (batch_idx == i)
-            p_p = phi_pred_sorted[mask]; p_t = phi_target[mask]
-            dot = torch.sum(p_p * p_t, dim=0, keepdim=True)
-            sign = torch.sign(dot + 1e-8)
-            raw_phi_mse += F.mse_loss(p_p, p_t * sign)
-        raw_phi_mse = raw_phi_mse / num_graphs
+            mac = _mac_per_graph(phi_pred[mask], aligned_target[mask])
+            mac_loss_total += (1.0 - mac).mean()
+        loss_mac = mac_loss_total / n_graphs
     else:
-        dot = torch.sum(phi_pred_sorted * phi_target, dim=1, keepdim=True)
-        sign = torch.sign(dot + 1e-8)
-        raw_phi_mse = F.mse_loss(phi_pred_sorted, phi_target * sign)
+        mac = _mac_per_graph(phi_pred, aligned_target)
+        loss_mac = (1.0 - mac).mean()
 
-    loss_phi = raw_phi_mse * phi_weight
-    return loss_omega + loss_zeta + loss_phi, loss_omega, loss_zeta, loss_phi
+    # Std Ratio: 预测/真实的幅值比例，clip 防极端样本 (某些 Mode2/3 std≈0.01)
+    loss_std = torch.mean(torch.clamp(torch.abs(p_std / (t_std + 1e-8) - 1.0), max=5.0))
+
+    # 归一化后 MSE 在 0~2 之间 (unit std 向量差), MAC 在 0~1
+    # MAC (用于日志): 逐模态 [K]
+    if batch_idx is not None:
+        mac_list = []
+        for i in range(n_graphs):
+            mask = (batch_idx == i)
+            mac_list.append(_mac_per_graph(phi_pred[mask], aligned_target[mask]))
+        mac_per_mode = torch.stack(mac_list, dim=0).mean(dim=0)  # [K]
+    else:
+        mac_per_mode = _mac_per_graph(phi_pred, aligned_target)   # [K]
+
+    loss_phi = (10.0 * raw_phi_mse + 40.0 * loss_mac + 20.0 * loss_std) * phi_weight
+
+    return loss_omega + loss_zeta + loss_phi, loss_omega, loss_zeta, loss_phi, mac_per_mode.detach()
 
 
 def frf_loss(frf_pred, frf_target):
