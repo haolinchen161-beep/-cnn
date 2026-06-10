@@ -154,6 +154,12 @@ def train(args, config, model_cfg, net, dataloader, optimizer, valloader, schedu
                   'omega_k0', 'omega_k1', 'omega_k2',
                   'zeta_k0', 'zeta_k1', 'zeta_k2',
                   'phi_k0', 'phi_k1', 'phi_k2',
+
+                  # 新增细分振型损失
+                  'z_shape', 'z_scale', 'part', 'xyz_shape', 'xyz_energy',
+                  'z_scale_k0', 'z_scale_k1', 'z_scale_k2',
+                  'part_k0', 'part_k1', 'part_k2',
+
                   'frf', 'frf_complex', 'frf_log_amp', 'frf_db',
                   'val_total', 'omega_rel', 'zeta_rel']
     csv_writer.writerow(csv_header)
@@ -231,6 +237,16 @@ def train(args, config, model_cfg, net, dataloader, optimizer, valloader, schedu
                *[_r4(train_logs.get(f'omega_k{k}', 0) * 100) for k in range(3)],
                *[_r4(train_logs.get(f'zeta_k{k}', 0) * 100) for k in range(3)],
                *[_r4(train_logs.get(f'phi_k{k}', 0) * 100) for k in range(3)],
+
+               # 新增细分振型损失
+               _r4(train_logs.get('loss_phi_resp_shape', 0)),
+               _r4(train_logs.get('loss_phi_resp_scale', 0)),
+               _r4(train_logs.get('loss_phi_participation', 0)),
+               _r4(train_logs.get('loss_phi_xyz_shape', 0)),
+               _r4(train_logs.get('loss_phi_xyz_energy', 0)),
+               *[_r4(train_logs.get(f'z_scale_k{k}', 0)) for k in range(3)],
+               *[_r4(train_logs.get(f'part_k{k}', 0)) for k in range(3)],
+
                _r4(raw_f),
                _r4(train_logs.get('loss_frf_complex', 0)),
                _r4(train_logs.get('loss_frf_log_amp', 0)),
