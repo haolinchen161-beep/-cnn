@@ -103,7 +103,7 @@ class MicroDecoder(nn.Module):
         x = self.up1(torch.cat([x, f1], dim=1))
 
         x = F.interpolate(x, size=(60, 160), mode='bilinear', align_corners=False)
-        return self.final(x) * 30.0  # phi_true std=1~2, final输出std≈0.05→×30≈1.5
+        return self.final(x)
 
 
 class OmegaHead(nn.Module):
@@ -169,6 +169,23 @@ class NodePhiRefiner(nn.Module):
         return phi_base + delta
 
 
+class PhiScaleHead(nn.Module):
+    """模态幅值标量预测器。解耦形状与幅值：UNet 输出纯形状(unit std)，MLP 预测物理尺度。"""
+
+    def __init__(self, hidden=512, n_modes=3):
+        super().__init__()
+        self.mlp = nn.Sequential(
+            nn.Linear(hidden, 256), nn.GELU(), nn.Dropout(0.15),
+            nn.Linear(256, 128), nn.GELU(),
+            nn.Linear(128, n_modes),
+        )
+        with torch.no_grad():
+            self.mlp[-1].bias.copy_(torch.tensor([0.0, 0.0, 0.0]))  # exp(0)=1.0
+
+    def forward(self, latent):
+        return torch.exp(self.mlp(latent))  # [B, K] > 0
+
+
 class UNetPhysicsModel(nn.Module):
     """2.5D CNN-UNet 模态参数预测模型。
 
@@ -190,6 +207,7 @@ class UNetPhysicsModel(nn.Module):
         self.zeta_head = ZetaHead(hidden, n_modes)
         self.micro_decoder = MicroDecoder(hidden, n_modes)
         self.phi_refiner = NodePhiRefiner(hidden, node_feat_dim=7, n_modes=n_modes)
+        self.phi_scale_head = PhiScaleHead(hidden, n_modes)
         self.physics = PhysicsDecoder(amp_scale, freq_min, freq_max)
 
     def forward(self, image_tensor, query_coords, frequencies=None,
@@ -220,7 +238,13 @@ class UNetPhysicsModel(nn.Module):
         zeta = torch.exp(log_zeta)
 
         # 振型: 2D map → grid_sample
-        mode_maps = self.micro_decoder(latent, skips)
+        # 形数解耦：UNet 输出纯形状(unit std)，PhiScaleHead 预测物理幅值
+        mode_maps = self.micro_decoder(latent, skips)                # [B, K, H, W]
+        maps_flat = mode_maps.view(B, self.n_modes, -1)
+        maps_std = torch.std(maps_flat, dim=2) + 1e-8               # [B, K]
+        normalized_maps = mode_maps / maps_std.unsqueeze(-1).unsqueeze(-1)
+        scale = self.phi_scale_head(latent)                          # [B, K]
+        mode_maps = normalized_maps * scale.unsqueeze(-1).unsqueeze(-1)
         phi_list = []
         for b in range(B):
             mask = batch == b
