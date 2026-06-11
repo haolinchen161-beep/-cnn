@@ -8,6 +8,7 @@
 本版本对输入做任务隔离：
     - 固有频率 omega 和本征振型 phi 只看结构本征输入；
     - 阻尼 C、激励点距离、激励点标记、刀具距离不进入 omega/phi 编码器；
+    - omega 采用物理先验直连 + Transolver 残差的 monotonic gap head；
     - 阻尼 zeta 仍通过 boundary_c_xyz + predicted phi + omega 的物理路径计算。
 """
 from __future__ import annotations
@@ -202,6 +203,7 @@ class TransolverModalFRF(nn.Module):
         self.use_edge_stem = use_edge_stem
         self.node_feat_dim = in_dim
         self.branch_stats_dim = in_dim * 4
+        self.omega_prior_dim = 24
 
         _DIR_MAP = {"X": 0, "Y": 1, "Z": 2}
         self.response_dir_index = _DIR_MAP[response_direction.upper()]
@@ -221,8 +223,17 @@ class TransolverModalFRF(nn.Module):
             nn.Linear(hidden_dim, hidden_dim), nn.GELU(),
             nn.Linear(hidden_dim, 1),
         )
+
+        # Transolver 残差频率头：只学物理先验解释不了的部分。
         self.omega_head = nn.Sequential(
             nn.Linear(hidden_dim, hidden_dim), nn.GELU(),
+            nn.Linear(hidden_dim, n_modes),
+        )
+
+        # 物理先验直连频率头：类似 geometric_frf2 的 skip_omega，但针对凹槽板扩展为多维描述符。
+        self.omega_prior_norm = nn.LayerNorm(self.omega_prior_dim)
+        self.omega_prior_head = nn.Sequential(
+            nn.Linear(self.omega_prior_dim, hidden_dim), nn.GELU(),
             nn.Linear(hidden_dim, n_modes),
         )
 
@@ -234,8 +245,11 @@ class TransolverModalFRF(nn.Module):
         self.register_buffer("omega_gap32_min", torch.tensor(1256.637, dtype=torch.float32))
         self.register_buffer("omega_gap32_scale", torch.tensor(2923.069, dtype=torch.float32))
 
+        # 初始时和旧模型接近：out≈0，频率在数据中位附近；训练中 prior/residual 再共同修正。
         nn.init.normal_(self.omega_head[-1].weight, mean=0.0, std=1e-3)
         nn.init.zeros_(self.omega_head[-1].bias)
+        nn.init.zeros_(self.omega_prior_head[-1].weight)
+        nn.init.zeros_(self.omega_prior_head[-1].bias)
 
         # 结构先验振型 + SIREN 畸变修正
         self.prior_phi_head = nn.Linear(hidden_dim, n_modes * 3)
@@ -289,6 +303,123 @@ class TransolverModalFRF(nn.Module):
         gate = torch.softmax(gate_logits, dim=1).masked_fill(~mask, 0.0)
         pooled = (gate.unsqueeze(-1) * x_dense).sum(dim=1)
         return torch.nan_to_num(pooled.float(), nan=0.0, posinf=20.0, neginf=-20.0).clamp(-20.0, 20.0).to(x_dense.dtype)
+
+    def omega_physics_descriptor(self, node_features_modal: torch.Tensor, node_counts: list) -> torch.Tensor:
+        """构造 omega 专用物理先验描述符。
+
+        只使用结构本征字段，不使用阻尼 C、激励点或刀具距离。
+        输出作为 omega_prior_head 的直接输入，作用相当于 geometric_frf2 中的
+        (H/L^2)*sqrt(E/rho) skip prior，但对凹槽板扩展为多维结构描述符。
+        """
+        feat = sanitize_feature_tensor(node_features_modal, 20.0)
+        feat_dense, mask = pad_batch(feat, node_counts)
+        B, N, Fdim = feat_dense.shape
+        dtype = feat_dense.dtype
+        valid = mask
+        valid_f = valid.to(dtype)
+        denom = valid_f.sum(dim=1).clamp_min(1.0)
+
+        def col(idx: int, default: float = 0.0) -> torch.Tensor:
+            if Fdim > idx:
+                return feat_dense[:, :, idx]
+            return feat_dense.new_full((B, N), float(default))
+
+        def masked_mean(v: torch.Tensor, sel: torch.Tensor | None = None) -> torch.Tensor:
+            m = valid if sel is None else (valid & sel)
+            w = m.to(dtype)
+            return (v * w).sum(dim=1) / w.sum(dim=1).clamp_min(1.0)
+
+        def masked_std(v: torch.Tensor, sel: torch.Tensor | None = None) -> torch.Tensor:
+            m = valid if sel is None else (valid & sel)
+            w = m.to(dtype)
+            d = w.sum(dim=1).clamp_min(1.0)
+            mu = (v * w).sum(dim=1) / d
+            var = ((v - mu.unsqueeze(1)).pow(2) * w).sum(dim=1) / d
+            return torch.sqrt(var.clamp_min(0.0) + 1e-8)
+
+        def masked_min(v: torch.Tensor, sel: torch.Tensor | None = None) -> torch.Tensor:
+            m = valid if sel is None else (valid & sel)
+            has = m.any(dim=1)
+            out = v.masked_fill(~m, 20.0).min(dim=1).values
+            return torch.where(has, out, torch.zeros_like(out))
+
+        def masked_max(v: torch.Tensor, sel: torch.Tensor | None = None) -> torch.Tensor:
+            m = valid if sel is None else (valid & sel)
+            has = m.any(dim=1)
+            out = v.masked_fill(~m, -20.0).max(dim=1).values
+            return torch.where(has, out, torch.zeros_like(out))
+
+        def ratio(sel: torch.Tensor) -> torch.Tensor:
+            return (sel & valid).to(dtype).sum(dim=1) / denom
+
+        z_norm = col(2)
+        e_ratio = col(3, 1.0)
+        rho_ratio = col(4, 1.0)
+        prxy = col(5, 0.33)
+        pocket_active = col(6) > 0.5
+        pocket_bottom = col(7) > 0.5
+        cutting_band = col(8) > 0.5
+        pocket_depth = col(10)
+        remaining = col(11, 1.0)
+        dist_edge = col(12, 1.0)
+        fixture_corner = col(13) > 0.5
+        fixture_side = col(14) > 0.5
+        logkx = col(15, -1.0)
+        logky = col(16, -1.0)
+        logkz = col(17, -1.0)
+        free_surface = col(23) > 0.5
+        top_surface = col(24) > 0.5
+        bottom_surface = col(25) > 0.5
+        external_side = col(26) > 0.5
+        pocket_sidewall = col(27) > 0.5
+
+        k_any = (logkx > 0.0) | (logky > 0.0) | (logkz > 0.0) | fixture_corner | fixture_side
+        logk_mean_node = torch.stack([logkx, logky, logkz], dim=-1).mean(dim=-1)
+        logk_max_node = torch.stack([logkx, logky, logkz], dim=-1).max(dim=-1).values
+
+        e_mean = masked_mean(e_ratio)
+        rho_mean = masked_mean(rho_ratio).clamp_min(1e-4)
+        sqrt_e_rho = torch.sqrt((e_mean / rho_mean).abs().clamp_min(1e-8))
+        rem_mean = masked_mean(remaining)
+        rem_min = masked_min(remaining)
+        rem_std = masked_std(remaining)
+        pocket_ratio = ratio(pocket_active)
+        pocket_depth_mean = masked_mean(pocket_depth, pocket_active)
+        pocket_depth_max = masked_max(pocket_depth, pocket_active)
+
+        # 两个主频率尺度：薄板趋势用有效厚度，凹槽削弱用最小剩余厚度补充。
+        freq_prior_mean = rem_mean * sqrt_e_rho
+        freq_prior_min = rem_min * sqrt_e_rho
+
+        vals = torch.stack([
+            e_mean,
+            rho_mean,
+            masked_mean(prxy),
+            sqrt_e_rho,
+            rem_mean,
+            rem_min,
+            rem_std,
+            freq_prior_mean,
+            freq_prior_min,
+            pocket_ratio,
+            ratio(pocket_bottom),
+            ratio(cutting_band),
+            pocket_depth_mean,
+            pocket_depth_max,
+            masked_mean(dist_edge, pocket_active),
+            masked_min(dist_edge, pocket_active),
+            ratio(fixture_corner),
+            ratio(fixture_side),
+            ratio(k_any),
+            masked_mean(logk_mean_node, k_any),
+            masked_max(logk_max_node, k_any),
+            masked_std(logk_mean_node, k_any),
+            ratio(pocket_sidewall) + ratio(external_side),
+            masked_mean(z_norm) + ratio(top_surface) - ratio(bottom_surface) + ratio(free_surface),
+        ], dim=-1)
+
+        vals = torch.nan_to_num(vals, nan=0.0, posinf=20.0, neginf=-20.0).clamp(-20.0, 20.0)
+        return vals
 
     def global_feature_summary(self, node_features: torch.Tensor, node_counts: list) -> torch.Tensor:
         """结构化全局物理描述符，仅作诊断/后续扩展，不直接进入 omega/phi。"""
@@ -456,8 +587,11 @@ class TransolverModalFRF(nn.Module):
         global_latent = self.global_pool(latent_dense, mask)
         branch_features = self.global_feature_summary(node_features_full, node_counts)
 
-        # --- 固有频率：clean structural latent → monotonic gap head ---
-        out = self.omega_head(global_latent)
+        # --- 固有频率：物理先验 descriptor + Transolver residual → monotonic gap head ---
+        omega_desc = self.omega_physics_descriptor(node_features_modal, node_counts).to(global_latent.dtype)
+        omega_prior_logits = self.omega_prior_head(self.omega_prior_norm(omega_desc))
+        omega_residual_logits = self.omega_head(global_latent)
+        out = omega_prior_logits + omega_residual_logits
         out = torch.nan_to_num(out.float(), nan=0.0, posinf=20.0, neginf=-20.0).clamp(-20.0, 20.0).to(global_latent.dtype)
 
         w1 = F.softplus(out[:, 0:1]) * self.omega_w1_scale + self.omega_w1_base
@@ -518,6 +652,7 @@ class TransolverModalFRF(nn.Module):
             'modal_phi_exc_force': phi_force_exc,
             'modal_phi_coeff': None,
             'branch_global_features': branch_features,
+            'omega_physics_descriptor': omega_desc,
             'response_dir_index': self.response_dir_index,
             'force_dir_index': self.force_dir_index,
             'modal_phi_z': phi_xyz[..., 2],
