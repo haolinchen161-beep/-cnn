@@ -23,9 +23,9 @@ from .physics_decoder import ModalFRFDecoder
 def sanitize_feature_tensor(x: torch.Tensor, clamp_value: float = 20.0) -> torch.Tensor:
     """Remove NaN/Inf and clamp feature scale before any network layer.
 
-    Node features contain log stiffness/damping and derived geometry flags.  A single
+    Node features contain log stiffness/damping and derived geometry flags. A single
     NaN/Inf value can poison the Transolver encoder, branch coeff distillation, and
-    omega loss at epoch 0.  Keep this operation inside the model so every caller
+    omega loss at epoch 0. Keep this operation inside the model so every caller
     (stage1 trunk, stage2 encoder, evaluation) uses the same safe path.
     """
     y = x.float()
@@ -120,7 +120,7 @@ class DeepONetPhiHead(nn.Module):
 
     三阶段训练版本采用更标准的 DeepONet 划分：
     - trunk 只看节点坐标和节点物理/几何特征，学习可冻结的空间基；
-    - branch 从整件工件的 global latent + 显式全局统计特征预测模态系数；
+    - branch 从整件工件的 global latent + 显式全局物理描述符预测模态系数；
     - 二者点乘得到逐节点 XYZ 三向振型。
 
     注意：这里 trunk 不再依赖 node_latent。这样阶段1才能在没有 Transolver
@@ -162,7 +162,6 @@ class DeepONetPhiHead(nn.Module):
         if self.branch_extra_dim > 0:
             if global_features is None:
                 global_features = global_latent.new_zeros(B, self.branch_extra_dim)
-            # 统计特征来自原始 node_features，可能有 NaN/Inf 或尺度较大；进入 branch 前先稳定化。
             gf = sanitize_feature_tensor(global_features, 20.0)
             gf = self.branch_extra_norm(gf).to(global_latent.dtype)
             branch_input = torch.cat([global_latent, gf], dim=-1)
@@ -229,7 +228,9 @@ class TransolverModalFRF(nn.Module):
         self.n_modes = n_modes
         self.use_edge_stem = use_edge_stem
         self.node_feat_dim = in_dim
-        self.branch_stats_dim = in_dim * 4  # mean/std/min/max of node_features
+        # 维度保持为 4*in_dim，不破坏当前训练脚本和旧 stage1 加载；
+        # 内容由盲目 mean/std/min/max 改成结构化物理描述符，剩余维度补零。
+        self.branch_stats_dim = in_dim * 4
 
         _DIR_MAP = {"X": 0, "Y": 1, "Z": 2}
         self.response_dir_index = _DIR_MAP[response_direction.upper()]
@@ -326,25 +327,177 @@ class TransolverModalFRF(nn.Module):
         return torch.nan_to_num(pooled.float(), nan=0.0, posinf=20.0, neginf=-20.0).clamp(-20.0, 20.0).to(x_dense.dtype)
 
     def global_feature_summary(self, node_features: torch.Tensor, node_counts: list) -> torch.Tensor:
-        """显式全局统计特征：mean/std/min/max(node_features)。
+        """构造结构化全局物理描述符。
 
-        统计全部用 float32 计算，并在统计前后做 nan_to_num/clamp。
-        这样保留“Branch 直接看到全局参数”的结构启发，同时避免 fp16 下
-        NaN/Inf 或极端节点特征把 branch 输入污染。
+        数据生成阶段的 transolver_point_features 已经包含材料、凹槽、装夹、K/C、
+        激励距离、表面标记等物理字段。这里不再盲目 concat mean/std/min/max，
+        而是按字段语义提取 branch 更需要的全局物理量：
+        - 材料: E/rho/PRXY 与 sqrt(E/rho)
+        - 几何: 剩余厚度、凹槽深度、凹槽底面/切削带/表面比例
+        - 边界: 角点/侧顶杆比例、三向 logK/logC 的弹簧节点统计
+        - 激励: 激励点坐标、距离激励点统计
+
+        输出维度仍固定为 self.branch_stats_dim = 4*in_dim，前若干维为物理描述符，
+        剩余维补零，避免破坏已有 stage1 trunk/coeff_table 的复用流程。
         """
         feat = sanitize_feature_tensor(node_features, 20.0)
         feat_dense, mask = pad_batch(feat, node_counts)
-        mask_f = mask.unsqueeze(-1).to(feat_dense.dtype)
-        denom = mask_f.sum(dim=1).clamp_min(1.0)
-        mean = (feat_dense * mask_f).sum(dim=1) / denom
-        var = ((feat_dense - mean.unsqueeze(1)).pow(2) * mask_f).sum(dim=1) / denom
-        std = torch.sqrt(var.clamp_min(0.0) + 1e-8)
-        large = 20.0
-        fmin = feat_dense.masked_fill(~mask.unsqueeze(-1), large).min(dim=1).values
-        fmax = feat_dense.masked_fill(~mask.unsqueeze(-1), -large).max(dim=1).values
-        summary = torch.cat([mean, std, fmin, fmax], dim=-1)
-        summary = torch.nan_to_num(summary, nan=0.0, posinf=large, neginf=-large)
-        return summary.clamp(-large, large)
+        B, N, Fdim = feat_dense.shape
+        dtype = feat_dense.dtype
+        device = feat_dense.device
+        valid = mask
+        valid_f = valid.to(dtype)
+        denom = valid_f.sum(dim=1).clamp_min(1.0)
+
+        def col(idx: int, default: float = 0.0) -> torch.Tensor:
+            if Fdim > idx:
+                return feat_dense[:, :, idx]
+            return feat_dense.new_full((B, N), float(default))
+
+        def masked_mean(v: torch.Tensor, sel: torch.Tensor | None = None) -> torch.Tensor:
+            m = valid if sel is None else (valid & sel)
+            w = m.to(dtype)
+            return (v * w).sum(dim=1) / w.sum(dim=1).clamp_min(1.0)
+
+        def masked_std(v: torch.Tensor, sel: torch.Tensor | None = None) -> torch.Tensor:
+            m = valid if sel is None else (valid & sel)
+            w = m.to(dtype)
+            d = w.sum(dim=1).clamp_min(1.0)
+            mu = (v * w).sum(dim=1) / d
+            var = ((v - mu.unsqueeze(1)).pow(2) * w).sum(dim=1) / d
+            return torch.sqrt(var.clamp_min(0.0) + 1e-8)
+
+        def masked_min(v: torch.Tensor, sel: torch.Tensor | None = None) -> torch.Tensor:
+            m = valid if sel is None else (valid & sel)
+            has = m.any(dim=1)
+            out = v.masked_fill(~m, 20.0).min(dim=1).values
+            return torch.where(has, out, torch.zeros_like(out))
+
+        def masked_max(v: torch.Tensor, sel: torch.Tensor | None = None) -> torch.Tensor:
+            m = valid if sel is None else (valid & sel)
+            has = m.any(dim=1)
+            out = v.masked_fill(~m, -20.0).max(dim=1).values
+            return torch.where(has, out, torch.zeros_like(out))
+
+        def ratio(sel: torch.Tensor) -> torch.Tensor:
+            return (sel & valid).to(dtype).sum(dim=1) / denom
+
+        x_norm = col(0)
+        y_norm = col(1)
+        z_norm = col(2)
+        e_ratio = col(3, 1.0)
+        rho_ratio = col(4, 1.0)
+        prxy = col(5, 0.33)
+        pocket_active = col(6) > 0.5
+        pocket_bottom = col(7) > 0.5
+        cutting_band = col(8) > 0.5
+        pocket_depth = col(10)
+        remaining = col(11, 1.0)
+        dist_edge = col(12, 1.0)
+        fixture_corner = col(13) > 0.5
+        fixture_side = col(14) > 0.5
+        logkx = col(15, -1.0)
+        logky = col(16, -1.0)
+        logkz = col(17, -1.0)
+        logcx = col(18, -1.0)
+        logcy = col(19, -1.0)
+        logcz = col(20, -1.0)
+        dist_exc = col(21, 1.0)
+        excitation_flag = col(22) > 0.5
+        free_surface = col(23) > 0.5
+        top_surface = col(24) > 0.5
+        bottom_surface = col(25) > 0.5
+        external_side = col(26) > 0.5
+        pocket_sidewall = col(27) > 0.5
+
+        k_any = (logkx > 0.0) | (logky > 0.0) | (logkz > 0.0) | fixture_corner | fixture_side
+        c_any = (logcx > 0.0) | (logcy > 0.0) | (logcz > 0.0) | fixture_corner | fixture_side
+        logk_max_node = torch.stack([logkx, logky, logkz], dim=-1).max(dim=-1).values
+        logc_max_node = torch.stack([logcx, logcy, logcz], dim=-1).max(dim=-1).values
+        logk_mean_node = torch.stack([logkx, logky, logkz], dim=-1).mean(dim=-1)
+        logc_mean_node = torch.stack([logcx, logcy, logcz], dim=-1).mean(dim=-1)
+
+        e_mean = masked_mean(e_ratio)
+        rho_mean = masked_mean(rho_ratio).clamp_min(1e-4)
+        sqrt_e_rho = torch.sqrt((e_mean / rho_mean).abs().clamp_min(1e-8))
+        rem_mean = masked_mean(remaining)
+        freq_prior = rem_mean * sqrt_e_rho  # 类似 H_eff * sqrt(E/rho)，交给 head 学尺度
+
+        # 激励点坐标：优先用 excitation_flag；没有 flag 时用 dist_exc 最小点近似。
+        exc_has = (excitation_flag & valid).any(dim=1)
+        exc_w = (excitation_flag & valid).to(dtype)
+        min_dist = dist_exc.masked_fill(~valid, 20.0).min(dim=1, keepdim=True).values
+        nearest_exc = (dist_exc <= min_dist + 1e-6) & valid
+        near_w = nearest_exc.to(dtype)
+        exc_w = torch.where(exc_has.view(B, 1), exc_w, near_w)
+        exc_denom = exc_w.sum(dim=1).clamp_min(1.0)
+        exc_x = (x_norm * exc_w).sum(dim=1) / exc_denom
+        exc_y = (y_norm * exc_w).sum(dim=1) / exc_denom
+        exc_z = (z_norm * exc_w).sum(dim=1) / exc_denom
+
+        extra28 = col(28, 0.0)
+        extra29 = col(29, 0.0)
+
+        physics_values = [
+            # 材料与频率主尺度
+            e_mean,
+            rho_mean,
+            masked_mean(prxy),
+            sqrt_e_rho,
+            freq_prior,
+            # 几何/凹槽
+            masked_mean(z_norm),
+            rem_mean,
+            masked_std(remaining),
+            masked_min(remaining),
+            masked_mean(pocket_depth, pocket_active),
+            masked_max(pocket_depth, pocket_active),
+            ratio(pocket_active),
+            ratio(pocket_bottom),
+            ratio(cutting_band),
+            masked_mean(dist_edge, pocket_active),
+            masked_min(dist_edge, pocket_active),
+            # 装夹/弹簧
+            ratio(fixture_corner),
+            ratio(fixture_side),
+            ratio(k_any),
+            masked_mean(logkx, k_any),
+            masked_mean(logky, k_any),
+            masked_mean(logkz, k_any),
+            masked_max(logk_max_node, k_any),
+            masked_std(logk_mean_node, k_any),
+            masked_mean(logcx, c_any),
+            masked_mean(logcy, c_any),
+            masked_mean(logcz, c_any),
+            masked_max(logc_max_node, c_any),
+            masked_std(logc_mean_node, c_any),
+            # 激励位置/距离
+            masked_mean(dist_exc),
+            masked_min(dist_exc),
+            masked_std(dist_exc),
+            exc_x,
+            exc_y,
+            exc_z,
+            # 表面结构
+            ratio(free_surface),
+            ratio(top_surface),
+            ratio(bottom_surface),
+            ratio(external_side),
+            ratio(pocket_sidewall),
+            # 网格与可选过程字段
+            denom / 10000.0,
+            masked_mean(extra28),
+            masked_min(extra28),
+            masked_mean(extra29),
+            masked_min(extra29),
+        ]
+
+        vals = torch.stack(physics_values, dim=-1)
+        vals = torch.nan_to_num(vals, nan=0.0, posinf=20.0, neginf=-20.0).clamp(-20.0, 20.0)
+        summary = feat_dense.new_zeros(B, self.branch_stats_dim)
+        n = min(vals.shape[-1], self.branch_stats_dim)
+        summary[:, :n] = vals[:, :n]
+        return summary
 
     def compute_physics_zeta(self, phi_xyz_dense, boundary_c_xyz_dense, omega, mask):
         """根据材料阻尼与三向边界耗散计算基线阻尼比（dense 版）。"""
@@ -411,7 +564,7 @@ class TransolverModalFRF(nn.Module):
         omega = torch.nan_to_num(omega.float(), nan=1.0, posinf=60000.0, neginf=1.0).clamp(1.0, 60000.0).to(global_latent.dtype)
 
         # --- 模态振型（三向）---
-        # DeepONet branch-trunk head: global latent + node feature stats 给模态系数
+        # DeepONet branch-trunk head: global latent + structured physical descriptor 给模态系数
         modal_phi_coeff = self.phi_head.branch_coeff(global_latent, branch_features)
         basis = self.phi_head.trunk_basis(points, node_features_safe)
         phi_xyz = self.phi_head.combine(modal_phi_coeff, basis, batch)
