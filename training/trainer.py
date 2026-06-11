@@ -39,7 +39,7 @@ def train(args, config, model_cfg, net, dataloader, optimizer,
     log_file = open(log_path, 'a', newline='')
     log_writer = csv.writer(log_file)
     if not log_exists:
-        log_writer.writerow(['轮次', '训练损失', 'w1%','w2%','w3%', 'z1%','z2%','z3%', 'φloss', 'MAC1','MAC2','MAC3', 'w占比%','z占比%','phi占比%','FRF占比%', '验证MSE', '幅值MAE', '幅值MAPE%', '学习率'])
+        log_writer.writerow(['轮次', '训练损失', 'w1%','w2%','w3%', 'z1%','z2%','z3%', 'φloss', 'φn1','φn2','φn3', 'φa1','φa2','φa3', 'MAC1','MAC2','MAC3', 'w占比%','z占比%','phi占比%','FRF占比%', '验证MSE', '幅值MAE', '幅值MAPE%', '学习率'])
 
     phase2_unlocked = False
     unlock_epoch = start_epoch
@@ -47,6 +47,7 @@ def train(args, config, model_cfg, net, dataloader, optimizer,
     try:
       for epoch in range(start_epoch, total_epochs):
         losses, omega_losses, zeta_losses, mac_losses = [], [], [], []
+        phi_n_losses, phi_a_losses = [], []
         weighted_w_losses, weighted_z_losses, weighted_p_losses = [], [], []
 
         in_phase1 = not phase2_unlocked
@@ -112,6 +113,9 @@ def train(args, config, model_cfg, net, dataloader, optimizer,
                         omega_weight=current_omega_w, zeta_weight=current_zeta_w,
                         phi_weight=current_phi_w)
                     mac_losses.append(mac_val.detach().cpu().numpy())
+                    pn, pa = _compute_phi_metrics(phi_pred, batch['modal_phi'].to(args.device), batch_idx_t)
+                    phi_n_losses.append(pn.detach().cpu().numpy())
+                    phi_a_losses.append(pa.detach().cpu().numpy())
 
                     raw_frf = frf_loss(frf_pred, batch['point_frf'].to(args.device))
                     phase2_ep = epoch - unlock_epoch
@@ -132,6 +136,9 @@ def train(args, config, model_cfg, net, dataloader, optimizer,
                         phi_weight=current_phi_w)
                     loss = loss_m
                     mac_losses.append(mac_val.detach().cpu().numpy())
+                    pn, pa = _compute_phi_metrics(phi_pred, batch['modal_phi'].to(args.device), batch_idx_t)
+                    phi_n_losses.append(pn.detach().cpu().numpy())
+                    phi_a_losses.append(pa.detach().cpu().numpy())
 
             losses.append(loss.detach().cpu().item())
 
@@ -178,13 +185,21 @@ def train(args, config, model_cfg, net, dataloader, optimizer,
         zeta_share = wgt_z / mean_loss * 100 if mean_loss > 0 else 0
         phi_share = wgt_p / mean_loss * 100 if mean_loss > 0 else 0
         frf_s = 0 if in_phase1 else (100 - omega_share - zeta_share - phi_share)
+        if phi_n_losses:
+            phi_n_per_mode = np.stack(phi_n_losses).mean(axis=0)
+            phi_a_per_mode = np.stack(phi_a_losses).mean(axis=0)
+            phi_str = f'φn=[{phi_n_per_mode[0]:.1f}/{phi_n_per_mode[1]:.1f}/{phi_n_per_mode[2]:.1f}]% φa=[{phi_a_per_mode[0]:.1f}/{phi_a_per_mode[1]:.1f}/{phi_a_per_mode[2]:.1f}]%'
+        else:
+            phi_str = 'φn=... φa=...'
+            phi_n_per_mode = np.zeros(3)
+            phi_a_per_mode = np.zeros(3)
         if mac_losses:
             mac_per_mode = np.stack(mac_losses).mean(axis=0)
             mac_str = f'MAC=[{mac_per_mode[0]:.3f}/{mac_per_mode[1]:.3f}/{mac_per_mode[2]:.3f}]'
             mac_scalar = mac_per_mode.mean()
         else:
             mac_str = 'MAC=...'; mac_scalar = 0
-        _log(f"Epoch {epoch:4d} | {w_str} {z_str} {mac_str} | w{omega_share:.0f}% z{zeta_share:.0f}% ph{phi_share:.0f}% | loss={mean_loss:.1f}", logger)
+        _log(f"Epoch {epoch:4d} | {w_str} {z_str} {phi_str} {mac_str} | w{omega_share:.0f}% z{zeta_share:.0f}% ph{phi_share:.0f}% | loss={mean_loss:.1f}", logger)
 
         # 动态解锁: enable_phase2=True 且 epoch >= phase2_min_epoch
         enable_phase2 = config.get('enable_phase2', False)
@@ -199,15 +214,15 @@ def train(args, config, model_cfg, net, dataloader, optimizer,
         if epoch % val_freq == 0 or epoch % int(total_epochs / 10) == 0:
             save_model(args.dir, epoch, net, optimizer, loss, "checkpoint_last")
             if in_phase1:
-                val_results = evaluate(args, config, net, valloader, logger, epoch)
+                val_results = evaluate(args, config, net, valloader, logger, epoch, phase1=True)
                 omega_mae = val_results.get("ω_MAE (rad/s)", -1)
-                _log(f"Epoch {epoch:4d} | ω_MAE={omega_mae:.1f} rad/s (Phase1: FRF metrics skipped)", logger)
-                log_writer.writerow([epoch, f'{mean_loss:.2e}', f'{omega_per_mode[0]:.3f}',f'{omega_per_mode[1]:.3f}',f'{omega_per_mode[2]:.3f}', f'{zeta_per_mode[0]:.1f}',f'{zeta_per_mode[1]:.1f}',f'{zeta_per_mode[2]:.1f}', f'{phi_loss:.2f}', f'{mac_per_mode[0]:.3f}',f'{mac_per_mode[1]:.3f}',f'{mac_per_mode[2]:.3f}', f'{omega_share:.1f}', f'{zeta_share:.1f}', f'{phi_share:.1f}', '0', '', '', '', f'{lr:.2e}'])
+                _log(f"Epoch {epoch:4d} | ω_MAE={omega_mae:.1f} rad/s (Phase1)", logger)
+                log_writer.writerow([epoch, f'{mean_loss:.2e}', f'{omega_per_mode[0]:.3f}',f'{omega_per_mode[1]:.3f}',f'{omega_per_mode[2]:.3f}', f'{zeta_per_mode[0]:.1f}',f'{zeta_per_mode[1]:.1f}',f'{zeta_per_mode[2]:.1f}', f'{phi_loss:.2f}', f'{phi_n_per_mode[0]:.1f}',f'{phi_n_per_mode[1]:.1f}',f'{phi_n_per_mode[2]:.1f}', f'{phi_a_per_mode[0]:.1f}',f'{phi_a_per_mode[1]:.1f}',f'{phi_a_per_mode[2]:.1f}', f'{mac_per_mode[0]:.3f}',f'{mac_per_mode[1]:.3f}',f'{mac_per_mode[2]:.3f}', f'{omega_share:.1f}', f'{zeta_share:.1f}', f'{phi_share:.1f}', '0', '', '', '', f'{lr:.2e}'])
             else:
                 val_results = evaluate(args, config, net, valloader, logger, epoch)
                 val_loss = val_results["loss (MSE)"]
                 frf_share = 100 - omega_share - zeta_share - phi_share
-                log_writer.writerow([epoch, f'{mean_loss:.2e}', f'{omega_per_mode[0]:.3f}',f'{omega_per_mode[1]:.3f}',f'{omega_per_mode[2]:.3f}', f'{zeta_per_mode[0]:.1f}',f'{zeta_per_mode[1]:.1f}',f'{zeta_per_mode[2]:.1f}', f'{phi_loss:.2f}', f'{mac_per_mode[0]:.3f}',f'{mac_per_mode[1]:.3f}',f'{mac_per_mode[2]:.3f}', f'{omega_share:.1f}', f'{zeta_share:.1f}', f'{phi_share:.1f}', f'{frf_share:.1f}', f'{val_loss:.4f}',
+                log_writer.writerow([epoch, f'{mean_loss:.2e}', f'{omega_per_mode[0]:.3f}',f'{omega_per_mode[1]:.3f}',f'{omega_per_mode[2]:.3f}', f'{zeta_per_mode[0]:.1f}',f'{zeta_per_mode[1]:.1f}',f'{zeta_per_mode[2]:.1f}', f'{phi_loss:.2f}', f'{phi_n_per_mode[0]:.1f}',f'{phi_n_per_mode[1]:.1f}',f'{phi_n_per_mode[2]:.1f}', f'{phi_a_per_mode[0]:.1f}',f'{phi_a_per_mode[1]:.1f}',f'{phi_a_per_mode[2]:.1f}', f'{mac_per_mode[0]:.3f}',f'{mac_per_mode[1]:.3f}',f'{mac_per_mode[2]:.3f}', f'{omega_share:.1f}', f'{zeta_share:.1f}', f'{phi_share:.1f}', f'{frf_share:.1f}', f'{val_loss:.4f}',
                                      f'{val_results.get("Amplitude MAE", 0):.4f}',
                                      f'{val_results.get("Amplitude MAPE (%)", 0):.2f}',
                                      f'{lr:.2e}'])
@@ -228,18 +243,43 @@ def train(args, config, model_cfg, net, dataloader, optimizer,
                 lowest = best_metric
         else:
             frf_s = 0 if in_phase1 else (100 - omega_share - zeta_share - phi_share)
-            log_writer.writerow([epoch, f'{mean_loss:.2e}', f'{omega_per_mode[0]:.3f}',f'{omega_per_mode[1]:.3f}',f'{omega_per_mode[2]:.3f}', f'{zeta_per_mode[0]:.1f}',f'{zeta_per_mode[1]:.1f}',f'{zeta_per_mode[2]:.1f}', f'{phi_loss:.2f}', f'{mac_per_mode[0]:.3f}',f'{mac_per_mode[1]:.3f}',f'{mac_per_mode[2]:.3f}', f'{omega_share:.1f}', f'{zeta_share:.1f}', f'{phi_share:.1f}', f'{frf_s:.1f}', '', '', '', f'{lr:.2e}'])
+            log_writer.writerow([epoch, f'{mean_loss:.2e}', f'{omega_per_mode[0]:.3f}',f'{omega_per_mode[1]:.3f}',f'{omega_per_mode[2]:.3f}', f'{zeta_per_mode[0]:.1f}',f'{zeta_per_mode[1]:.1f}',f'{zeta_per_mode[2]:.1f}', f'{phi_loss:.2f}', f'{phi_n_per_mode[0]:.1f}',f'{phi_n_per_mode[1]:.1f}',f'{phi_n_per_mode[2]:.1f}', f'{phi_a_per_mode[0]:.1f}',f'{phi_a_per_mode[1]:.1f}',f'{phi_a_per_mode[2]:.1f}', f'{mac_per_mode[0]:.3f}',f'{mac_per_mode[1]:.3f}',f'{mac_per_mode[2]:.3f}', f'{omega_share:.1f}', f'{zeta_share:.1f}', f'{phi_share:.1f}', f'{frf_s:.1f}', '', '', '', f'{lr:.2e}'])
 
         if epoch == (total_epochs - 1):
             path = os.path.join(args.dir, "checkpoint_best")
             if os.path.exists(path):
                 net.load_state_dict(torch.load(path, map_location='cpu')["model_state_dict"])
-            evaluate(args, config, net, valloader, logger, epoch, verbose=True)
+            evaluate(args, config, net, valloader, logger, epoch, verbose=True, phase1=not phase2_unlocked)
 
     finally:
         log_file.close()
 
     return net
+
+
+def _compute_phi_metrics(phi_pred, phi_target, batch_idx):
+    """逐图计算 φn (NRMSE%) 和 φa (范数误差%)，返回 per-mode [K]."""
+    dot = torch.sum(phi_pred * phi_target, dim=0, keepdim=True)
+    sign = torch.sign(dot + 1e-8)
+    aligned_target = phi_target * sign
+
+    n_graphs = int(batch_idx.max().item()) + 1
+    nrmse_list, norm_err_list = [], []
+    for i in range(n_graphs):
+        mask = (batch_idx == i)
+        p = phi_pred[mask]
+        t = aligned_target[mask]
+        # φn: RMSE / (max-min) * 100
+        rmse = torch.sqrt(torch.mean((p - t) ** 2, dim=0))
+        ptp = t.max(dim=0)[0] - t.min(dim=0)[0] + 1e-8
+        nrmse_list.append(rmse / ptp * 100.0)
+        # φa: |norm(p)-norm(t)| / norm(t) * 100
+        norm_p = torch.norm(p, dim=0)
+        norm_t = torch.norm(t, dim=0) + 1e-8
+        norm_err_list.append(torch.abs(norm_p - norm_t) / norm_t * 100.0)
+    phi_n = torch.stack(nrmse_list, dim=0).mean(dim=0)  # [K]
+    phi_a = torch.stack(norm_err_list, dim=0).mean(dim=0)  # [K]
+    return phi_n, phi_a
 
 
 def _apply_gradient_clip(net, config):
@@ -251,6 +291,7 @@ def _apply_gradient_clip(net, config):
     _clip_module(net, 'omega_head', 2.0)
     _clip_module(net, 'zeta_head', 2.0)
     _clip_module(net, 'phi_refiner', 2.0)
+    _clip_module(net, 'phi_scale_head', 2.0)
 
 
 def _clip_module(net, prefix, max_norm):
@@ -260,14 +301,14 @@ def _clip_module(net, prefix, max_norm):
         torch.nn.utils.clip_grad_norm_(params, max_norm)
 
 
-def evaluate(args, config, net, dataloader, logger=None, epoch=None, verbose=True):
-    """验证/测试评估"""
-    prediction, output, omega_errs = _generate_preds(args, config, net, dataloader)
-    results = _evaluate(prediction, output, omega_errs, logger, epoch, verbose)
+def evaluate(args, config, net, dataloader, logger=None, epoch=None, verbose=True, phase1=False):
+    """验证/测试评估。phase1=True 时只计算 ω_MAE，跳过 FRF 推理。"""
+    prediction, output, omega_errs = _generate_preds(args, config, net, dataloader, phase1=phase1)
+    results = _evaluate(prediction, output, omega_errs, logger, epoch, verbose, phase1=phase1)
     return results
 
 
-def _generate_preds(args, config, net, dataloader):
+def _generate_preds(args, config, net, dataloader, phase1=False):
     net.eval()
     with torch.no_grad():
         predictions, outputs = [], []
@@ -284,6 +325,14 @@ def _generate_preds(args, config, net, dataloader):
             _nx = batch.get('node_xyz'); _nf = batch.get('node_features')
             _nx = _nx.to(args.device) if _nx is not None else None
             _nf = _nf.to(args.device) if _nf is not None else None
+
+            # Phase1: 只取 ω，跳过 FRF 推理
+            if phase1:
+                _, omega_pred, _, _, _ = net(img, coords, None, None, bt,
+                                             node_xyz=_nx, node_features=_nf)
+                if omega_true is not None:
+                    omega_errs.append((omega_pred.detach().cpu() - omega_true).abs())
+                continue
 
             if isinstance(frequencies, list):
                 for i, freqs_i in enumerate(frequencies):
@@ -346,30 +395,32 @@ def _generate_preds(args, config, net, dataloader):
         return predictions, outputs, omega_errs
 
 
-def _evaluate(prediction, output, omega_errs, logger, epoch, verbose=True):
-    if isinstance(prediction, list):
-        asinh_mse_vals = [F.mse_loss(p, o).item() for p, o in zip(prediction, output)]
-        results = {"loss (MSE)": np.mean(asinh_mse_vals)}
-        mae_list, mape_list = [], []
-        for p_asinh, o_asinh in zip(prediction, output):
-            p_phys = p_asinh; o_phys = o_asinh
-            p_amp = torch.sqrt(p_phys[..., 0]**2 + p_phys[..., 1]**2 + 1e-8)
-            o_amp = torch.sqrt(o_phys[..., 0]**2 + o_phys[..., 1]**2 + 1e-8)
-            mae_list.append(F.l1_loss(p_amp, o_amp).item())
-            mape_list.append((torch.abs(p_amp - o_amp) / (o_amp + 1e-6)).mean().item() * 100.0)
-        results["Amplitude MAE"] = np.mean(mae_list)
-        results["Amplitude MAPE (%)"] = np.mean(mape_list)
-    else:
-        results = {}
-        if prediction.shape != output.shape:
-            output = output.reshape(prediction.shape)
-        results["loss (MSE)"] = F.mse_loss(prediction, output).item()
-        if prediction.ndim >= 3 and prediction.shape[-1] == 2:
-            p_phys = prediction; o_phys = output
-            p_amp = torch.sqrt(p_phys[..., 0]**2 + p_phys[..., 1]**2 + 1e-8)
-            o_amp = torch.sqrt(o_phys[..., 0]**2 + o_phys[..., 1]**2 + 1e-8)
-            results["Amplitude MAE"] = F.l1_loss(p_amp, o_amp).item()
-            results["Amplitude MAPE (%)"] = (torch.abs(p_amp - o_amp) / (o_amp + 1e-6)).mean().item() * 100.0
+def _evaluate(prediction, output, omega_errs, logger, epoch, verbose=True, phase1=False):
+    results = {}
+    # Phase1: 只评估 ω，跳过 FRF 指标 (FRF 尚未训练，指标无意义)
+    if not phase1:
+        if isinstance(prediction, list):
+            asinh_mse_vals = [F.mse_loss(p, o).item() for p, o in zip(prediction, output)]
+            results["loss (MSE)"] = np.mean(asinh_mse_vals)
+            mae_list, mape_list = [], []
+            for p_asinh, o_asinh in zip(prediction, output):
+                p_phys = p_asinh; o_phys = o_asinh
+                p_amp = torch.sqrt(p_phys[..., 0]**2 + p_phys[..., 1]**2 + 1e-8)
+                o_amp = torch.sqrt(o_phys[..., 0]**2 + o_phys[..., 1]**2 + 1e-8)
+                mae_list.append(F.l1_loss(p_amp, o_amp).item())
+                mape_list.append((torch.abs(p_amp - o_amp) / (o_amp + 1e-6)).mean().item() * 100.0)
+            results["Amplitude MAE"] = np.mean(mae_list)
+            results["Amplitude MAPE (%)"] = np.mean(mape_list)
+        else:
+            if prediction.shape != output.shape:
+                output = output.reshape(prediction.shape)
+            results["loss (MSE)"] = F.mse_loss(prediction, output).item()
+            if prediction.ndim >= 3 and prediction.shape[-1] == 2:
+                p_phys = prediction; o_phys = output
+                p_amp = torch.sqrt(p_phys[..., 0]**2 + p_phys[..., 1]**2 + 1e-8)
+                o_amp = torch.sqrt(o_phys[..., 0]**2 + o_phys[..., 1]**2 + 1e-8)
+                results["Amplitude MAE"] = F.l1_loss(p_amp, o_amp).item()
+                results["Amplitude MAPE (%)"] = (torch.abs(p_amp - o_amp) / (o_amp + 1e-6)).mean().item() * 100.0
     if omega_errs:
         results["ω_MAE (rad/s)"] = torch.cat([e.flatten() for e in omega_errs]).mean().item()
     if verbose:
