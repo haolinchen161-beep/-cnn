@@ -212,7 +212,8 @@ class UNetPhysicsModel(nn.Module):
 
     def forward(self, image_tensor, query_coords, frequencies=None,
                 phi_exc=None, batch=None, alpha=1.0,
-                node_xyz=None, node_features=None):
+                node_xyz=None, node_features=None,
+                omega_true=None, teacher_alpha=0.0):
         """
         Returns:
             frf, omega_phys, log_zeta, zeta, phi
@@ -220,6 +221,10 @@ class UNetPhysicsModel(nn.Module):
             log_zeta:   [B, K] 对数阻尼
             zeta:       [B, K] 物理阻尼 = exp(log_zeta)
             phi:        [total_N, K] 振型
+
+        Teacher-Forced Omega (Phase2):
+            teacher_alpha=1.0 → FRF 全用 ω_true (峰位置完美对齐，只训 φ/ζ)
+            teacher_alpha=0.0 → FRF 全用 ω_pred (端到端推理模式)
         """
         B = image_tensor.shape[0]
         if query_coords.ndim == 3:
@@ -259,9 +264,13 @@ class UNetPhysicsModel(nn.Module):
         if node_xyz is not None and node_features is not None:
             phi = self.phi_refiner(phi, latent, node_xyz, node_features, batch)
 
-        # FRF 重建
+        # FRF 重建 (Teacher-Forced: 可混合 ω_true 与 ω_pred)
         if frequencies is not None:
-            frf = self.physics(phi, omega_phys, zeta, frequencies, phi_exc,
+            if omega_true is not None and teacher_alpha > 0.0:
+                omega_used = teacher_alpha * omega_true + (1.0 - teacher_alpha) * omega_phys
+            else:
+                omega_used = omega_phys
+            frf = self.physics(phi, omega_used, zeta, frequencies, phi_exc,
                                batch_idx=batch, alpha=alpha)
         else:
             frf = None
