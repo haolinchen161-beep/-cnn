@@ -166,6 +166,11 @@ class GeometricHDF5Dataset(Dataset):
                         val = val[:, 2]  # [K, 3] → [K]
                     out[key] = val
 
+            # 高级物理标签 (effm/pfact)，兼容老数据
+            for h5_key, out_key in [('modal_effm', 'modal_effm'), ('modal_pfact', 'modal_pfact')]:
+                if h5_key in grp:
+                    out[out_key] = torch.from_numpy(grp[h5_key][:]).float()
+
         # ω 归一化到 [0,1] (sigmoid 输出空间)
         OMEGA_MAX = 25000.0
         if 'modal_omega' in out:
@@ -270,4 +275,7 @@ def _stack_modal(batch):
         result['modal_freq_hz'] = torch.stack([item['modal_freq_hz'] for item in batch])
     if 'modal_log_zeta' in batch[0] and batch[0]['modal_log_zeta'] is not None:
         result['modal_log_zeta'] = torch.stack([item['modal_log_zeta'] for item in batch])
+    for key in ['modal_effm', 'modal_pfact']:
+        if key in batch[0] and batch[0][key] is not None:
+            result[key] = torch.stack([item[key] for item in batch])
     return result
