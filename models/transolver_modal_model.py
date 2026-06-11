@@ -5,9 +5,10 @@
 输出:
     模态固有频率、模态阻尼比、逐节点 XYZ 三向振型，以及方向性 FRF。
 
-全链路使用 Dense Padding + bmm 实现，0 隐式同步，100% 向量化。
-
-阻尼比 ζ = 物理耗散基底 + 学习残差。
+本版本对输入做任务隔离：
+    - 固有频率 omega 和本征振型 phi 只看结构本征输入；
+    - 阻尼 C、激励点距离、激励点标记、刀具距离不进入 omega/phi 编码器；
+    - 阻尼 zeta 仍通过 boundary_c_xyz + predicted phi + omega 的物理路径计算。
 """
 from __future__ import annotations
 
@@ -25,6 +26,7 @@ from .physics_decoder import ModalFRFDecoder
 # ---------------------------------------------------------------------------
 class Sine(nn.Module):
     """SIREN 的正弦激活函数。"""
+
     def __init__(self, w0: float = 30.0):
         super().__init__()
         self.w0 = w0
@@ -35,6 +37,7 @@ class Sine(nn.Module):
 
 class SirenLayer(nn.Module):
     """带有严格频率初始化的 SIREN 线性层。"""
+
     def __init__(self, dim_in: int, dim_out: int, w0: float = 30.0, is_first: bool = False):
         super().__init__()
         self.linear = nn.Linear(dim_in, dim_out)
@@ -47,10 +50,9 @@ class SirenLayer(nn.Module):
         with torch.no_grad():
             if self.is_first:
                 b = 1.0 / self.linear.in_features
-                self.linear.weight.uniform_(-b, b)
             else:
                 b = math.sqrt(6.0 / self.linear.in_features) / self.w0
-                self.linear.weight.uniform_(-b, b)
+            self.linear.weight.uniform_(-b, b)
             if self.linear.bias is not None:
                 self.linear.bias.uniform_(-b, b)
 
@@ -59,16 +61,46 @@ class SirenLayer(nn.Module):
 
 
 def sanitize_feature_tensor(x: torch.Tensor, clamp_value: float = 20.0) -> torch.Tensor:
-    """Remove NaN/Inf and clamp feature scale before any network layer.
-
-    Node features contain log stiffness/damping and derived geometry flags. A single
-    NaN/Inf value can poison the Transolver encoder, branch coeff distillation, and
-    omega loss at epoch 0. Keep this operation inside the model so every caller
-    (stage1 trunk, stage2 encoder, evaluation) uses the same safe path.
-    """
+    """Remove NaN/Inf and clamp feature scale before any network layer."""
     y = x.float()
     y = torch.nan_to_num(y, nan=0.0, posinf=float(clamp_value), neginf=-float(clamp_value))
     return y.clamp(-float(clamp_value), float(clamp_value))
+
+
+def make_modal_structural_features(node_features: torch.Tensor) -> torch.Tensor:
+    """给 omega/phi 使用的结构本征特征。
+
+    原始 transolver_point_features 默认字段：
+        0..17  : 坐标、材料、凹槽、剩余厚度、装夹 K 等结构信息
+        18..20 : log10_Cx/Cy/Cz，阻尼信息，只给 zeta 用
+        21..22 : distance_to_excitation / excitation_flag，FRF 查询信息，不应进入本征模态
+        23..27 : 表面标记，属于结构几何，可保留
+        28/29  : dataset 追加字段。常见情况：in_dim=29 时 28 是 dist_to_tool；
+                 in_dim>=30 时 28 可能是 node_active_flag，29 是 dist_to_tool。
+
+    因此：omega/phi 去掉 C、激励点、刀具距离；保留几何、材料、K、表面/拓扑。
+    """
+    feat = sanitize_feature_tensor(node_features, 20.0).clone()
+    fdim = feat.shape[-1]
+
+    # 阻尼 C 不影响无阻尼固有频率/本征振型，不进入 omega/phi。
+    for idx in (18, 19, 20):
+        if fdim > idx:
+            feat[..., idx] = 0.0
+
+    # 激励点是 FRF 查询条件，不是结构本征属性，不进入 omega/phi。
+    for idx in (21, 22):
+        if fdim > idx:
+            feat[..., idx] = 0.0
+
+    # dataset 追加字段：in_dim=29 时通常 28 是 dist_to_tool；in_dim>=30 时通常 29 是 dist_to_tool。
+    # 如果后续存在 node_active_flag，它仍可作为拓扑/过程几何信息保留在 28 位。
+    if fdim == 29:
+        feat[..., 28] = 0.0
+    elif fdim >= 30:
+        feat[..., 29] = 0.0
+
+    return feat
 
 
 # ======================= Dense Padding 工具 =======================
@@ -132,120 +164,23 @@ class SliceTransolverBlock(nn.Module):
         )
 
     def forward(self, x: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
-        # x: (B, N_max, H), mask: (B, N_max)
         assign_logits = self.assign(x).masked_fill(~mask.unsqueeze(-1), -1e4)
-        assign = torch.softmax(assign_logits, dim=1).masked_fill(~mask.unsqueeze(-1), 0.0)  # (B, N, S)
+        assign = torch.softmax(assign_logits, dim=1).masked_fill(~mask.unsqueeze(-1), 0.0)
 
-        # bmm 并行投影到 token 空间
-        denom = assign.sum(dim=1, keepdim=True).clamp_min(1e-6)  # (B, 1, S)
-        tokens = torch.bmm(assign.transpose(1, 2), x) / denom.transpose(1, 2)  # (B, S, H)
+        denom = assign.sum(dim=1, keepdim=True).clamp_min(1e-6)
+        tokens = torch.bmm(assign.transpose(1, 2), x) / denom.transpose(1, 2)
 
-        # Token 注意力
         tokens_norm = self.token_norm(tokens)
-        tokens_attn, _ = self.token_attn(tokens_norm, tokens_norm, tokens_norm,
-                                          need_weights=False)  # (B, S, H)
+        tokens_attn, _ = self.token_attn(tokens_norm, tokens_norm, tokens_norm, need_weights=False)
 
-        # bmm 回写节点
-        back = torch.bmm(assign, tokens_attn)  # (B, N, H)
-
+        back = torch.bmm(assign, tokens_attn)
         y = self.node_norm1(x + back)
         y = self.node_norm2(y + self.ffn(y))
         return y.masked_fill(~mask.unsqueeze(-1), 0.0)
 
 
-class DeepONetPhiHead(nn.Module):
-    """低秩 branch-trunk 振型头。
-
-    三阶段训练版本采用更标准的 DeepONet 划分：
-    - trunk 只看节点坐标和节点物理/几何特征，学习可冻结的空间基；
-    - branch 从整件工件的 global latent + 显式全局物理描述符预测模态系数；
-    - 二者点乘得到逐节点 XYZ 三向振型。
-
-    注意：这里 trunk 不再依赖 node_latent。这样阶段1才能在没有 Transolver
-    encoder 的情况下，先用 sample_id 的可学习 coeff_table 单独学习 trunk basis。
-    """
-
-    def __init__(self,
-                 hidden_dim: int,
-                 node_feat_dim: int,
-                 n_modes: int = 3,
-                 rank: int = 64,
-                 dropout: float = 0.0,
-                 branch_extra_dim: int = 0):
-        super().__init__()
-        self.n_modes = n_modes
-        self.rank = rank
-        self.branch_extra_dim = branch_extra_dim
-        out_dim = n_modes * 3 * rank
-        branch_in_dim = hidden_dim + branch_extra_dim
-
-        self.branch_extra_norm = nn.LayerNorm(branch_extra_dim) if branch_extra_dim > 0 else None
-        self.branch = nn.Sequential(
-            nn.Linear(branch_in_dim, hidden_dim), nn.GELU(), nn.Dropout(dropout),
-            nn.Linear(hidden_dim, hidden_dim), nn.GELU(),
-            nn.Linear(hidden_dim, out_dim),
-        )
-        self.trunk = nn.Sequential(
-            nn.Linear(3 + node_feat_dim, hidden_dim),
-            nn.LayerNorm(hidden_dim), nn.GELU(), nn.Dropout(dropout),
-            nn.Linear(hidden_dim, hidden_dim), nn.GELU(),
-            nn.Linear(hidden_dim, out_dim),
-        )
-        self.norm = 1.0 / math.sqrt(float(rank))
-
-    def branch_coeff(self, global_latent: torch.Tensor,
-                     global_features: torch.Tensor | None = None) -> torch.Tensor:
-        B = global_latent.shape[0]
-        global_latent = torch.nan_to_num(global_latent.float(), nan=0.0, posinf=20.0, neginf=-20.0).clamp(-20.0, 20.0).to(global_latent.dtype)
-        if self.branch_extra_dim > 0:
-            if global_features is None:
-                global_features = global_latent.new_zeros(B, self.branch_extra_dim)
-            gf = sanitize_feature_tensor(global_features, 20.0)
-            gf = self.branch_extra_norm(gf).to(global_latent.dtype)
-            branch_input = torch.cat([global_latent, gf], dim=-1)
-        else:
-            branch_input = global_latent
-        out = self.branch(branch_input)
-        out = torch.nan_to_num(out.float(), nan=0.0, posinf=20.0, neginf=-20.0).clamp(-20.0, 20.0).to(branch_input.dtype)
-        return out.view(B, self.n_modes, 3, self.rank)
-
-    def trunk_basis(self, points: torch.Tensor, node_features: torch.Tensor) -> torch.Tensor:
-        N = points.shape[0]
-        feat = sanitize_feature_tensor(node_features, 20.0).to(points.dtype)
-        trunk_in = torch.cat([points, feat], dim=-1)
-        out = self.trunk(trunk_in)
-        out = torch.nan_to_num(out.float(), nan=0.0, posinf=20.0, neginf=-20.0).clamp(-20.0, 20.0).to(trunk_in.dtype)
-        return out.view(N, self.n_modes, 3, self.rank)
-
-    def combine(self, coeff: torch.Tensor, basis: torch.Tensor, batch: torch.Tensor) -> torch.Tensor:
-        coeff_n = coeff[batch.long()]  # (N, K, 3, R)
-        phi = (coeff_n * basis).sum(dim=-1) * self.norm  # (N, K, 3)
-        return torch.nan_to_num(phi.float(), nan=0.0, posinf=20.0, neginf=-20.0).clamp(-20.0, 20.0).to(basis.dtype)
-
-    def forward(self,
-                global_latent: torch.Tensor,
-                node_latent: torch.Tensor,
-                points: torch.Tensor,
-                node_features: torch.Tensor,
-                batch: torch.Tensor,
-                global_features: torch.Tensor | None = None) -> torch.Tensor:
-        # node_latent 保留在接口中是为了兼容 TransolverModalFRF.forward，当前 trunk 不使用它。
-        coeff = self.branch_coeff(global_latent, global_features)
-        basis = self.trunk_basis(points, node_features)
-        return self.combine(coeff, basis, batch)
-
-
 class TransolverModalFRF(nn.Module):
-    """Transolver 编码器 + 模态预测头 + 可微 FRF 解码器（Dense Padding 版）。
-
-    参数
-    ----------
-    response_direction : str
-        响应测量的笛卡尔轴。可选 ``"X"``、``"Y"``、``"Z"``。
-        默认 ``"Z"``（薄板面外方向）。
-    force_direction : str
-        力激励的笛卡尔轴。默认 ``"Z"``。
-    """
+    """Transolver 编码器 + 模态预测头 + 可微 FRF 解码器（Dense Padding 版）。"""
 
     def __init__(self,
                  in_dim: int = 28,
@@ -262,12 +197,10 @@ class TransolverModalFRF(nn.Module):
                  phi_rank: int = 64):
         super().__init__()
         if n_modes != 3:
-            raise ValueError("当前 CNN-style omega gap head 只支持 n_modes=3")
+            raise ValueError("当前 omega gap head 只支持 n_modes=3")
         self.n_modes = n_modes
         self.use_edge_stem = use_edge_stem
         self.node_feat_dim = in_dim
-        # 维度保持为 4*in_dim，不破坏当前训练脚本和旧 stage1 加载；
-        # 内容由盲目 mean/std/min/max 改成结构化物理描述符，剩余维度补零。
         self.branch_stats_dim = in_dim * 4
 
         _DIR_MAP = {"X": 0, "Y": 1, "Z": 2}
@@ -292,29 +225,20 @@ class TransolverModalFRF(nn.Module):
             nn.Linear(hidden_dim, hidden_dim), nn.GELU(),
             nn.Linear(hidden_dim, n_modes),
         )
+
         # 频率 gap head 标定常量，单位 rad/s
-        # 基于当前数据集，并保留 f3 - f2 >= 200Hz 的过滤条件
-        self.register_buffer("omega_w1_base", torch.tensor(4712.389, dtype=torch.float32))      # 2π × 750 Hz
+        self.register_buffer("omega_w1_base", torch.tensor(4712.389, dtype=torch.float32))
         self.register_buffer("omega_w1_scale", torch.tensor(1817.471, dtype=torch.float32))
-
-        self.register_buffer("omega_gap21_min", torch.tensor(4398.230, dtype=torch.float32))    # 2π × 700 Hz
+        self.register_buffer("omega_gap21_min", torch.tensor(4398.230, dtype=torch.float32))
         self.register_buffer("omega_gap21_scale", torch.tensor(6290.185, dtype=torch.float32))
-
-        self.register_buffer("omega_gap32_min", torch.tensor(1256.637, dtype=torch.float32))    # 2π × 200 Hz
+        self.register_buffer("omega_gap32_min", torch.tensor(1256.637, dtype=torch.float32))
         self.register_buffer("omega_gap32_scale", torch.tensor(2923.069, dtype=torch.float32))
 
-        # 让初始 out≈0，使初始频率接近数据均值，同时保留梯度通路
         nn.init.normal_(self.omega_head[-1].weight, mean=0.0, std=1e-3)
         nn.init.zeros_(self.omega_head[-1].bias)
 
-        self.zeta_residual_head = nn.Sequential(
-            nn.Linear(hidden_dim, hidden_dim), nn.GELU(),
-            nn.Linear(hidden_dim, n_modes),
-        )
-        # 2. 先验通道：从节点特征直接映射出结构先验振型
+        # 结构先验振型 + SIREN 畸变修正
         self.prior_phi_head = nn.Linear(hidden_dim, n_modes * 3)
-
-        # 3. 非线性融合层 (SIREN)：预测因切削带来的高频高阶畸变 (Delta Phi)
         siren_w0 = 10.0
         self.fusion_mlp = nn.Sequential(
             SirenLayer(hidden_dim * 2, hidden_dim * 2, w0=siren_w0, is_first=True),
@@ -322,24 +246,19 @@ class TransolverModalFRF(nn.Module):
             SirenLayer(hidden_dim, hidden_dim, w0=siren_w0, is_first=False),
             nn.Linear(hidden_dim, n_modes * 3),
         )
-        # 严格初始化最后一层，防止破坏 SIREN 频率波段
         with torch.no_grad():
             b = math.sqrt(6.0 / hidden_dim) / siren_w0
             self.fusion_mlp[-1].weight.uniform_(-b, b)
             self.fusion_mlp[-1].bias.uniform_(-b, b)
 
         self.zeta_context_gate = nn.Sequential(
-            nn.Linear(hidden_dim + 2, hidden_dim),
-            nn.GELU(),
+            nn.Linear(hidden_dim + 2, hidden_dim), nn.GELU(),
             nn.Linear(hidden_dim, 1),
         )
         self.zeta_mode_residual_head = nn.Sequential(
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.GELU(),
+            nn.Linear(hidden_dim, hidden_dim), nn.GELU(),
             nn.Linear(hidden_dim, 1),
         )
-
-        # 数据驱动阻尼头：纯数据路径，用于训练早期物理路径不稳定时的热启动
         self.zeta_direct_head = nn.Sequential(
             nn.Linear(hidden_dim, hidden_dim), nn.GELU(),
             nn.Linear(hidden_dim, n_modes),
@@ -365,35 +284,20 @@ class TransolverModalFRF(nn.Module):
         return latent_flat, x_dense, mask
 
     def global_pool(self, x_dense, mask):
-        """对 dense 张量做门控全局池化。"""
         gate_logits = self.pool_gate(x_dense).squeeze(-1).masked_fill(~mask, -1e4)
         gate_logits = torch.nan_to_num(gate_logits.float(), nan=0.0, posinf=20.0, neginf=-20.0).clamp(-20.0, 20.0).to(x_dense.dtype)
         gate = torch.softmax(gate_logits, dim=1).masked_fill(~mask, 0.0)
-        pooled = (gate.unsqueeze(-1) * x_dense).sum(dim=1)  # (B, H)
+        pooled = (gate.unsqueeze(-1) * x_dense).sum(dim=1)
         return torch.nan_to_num(pooled.float(), nan=0.0, posinf=20.0, neginf=-20.0).clamp(-20.0, 20.0).to(x_dense.dtype)
 
     def global_feature_summary(self, node_features: torch.Tensor, node_counts: list) -> torch.Tensor:
-        """构造结构化全局物理描述符。
-
-        数据生成阶段的 transolver_point_features 已经包含材料、凹槽、装夹、K/C、
-        激励距离、表面标记等物理字段。这里不再盲目 concat mean/std/min/max，
-        而是按字段语义提取 branch 更需要的全局物理量：
-        - 材料: E/rho/PRXY 与 sqrt(E/rho)
-        - 几何: 剩余厚度、凹槽深度、凹槽底面/切削带/表面比例
-        - 边界: 角点/侧顶杆比例、三向 logK/logC 的弹簧节点统计
-        - 激励: 激励点坐标、距离激励点统计
-
-        输出维度仍固定为 self.branch_stats_dim = 4*in_dim，前若干维为物理描述符，
-        剩余维补零，避免破坏已有 stage1 trunk/coeff_table 的复用流程。
-        """
+        """结构化全局物理描述符，仅作诊断/后续扩展，不直接进入 omega/phi。"""
         feat = sanitize_feature_tensor(node_features, 20.0)
         feat_dense, mask = pad_batch(feat, node_counts)
         B, N, Fdim = feat_dense.shape
         dtype = feat_dense.dtype
-        device = feat_dense.device
         valid = mask
-        valid_f = valid.to(dtype)
-        denom = valid_f.sum(dim=1).clamp_min(1.0)
+        denom = valid.to(dtype).sum(dim=1).clamp_min(1.0)
 
         def col(idx: int, default: float = 0.0) -> torch.Tensor:
             if Fdim > idx:
@@ -467,9 +371,8 @@ class TransolverModalFRF(nn.Module):
         rho_mean = masked_mean(rho_ratio).clamp_min(1e-4)
         sqrt_e_rho = torch.sqrt((e_mean / rho_mean).abs().clamp_min(1e-8))
         rem_mean = masked_mean(remaining)
-        freq_prior = rem_mean * sqrt_e_rho  # 类似 H_eff * sqrt(E/rho)，交给 head 学尺度
+        freq_prior = rem_mean * sqrt_e_rho
 
-        # 激励点坐标：优先用 excitation_flag；没有 flag 时用 dist_exc 最小点近似。
         exc_has = (excitation_flag & valid).any(dim=1)
         exc_w = (excitation_flag & valid).to(dtype)
         min_dist = dist_exc.masked_fill(~valid, 20.0).min(dim=1, keepdim=True).values
@@ -485,57 +388,19 @@ class TransolverModalFRF(nn.Module):
         extra29 = col(29, 0.0)
 
         physics_values = [
-            # 材料与频率主尺度
-            e_mean,
-            rho_mean,
-            masked_mean(prxy),
-            sqrt_e_rho,
-            freq_prior,
-            # 几何/凹槽
-            masked_mean(z_norm),
-            rem_mean,
-            masked_std(remaining),
-            masked_min(remaining),
-            masked_mean(pocket_depth, pocket_active),
-            masked_max(pocket_depth, pocket_active),
-            ratio(pocket_active),
-            ratio(pocket_bottom),
-            ratio(cutting_band),
-            masked_mean(dist_edge, pocket_active),
-            masked_min(dist_edge, pocket_active),
-            # 装夹/弹簧
-            ratio(fixture_corner),
-            ratio(fixture_side),
-            ratio(k_any),
-            masked_mean(logkx, k_any),
-            masked_mean(logky, k_any),
-            masked_mean(logkz, k_any),
-            masked_max(logk_max_node, k_any),
-            masked_std(logk_mean_node, k_any),
-            masked_mean(logcx, c_any),
-            masked_mean(logcy, c_any),
-            masked_mean(logcz, c_any),
-            masked_max(logc_max_node, c_any),
-            masked_std(logc_mean_node, c_any),
-            # 激励位置/距离
-            masked_mean(dist_exc),
-            masked_min(dist_exc),
-            masked_std(dist_exc),
-            exc_x,
-            exc_y,
-            exc_z,
-            # 表面结构
-            ratio(free_surface),
-            ratio(top_surface),
-            ratio(bottom_surface),
-            ratio(external_side),
-            ratio(pocket_sidewall),
-            # 网格与可选过程字段
-            denom / 10000.0,
-            masked_mean(extra28),
-            masked_min(extra28),
-            masked_mean(extra29),
-            masked_min(extra29),
+            e_mean, rho_mean, masked_mean(prxy), sqrt_e_rho, freq_prior,
+            masked_mean(z_norm), rem_mean, masked_std(remaining), masked_min(remaining),
+            masked_mean(pocket_depth, pocket_active), masked_max(pocket_depth, pocket_active),
+            ratio(pocket_active), ratio(pocket_bottom), ratio(cutting_band),
+            masked_mean(dist_edge, pocket_active), masked_min(dist_edge, pocket_active),
+            ratio(fixture_corner), ratio(fixture_side), ratio(k_any),
+            masked_mean(logkx, k_any), masked_mean(logky, k_any), masked_mean(logkz, k_any),
+            masked_max(logk_max_node, k_any), masked_std(logk_mean_node, k_any),
+            masked_mean(logcx, c_any), masked_mean(logcy, c_any), masked_mean(logcz, c_any),
+            masked_max(logc_max_node, c_any), masked_std(logc_mean_node, c_any),
+            masked_mean(dist_exc), masked_min(dist_exc), masked_std(dist_exc), exc_x, exc_y, exc_z,
+            ratio(free_surface), ratio(top_surface), ratio(bottom_surface), ratio(external_side), ratio(pocket_sidewall),
+            denom / 10000.0, masked_mean(extra28), masked_min(extra28), masked_mean(extra29), masked_min(extra29),
         ]
 
         vals = torch.stack(physics_values, dim=-1)
@@ -546,15 +411,13 @@ class TransolverModalFRF(nn.Module):
         return summary
 
     def compute_physics_zeta(self, phi_xyz_dense, boundary_c_xyz_dense, omega, mask):
-        """根据材料阻尼与三向边界耗散计算基线阻尼比（dense 版）。"""
-        diss = (boundary_c_xyz_dense.unsqueeze(2) * phi_xyz_dense.pow(2)).sum(dim=-1)  # (B, N, K)
-        diss_per_graph = diss.masked_fill(~mask.unsqueeze(-1), 0.0).sum(dim=1)  # (B, K)
+        diss = (boundary_c_xyz_dense.unsqueeze(2) * phi_xyz_dense.pow(2)).sum(dim=-1)
+        diss_per_graph = diss.masked_fill(~mask.unsqueeze(-1), 0.0).sum(dim=1)
         return 0.002 + diss_per_graph / (2.0 * omega.clamp_min(1.0))
 
     def mode_weighted_pool(self, latent_dense, phi_xyz_dense, boundary_c_xyz_dense, mask):
-        """振型加权池化（dense 版，逐模态 masked softmax）。"""
-        modal_energy = phi_xyz_dense.pow(2).sum(dim=-1)  # (B, N, K)
-        boundary_strength = torch.log1p(boundary_c_xyz_dense.abs().sum(dim=-1))  # (B, N)
+        modal_energy = phi_xyz_dense.pow(2).sum(dim=-1)
+        boundary_strength = torch.log1p(boundary_c_xyz_dense.abs().sum(dim=-1))
 
         context_modes = []
         for k in range(self.n_modes):
@@ -563,14 +426,12 @@ class TransolverModalFRF(nn.Module):
                 modal_energy[..., k:k + 1],
                 boundary_strength.unsqueeze(-1),
             ], dim=-1)
-            learned_score = self.zeta_context_gate(score_input).squeeze(-1)  # (B, N)
-            score = (learned_score
-                     + torch.log(modal_energy[..., k] + 1e-8)
-                     + 0.1 * boundary_strength)  # (B, N)
+            learned_score = self.zeta_context_gate(score_input).squeeze(-1)
+            score = learned_score + torch.log(modal_energy[..., k] + 1e-8) + 0.1 * boundary_strength
             score = score.masked_fill(~mask, -1e4)
-            w = torch.softmax(score, dim=1).masked_fill(~mask, 0.0)  # (B, N)
-            context_modes.append((w.unsqueeze(-1) * latent_dense).sum(dim=1))  # (B, H)
-        return torch.stack(context_modes, dim=1)  # (B, K, H)
+            w = torch.softmax(score, dim=1).masked_fill(~mask, 0.0)
+            context_modes.append((w.unsqueeze(-1) * latent_dense).sum(dim=1))
+        return torch.stack(context_modes, dim=1)
 
     def forward(self,
                 points: torch.Tensor,
@@ -586,84 +447,66 @@ class TransolverModalFRF(nn.Module):
         if node_counts is None:
             node_counts = batch.bincount().tolist()
 
-        node_features_safe = sanitize_feature_tensor(node_features, 20.0).to(points.dtype)
+        node_features_full = sanitize_feature_tensor(node_features, 20.0).to(points.dtype)
+        node_features_modal = make_modal_structural_features(node_features_full).to(points.dtype)
 
-        # --- 编码 ---
+        # --- 编码：omega/phi 只使用结构本征特征，不看 C / excitation / tool distance ---
         latent, latent_dense, mask = self.encode(
-            points, node_features_safe, edge_index=edge_index, node_counts=node_counts)
+            points, node_features_modal, edge_index=edge_index, node_counts=node_counts)
         global_latent = self.global_pool(latent_dense, mask)
-        branch_features = self.global_feature_summary(node_features_safe, node_counts)
+        branch_features = self.global_feature_summary(node_features_full, node_counts)
 
-        # --- 固有频率 ---
-        # CNN 同款单调 gap head：w1 + gap21 + gap32
+        # --- 固有频率：clean structural latent → monotonic gap head ---
         out = self.omega_head(global_latent)
         out = torch.nan_to_num(out.float(), nan=0.0, posinf=20.0, neginf=-20.0).clamp(-20.0, 20.0).to(global_latent.dtype)
 
         w1 = F.softplus(out[:, 0:1]) * self.omega_w1_scale + self.omega_w1_base
         gap21 = F.softplus(out[:, 1:2]) * self.omega_gap21_scale + self.omega_gap21_min
         gap32 = F.softplus(out[:, 2:3]) * self.omega_gap32_scale + self.omega_gap32_min
-
         w2 = w1 + gap21
         w3 = w2 + gap32
-
-        omega = torch.cat([w1, w2, w3], dim=-1)  # (B, 3), rad/s
+        omega = torch.cat([w1, w2, w3], dim=-1)
         omega = torch.nan_to_num(omega.float(), nan=1.0, posinf=60000.0, neginf=1.0).clamp(1.0, 60000.0).to(global_latent.dtype)
 
-        # --- 模态振型（三向）：先验 + 畸变双轨制 ---
-        # A. 结构先验振型：仅依赖空间/边界信息
-        prior_phi_flat = self.prior_phi_head(latent_dense)  # (B, N, K*3)
-
-        # B. 融合全局与局部特征，预测畸变
+        # --- 模态振型：clean structural latent → prior + SIREN delta ---
+        prior_phi_flat = self.prior_phi_head(latent_dense)
         B_N = latent_dense.shape[:2]
         global_expanded = global_latent.unsqueeze(1).expand(-1, B_N[1], -1)
-        fused_latent = torch.cat([global_expanded, latent_dense], dim=-1)  # (B, N, hidden*2)
-        delta_phi_flat = self.fusion_mlp(fused_latent)  # (B, N, K*3)
-
-        # C. 最终振型 = 先验 + 畸变 (此时形状为 B, N_max, K*3)
+        fused_latent = torch.cat([global_expanded, latent_dense], dim=-1)
+        delta_phi_flat = self.fusion_mlp(fused_latent)
         final_phi_flat = prior_phi_flat + delta_phi_flat
-        modal_phi_coeff = None  # 不再有 branch_coeff
-
-        # 解包：把 Dense 填充张量剔除虚拟节点，恢复为 (total_N, K*3)
         final_phi_unpadded = unpad_batch(final_phi_flat, node_counts)
         phi_xyz = final_phi_unpadded.view(-1, self.n_modes, 3)
+        phi_xyz = torch.nan_to_num(phi_xyz.float(), nan=0.0, posinf=20.0, neginf=-20.0).clamp(-20.0, 20.0).to(global_latent.dtype)
 
-        # --- 方向感知投影 ---
-        phi_response = phi_xyz[..., self.response_dir_index]  # (total_N, K)
-        phi_force = phi_xyz[..., self.force_dir_index]        # (total_N, K)
+        phi_response = phi_xyz[..., self.response_dir_index]
+        phi_force = phi_xyz[..., self.force_dir_index]
 
-        # --- 阻尼比（渐进式物理融合） ---
-        # 1. 数据驱动路径：纯数据预测，用于训练早期热启动
-        zeta_direct = F.softplus(self.zeta_direct_head(global_latent)) + 1e-4  # (B, K)
+        # --- 阻尼比：可先在 loss 中关闭。物理路径仍允许使用 boundary_c_xyz。 ---
+        zeta_direct = F.softplus(self.zeta_direct_head(global_latent)) + 1e-4
         zeta_direct = torch.nan_to_num(zeta_direct.float(), nan=0.003, posinf=1.0, neginf=1e-4).clamp(1e-4, 1.0).to(global_latent.dtype)
 
-        # 2. 物理路径：物理耗散基底 + 非线性残差修正
         if boundary_c_xyz is not None:
             boundary_c_xyz = torch.nan_to_num(boundary_c_xyz.float(), nan=0.0, posinf=1e6, neginf=-1e6).clamp(-1e6, 1e6).to(phi_xyz.dtype)
             phi_xyz_dense, _ = pad_batch(phi_xyz, node_counts)
             boundary_c_xyz_dense, _ = pad_batch(boundary_c_xyz, node_counts)
-
             zeta_phys = self.compute_physics_zeta(phi_xyz_dense, boundary_c_xyz_dense, omega, mask)
             mode_context = self.mode_weighted_pool(latent_dense, phi_xyz_dense, boundary_c_xyz_dense, mask)
-            zeta_residual = self.zeta_mode_residual_head(mode_context).squeeze(-1)  # (B, K)
-            # 0.5 允许网络进行 ±60% 的修正（exp(0.5)≈1.65, exp(-0.5)≈0.61）
+            zeta_residual = self.zeta_mode_residual_head(mode_context).squeeze(-1)
             zeta_phys_corrected = zeta_phys * torch.exp(0.5 * torch.tanh(zeta_residual))
             zeta_phys_corrected = torch.nan_to_num(zeta_phys_corrected.float(), nan=0.003, posinf=1.0, neginf=1e-4).clamp(1e-4, 1.0).to(global_latent.dtype)
         else:
-            # 无边界阻尼信息时，物理路径退化为数据路径
             zeta_phys_corrected = zeta_direct
 
-        # 3. 渐进式融合：alpha=0 纯数据驱动，alpha=1 纯物理路径
         zeta = (1.0 - physics_alpha) * zeta_direct + physics_alpha * zeta_phys_corrected
         zeta = torch.nan_to_num(zeta.float(), nan=0.003, posinf=1.0, neginf=1e-4).clamp(1e-4, 1.0).to(global_latent.dtype)
 
-        # --- FRF 物理重建 ---
         frf = None
         phi_force_exc = None
         if excitation_index is not None:
-            phi_force_exc = phi_force[excitation_index.long()]  # (B, K)
+            phi_force_exc = phi_force[excitation_index.long()]
             if frequencies is not None:
-                frf = self.physics(phi_response, phi_force_exc,
-                                   omega, zeta, frequencies, batch)
+                frf = self.physics(phi_response, phi_force_exc, omega, zeta, frequencies, batch)
 
         return {
             'frf': frf,
@@ -673,7 +516,7 @@ class TransolverModalFRF(nn.Module):
             'modal_phi_response': phi_response,
             'modal_phi_force': phi_force,
             'modal_phi_exc_force': phi_force_exc,
-            'modal_phi_coeff': modal_phi_coeff,
+            'modal_phi_coeff': None,
             'branch_global_features': branch_features,
             'response_dir_index': self.response_dir_index,
             'force_dir_index': self.force_dir_index,
