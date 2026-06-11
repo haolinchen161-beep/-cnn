@@ -102,7 +102,7 @@ def train(args, config, model_cfg, net, dataloader, optimizer,
                         phi_exc_corrected = phi_exc.clone()
                         for i in range(int(batch_idx_t.max().item()) + 1):
                             mask = (batch_idx_t == i)
-                            dot = torch.sum(phi_scan[mask] * modal_phi[mask], dim=0)
+                            dot = torch.sum(phi_scan[mask] * modal_phi[mask], dim=(0, 2))
                             phi_exc_corrected[i] = phi_exc[i] * torch.sign(dot + 1e-8)
                         phi_exc = phi_exc_corrected
 
@@ -263,8 +263,8 @@ def train(args, config, model_cfg, net, dataloader, optimizer,
 
 
 def _compute_phi_metrics(phi_pred, phi_target, batch_idx):
-    """逐图计算 φn (NRMSE%) 和 φa (范数误差%)，返回 per-mode [K]."""
-    dot = torch.sum(phi_pred * phi_target, dim=0, keepdim=True)
+    """逐图计算 φn (NRMSE%) 和 φa (范数误差%)，phi 为 [N,K,3]。返回 per-mode [K]."""
+    dot = torch.sum(phi_pred * phi_target, dim=(0, 2), keepdim=True)
     sign = torch.sign(dot + 1e-8)
     aligned_target = phi_target * sign
 
@@ -272,15 +272,15 @@ def _compute_phi_metrics(phi_pred, phi_target, batch_idx):
     nrmse_list, norm_err_list = [], []
     for i in range(n_graphs):
         mask = (batch_idx == i)
-        p = phi_pred[mask]
+        p = phi_pred[mask]   # [N, K, 3]
         t = aligned_target[mask]
-        # φn: RMSE / (max-min) * 100
-        rmse = torch.sqrt(torch.mean((p - t) ** 2, dim=0))
-        ptp = t.max(dim=0)[0] - t.min(dim=0)[0] + 1e-8
+        # φn: 三维 RMSE / (max-min)，沿 (N, XYZ) 两维
+        rmse = torch.sqrt(torch.mean((p - t) ** 2, dim=(0, 2)))
+        ptp = t.amax(dim=(0, 2)) - t.amin(dim=(0, 2)) + 1e-8
         nrmse_list.append(rmse / ptp * 100.0)
-        # φa: |norm(p)-norm(t)| / norm(t) * 100
-        norm_p = torch.norm(p, dim=0)
-        norm_t = torch.norm(t, dim=0) + 1e-8
+        # φa: 三维总体范数误差
+        norm_p = torch.sqrt(torch.sum(p ** 2, dim=(0, 2)))
+        norm_t = torch.sqrt(torch.sum(t ** 2, dim=(0, 2))) + 1e-8
         norm_err_list.append(torch.abs(norm_p - norm_t) / norm_t * 100.0)
     phi_n = torch.stack(nrmse_list, dim=0).mean(dim=0)  # [K]
     phi_a = torch.stack(norm_err_list, dim=0).mean(dim=0)  # [K]
@@ -351,7 +351,7 @@ def _generate_preds(args, config, net, dataloader, phase1=False):
                         with torch.no_grad():
                             _, _, _, _, phi_scan = net(img_i, c_i, None, None, bt_i,
                                                        node_xyz=_nx_i, node_features=_nf_i)
-                        dot = torch.sum(phi_scan.squeeze(0) * batch['modal_phi'].to(args.device)[m], dim=0)
+                        dot = torch.sum(phi_scan.squeeze(0) * batch['modal_phi'].to(args.device)[m], dim=(0, 2))
                         pe_i = pe_i * torch.sign(dot + 1e-8).unsqueeze(0)
                     r = net(img_i, c_i, freqs_i.unsqueeze(0).to(args.device), pe_i, bt_i,
                             node_xyz=_nx_i, node_features=_nf_i)
@@ -375,7 +375,7 @@ def _generate_preds(args, config, net, dataloader, phase1=False):
                     phi_exc_c = phi_exc.clone()
                     for i in range(int(bt.max().item()) + 1):
                         m = (bt == i)
-                        dot = torch.sum(phi_scan[m] * modal_phi[m], dim=0)
+                        dot = torch.sum(phi_scan[m] * modal_phi[m], dim=(0, 2))
                         phi_exc_c[i] = phi_exc[i] * torch.sign(dot + 1e-8)
                     phi_exc = phi_exc_c
                 r = net(img, coords, frequencies, phi_exc, bt,
