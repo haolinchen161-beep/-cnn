@@ -20,6 +20,44 @@ import torch.nn.functional as F
 from .physics_decoder import ModalFRFDecoder
 
 
+# ---------------------------------------------------------------------------
+# SIREN: 正弦表示网络，用于拟合高频空间畸变
+# ---------------------------------------------------------------------------
+class Sine(nn.Module):
+    """SIREN 的正弦激活函数。"""
+    def __init__(self, w0: float = 30.0):
+        super().__init__()
+        self.w0 = w0
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return torch.sin(self.w0 * x)
+
+
+class SirenLayer(nn.Module):
+    """带有严格频率初始化的 SIREN 线性层。"""
+    def __init__(self, dim_in: int, dim_out: int, w0: float = 30.0, is_first: bool = False):
+        super().__init__()
+        self.linear = nn.Linear(dim_in, dim_out)
+        self.activation = Sine(w0)
+        self.is_first = is_first
+        self.w0 = w0
+        self._init_weights()
+
+    def _init_weights(self):
+        with torch.no_grad():
+            if self.is_first:
+                b = 1.0 / self.linear.in_features
+                self.linear.weight.uniform_(-b, b)
+            else:
+                b = math.sqrt(6.0 / self.linear.in_features) / self.w0
+                self.linear.weight.uniform_(-b, b)
+            if self.linear.bias is not None:
+                self.linear.bias.uniform_(-b, b)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.activation(self.linear(x))
+
+
 def sanitize_feature_tensor(x: torch.Tensor, clamp_value: float = 20.0) -> torch.Tensor:
     """Remove NaN/Inf and clamp feature scale before any network layer.
 
@@ -273,14 +311,22 @@ class TransolverModalFRF(nn.Module):
             nn.Linear(hidden_dim, hidden_dim), nn.GELU(),
             nn.Linear(hidden_dim, n_modes),
         )
-        self.phi_head = DeepONetPhiHead(
-            hidden_dim=hidden_dim,
-            node_feat_dim=in_dim,
-            n_modes=n_modes,
-            rank=phi_rank,
-            dropout=dropout,
-            branch_extra_dim=self.branch_stats_dim,
+        # 2. 先验通道：从节点特征直接映射出结构先验振型
+        self.prior_phi_head = nn.Linear(hidden_dim, n_modes * 3)
+
+        # 3. 非线性融合层 (SIREN)：预测因切削带来的高频高阶畸变 (Delta Phi)
+        siren_w0 = 10.0
+        self.fusion_mlp = nn.Sequential(
+            SirenLayer(hidden_dim * 2, hidden_dim * 2, w0=siren_w0, is_first=True),
+            SirenLayer(hidden_dim * 2, hidden_dim, w0=siren_w0, is_first=False),
+            SirenLayer(hidden_dim, hidden_dim, w0=siren_w0, is_first=False),
+            nn.Linear(hidden_dim, n_modes * 3),
         )
+        # 严格初始化最后一层，防止破坏 SIREN 频率波段
+        with torch.no_grad():
+            b = math.sqrt(6.0 / hidden_dim) / siren_w0
+            self.fusion_mlp[-1].weight.uniform_(-b, b)
+            self.fusion_mlp[-1].bias.uniform_(-b, b)
 
         self.zeta_context_gate = nn.Sequential(
             nn.Linear(hidden_dim + 2, hidden_dim),
@@ -563,11 +609,23 @@ class TransolverModalFRF(nn.Module):
         omega = torch.cat([w1, w2, w3], dim=-1)  # (B, 3), rad/s
         omega = torch.nan_to_num(omega.float(), nan=1.0, posinf=60000.0, neginf=1.0).clamp(1.0, 60000.0).to(global_latent.dtype)
 
-        # --- 模态振型（三向）---
-        # DeepONet branch-trunk head: global latent + structured physical descriptor 给模态系数
-        modal_phi_coeff = self.phi_head.branch_coeff(global_latent, branch_features)
-        basis = self.phi_head.trunk_basis(points, node_features_safe)
-        phi_xyz = self.phi_head.combine(modal_phi_coeff, basis, batch)
+        # --- 模态振型（三向）：先验 + 畸变双轨制 ---
+        # A. 结构先验振型：仅依赖空间/边界信息
+        prior_phi_flat = self.prior_phi_head(latent_dense)  # (B, N, K*3)
+
+        # B. 融合全局与局部特征，预测畸变
+        B_N = latent_dense.shape[:2]
+        global_expanded = global_latent.unsqueeze(1).expand(-1, B_N[1], -1)
+        fused_latent = torch.cat([global_expanded, latent_dense], dim=-1)  # (B, N, hidden*2)
+        delta_phi_flat = self.fusion_mlp(fused_latent)  # (B, N, K*3)
+
+        # C. 最终振型 = 先验 + 畸变 (此时形状为 B, N_max, K*3)
+        final_phi_flat = prior_phi_flat + delta_phi_flat
+        modal_phi_coeff = None  # 不再有 branch_coeff
+
+        # 解包：把 Dense 填充张量剔除虚拟节点，恢复为 (total_N, K*3)
+        final_phi_unpadded = unpad_batch(final_phi_flat, node_counts)
+        phi_xyz = final_phi_unpadded.view(-1, self.n_modes, 3)
 
         # --- 方向感知投影 ---
         phi_response = phi_xyz[..., self.response_dir_index]  # (total_N, K)
