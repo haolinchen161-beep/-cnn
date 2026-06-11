@@ -16,7 +16,8 @@ def _mac_per_graph(phi_pred, phi_target):
 def modal_loss(omega_phys_pred, omega_phys_target,
                log_zeta_pred, zeta_target,
                phi_pred, phi_target, batch_idx=None,
-               omega_weight=200.0, zeta_weight=100.0, phi_weight=1.0):
+               omega_weight=200.0, zeta_weight=100.0, phi_weight=1.0,
+               effm_target=None):
     """
     CNN-ModalV2 模态损失。
 
@@ -28,6 +29,7 @@ def modal_loss(omega_phys_pred, omega_phys_target,
         phi_pred:         [N,K,3] 或 [B,N,K,3] 预测三维振型
         phi_target:       [N,K,3] 或 [B,N,K,3] 真实三维振型
         batch_idx:        [N,]   批次索引 (phi 为 [N,K,3] 时)
+        effm_target:      [B,K,3] 模态有效质量，用于方向加权 MSE
     """
 
     # ====================================================
@@ -71,7 +73,16 @@ def modal_loss(omega_phys_pred, omega_phys_target,
 
     phi_pred_norm = phi_pred / p_std_view
     phi_target_norm = aligned_target / t_std_view
-    raw_phi_mse = F.mse_loss(phi_pred_norm, phi_target_norm)
+
+    # 基于有效质量的物理方向加权: Z 向主导 → Z 向误差惩罚更重
+    if effm_target is not None and batch_idx is not None:
+        effm_node = effm_target[batch_idx]                      # [B,K,3] → [N,K,3]
+        sum_effm = torch.sum(effm_node, dim=2, keepdim=True) + 1e-8
+        direc_weight = effm_node / sum_effm * 3.0               # [N,K,3] 各向之和=3
+        mse_elements = F.mse_loss(phi_pred_norm, phi_target_norm, reduction='none')
+        raw_phi_mse = torch.mean(mse_elements * direc_weight)
+    else:
+        raw_phi_mse = F.mse_loss(phi_pred_norm, phi_target_norm)
 
     # MAC: 三维，尺度无关
     if batch_idx is not None:
