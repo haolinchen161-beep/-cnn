@@ -86,8 +86,11 @@ def modal_loss(omega_phys_pred, omega_phys_target,
         mac = _mac_per_graph(phi_pred, aligned_target)
         loss_mac = (1.0 - mac).mean()
 
-    # Std Ratio: 预测/真实的幅值比例，clip 防极端样本 (某些 Mode2/3 std≈0.01)
-    loss_std = torch.mean(torch.clamp(torch.abs(p_std / (t_std + 1e-8) - 1.0), max=5.0))
+    # Std Ratio (对数域): 解决 PhiScaleHead 初始偏差大时 clamp 截断梯度的问题
+    # 对数域 smooth_l1 无论偏差几十倍还是几百倍，梯度始终稳定回传
+    log_p_std = torch.log(p_std)
+    log_t_std = torch.log(t_std + 1e-8)
+    loss_std = F.smooth_l1_loss(log_p_std, log_t_std)
 
     # 归一化后 MSE 在 0~2 之间 (unit std 向量差), MAC 在 0~1
     # MAC (用于日志): 逐模态 [K]
