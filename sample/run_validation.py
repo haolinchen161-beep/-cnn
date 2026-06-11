@@ -39,7 +39,7 @@ DEFAULT_CONFIG = {
 
     'modal_loss_weights': {
         'omega': 20.0,              # 极高权重，强迫网络咬死刚度退化
-        'zeta': 1.0,
+        'zeta': 0.0,
         'phi_resp': 1.0,            # 响应方向振型复合损失
         'phi_xyz': 0.5,             # 三向振型复合损失
         'mac': 0.05,
