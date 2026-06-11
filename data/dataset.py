@@ -161,6 +161,9 @@ class GeometricHDF5Dataset(Dataset):
             for key in ['modal_omega', 'modal_zeta', 'modal_phi', 'modal_phi_exc']:
                 if key in grp:
                     val = torch.from_numpy(grp[key][:]).float()
+                    # modal_phi_exc 新版为 [K,3]，取 Z 向分量用于 FRF 激励
+                    if key == 'modal_phi_exc' and val.ndim == 2 and val.shape[1] == 3:
+                        val = val[:, 2]  # [K, 3] → [K]
                     out[key] = val
 
         # ω 归一化到 [0,1] (sigmoid 输出空间)
