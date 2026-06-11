@@ -1,277 +1,395 @@
-"""Training and evaluation loop for Transolver modal-FRF model."""
-from __future__ import annotations
+"""
+trainer.py — GrooveTransFRF 两阶段训练循环 + 评估。
 
+训练策略: Phase1 (纯模态) → 动态解锁 → Phase2 (模态+FRF)
+
+数据流:
+    geometry + frequencies → net → per_point_frf (B, N, n_freqs[, out_dim])
+    损失: modal_loss (ω, ζ, φ) + frf_loss (物理约束)
+"""
 import os
-from typing import Dict, Optional
-
+import numpy as np
 import torch
-import torch.nn as nn
-
-from .losses import total_loss
-
-
-def move_batch_to_device(batch: Dict, device: str) -> Dict:
-    out = {}
-    for key, value in batch.items():
-        out[key] = value.to(device) if isinstance(value, torch.Tensor) else value
-    return out
+import torch.nn.functional as F
+from .losses import modal_loss, frf_loss
 
 
-class TransolverTrainer:
-    """Small trainer for variable-size mesh batches."""
+def train(args, config, model_cfg, net, dataloader, optimizer,
+          valloader, scheduler, logger=None, start_epoch=0):
+    """
+    GrooveTransFRF 两阶段训练循环。
 
-    def __init__(self,
-                 model: nn.Module,
-                 optimizer: torch.optim.Optimizer,
-                 device: str = 'cpu',
-                 scheduler: Optional[torch.optim.lr_scheduler._LRScheduler] = None,
-                 fp16: bool = False):
-        self.model = model.to(device)
-        self.optimizer = optimizer
-        self.device = device
-        self.scheduler = scheduler
-        self.scaler = torch.cuda.amp.GradScaler(enabled=fp16)
-        self.fp16 = fp16
+    阶段1 (0 ~ 动态解锁):      全解冻纯模态, 仅 modal_loss
+    阶段2 (动态解锁 ~ total):  模态+FRF 弱约束
+    """
+    lowest = np.inf
+    net.train()
+    scaler = torch.cuda.amp.GradScaler(enabled=args.fp16)
 
-    def forward_batch(self, batch: Dict, config: Dict | None = None) -> Dict[str, torch.Tensor]:
-        # 根据 use_frf_loss 决定是否传入 frequencies（节省计算）
-        use_frf = True if config is None else config.get('use_frf_loss', False)
-        # 渐进式物理融合权重：训练时由 epoch 计算，评估时默认 1.0（纯物理）
-        physics_alpha = 1.0 if config is None else config.get('physics_alpha', 1.0)
+    total_epochs = config.get('epochs', 2000)
+    frf_weight = config.get('frf_loss_weight', 0.05)
+    freq_warmup_epochs = config.get('freq_warmup_epochs', 80)
+    zeta_warmup_epochs = config.get('zeta_warmup_epochs', 40)
 
-        return self.model(
-            points=batch['points'],
-            node_features=batch['node_features'],
-            batch=batch['batch'],
-            edge_index=batch.get('edge_index'),
-            boundary_c_xyz=batch.get('boundary_c_xyz'),
-            excitation_index=batch.get('excitation_index'),
-            frequencies=batch.get('frequencies') if use_frf else None,
-            num_graphs=batch.get('num_graphs'),
-            node_counts=batch.get('node_counts'),
-            physics_alpha=physics_alpha,
-        )
-
-    def train_epoch(self, loader, config: Dict, epoch: int = 0) -> Dict[str, float]:
-        import time
-        self.model.train()
-        sums, count = {}, 0
-
-        # 渐进式物理融合：前 warmup_epochs 从 0 线性升到 1
-        # epoch=0 时 alpha≈0（纯数据驱动），epoch=warmup 时 alpha=1（纯物理路径）
-        warmup_epochs = config.get('physics_alpha_warmup', 50)
-        physics_alpha = min(1.0, epoch / max(warmup_epochs, 1))
-        config['physics_alpha'] = physics_alpha
-
-        t_fwd = t_bwd = 0.0
-        t_wait = 0.0  # DataLoader 批次间等待（含 HDF5 读盘）
-        t_loop_start = time.time()
-        for batch in loader:
-            t_wait += time.time() - t_loop_start  # 等 DataLoader 出下一批的时间
-
-            batch = move_batch_to_device(batch, self.device)
-            t0 = time.time()
-
-            self.optimizer.zero_grad(set_to_none=True)
-            with torch.cuda.amp.autocast(enabled=self.fp16):
-                outputs = self.forward_batch(batch, config)
-                loss, logs = total_loss(outputs, batch, config)
-            torch.cuda.synchronize()
-            t_fwd += time.time() - t0
-
-            t0 = time.time()
-            self.scaler.scale(loss).backward()
-            grad_clip = config.get('gradient_clip', 1.0)
-            if grad_clip is not None:
-                self.scaler.unscale_(self.optimizer)
-                torch.nn.utils.clip_grad_norm_(self.model.parameters(), grad_clip)
-            self.scaler.step(self.optimizer)
-            self.scaler.update()
-            torch.cuda.synchronize()
-            t_bwd += time.time() - t0
-
-            for key, value in logs.items():
-                sums[key] = sums.get(key, 0.0) + float(value.detach().cpu())
-            count += 1
-            t_loop_start = time.time()
-
-        if count > 0 and epoch % 10 == 0:
-            print(f"  [计时] epoch {epoch}: wait={t_wait:.1f}s fwd={t_fwd:.1f}s bwd={t_bwd:.1f}s ({count}批)")
-
-        if self.scheduler is not None:
-            self.scheduler.step()
-        return {key: value / max(1, count) for key, value in sums.items()}
-
-    @torch.no_grad()
-    def evaluate(self, loader, config: Dict) -> Dict[str, float]:
-        self.model.eval()
-        sums, count = {}, 0
-        for batch in loader:
-            batch = move_batch_to_device(batch, self.device)
-            outputs = self.forward_batch(batch, config)
-            # total_loss 返回当前 loss 结构下的评估日志
-            _, logs = total_loss(outputs, batch, config)
-            for key, value in logs.items():
-                sums[key] = sums.get(key, 0.0) + float(value.detach().cpu())
-            count += 1
-        metrics = {key: value / max(1, count) for key, value in sums.items()}
-        # 从对齐后的 loss 中提取真实的 ω_rel 和 zeta_rel
-        metrics['omega_rel'] = metrics.get('loss_omega', 0.0)
-        zeta_k_sum = sum([metrics.get(f'zeta_k{k}', 0.0) for k in range(3)])
-        metrics['zeta_rel'] = zeta_k_sum / 3.0
-        return metrics
-
-
-def save_checkpoint(path: str, model: nn.Module, optimizer, epoch: int, metrics: Dict[str, float]) -> None:
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    torch.save({
-        'epoch': epoch,
-        'model_state_dict': model.state_dict(),
-        'optimizer_state_dict': optimizer.state_dict() if optimizer is not None else None,
-        'metrics': metrics,
-        'loss': metrics.get('loss_total', metrics.get('loss_modal', 0.0)),
-    }, path)
-
-
-def train(args, config, model_cfg, net, dataloader, optimizer, valloader, scheduler=None, logger=None, start_epoch=0):
-    """训练入口，供 sample/run_validation.py 调用。"""
+    # 损失日志
     import csv
+    os.makedirs(args.dir, exist_ok=True)
+    log_path = os.path.join(args.dir, "loss_log.csv")
+    log_exists = os.path.exists(log_path) and start_epoch > 0
+    log_file = open(log_path, 'a', newline='')
+    log_writer = csv.writer(log_file)
+    if not log_exists:
+        log_writer.writerow(['轮次', '训练损失', 'w1%','w2%','w3%', 'z1%','z2%','z3%', 'φloss', 'MAC1','MAC2','MAC3', 'w占比%','z占比%','phi占比%','FRF占比%', '验证MSE', '幅值MAE', '幅值MAPE%', '学习率'])
 
-    trainer = TransolverTrainer(net, optimizer, device=args.device, scheduler=scheduler, fp16=getattr(args, 'fp16', False))
-    best = float('inf')
-    epochs = config.get('epochs', 200)
-    out_dir = getattr(args, 'dir', 'output')
+    phase2_unlocked = False
+    unlock_epoch = start_epoch
 
-    # 打开 CSV 日志
-    csv_path = os.path.join(out_dir, 'training_log.csv')
-    csv_file = open(csv_path, 'w', newline='', encoding='utf-8')
-    csv_writer = csv.writer(csv_file)
-    # CSV 表头
-    csv_header = ['epoch', 'lr',
-                  'total',  # 加权总损失
-                  'omega', 'zeta', 'phi_resp', 'phi_xyz', 'mac',  # 原始损失值
-                  'omega%', 'zeta%', 'phi_resp%', 'phi_xyz%',  # 损失占比(%)
-                  'omega_k0', 'omega_k1', 'omega_k2',
-                  'zeta_k0', 'zeta_k1', 'zeta_k2',
-                  'phi_k0', 'phi_k1', 'phi_k2',
+    try:
+      for epoch in range(start_epoch, total_epochs):
+        losses, omega_losses, zeta_losses, mac_losses = [], [], [], []
+        weighted_w_losses, weighted_z_losses, weighted_p_losses = [], [], []
 
-                  # 新增细分振型损失
-                  'z_shape', 'z_scale', 'part', 'xyz_shape', 'xyz_energy',
-                  'z_scale_k0', 'z_scale_k1', 'z_scale_k2',
-                  'part_k0', 'part_k1', 'part_k2',
+        in_phase1 = not phase2_unlocked
+        in_phase2 = phase2_unlocked
 
-                  'frf', 'frf_complex', 'frf_log_amp', 'frf_db',
-                  'val_total', 'omega_rel', 'zeta_rel',
-                  'val_phi_k0', 'val_phi_k1', 'val_phi_k2']
-    csv_writer.writerow(csv_header)
+        # 阶段切换
+        if in_phase1 and epoch == 0:
+            _log("=== 阶段1: 纯模态训练 (enable_phase2=False, FRF 未解锁) ===", logger)
+        elif in_phase2 and epoch > 0 and not getattr(net, '_phase2_logged', False):
+            _log(f"=== 阶段2: FRF 联合训练 (第 {epoch} 轮解锁) ===", logger)
+            net._phase2_logged = True
+            lowest = np.inf
 
-    # 损失权重
-    mw = config.get('modal_loss_weights', {})
-    w_omega = mw.get('omega', 1.0)
-    w_zeta = mw.get('zeta', 0.5)
-    w_phi_resp = mw.get('phi_resp', 1.0)
-    w_phi_xyz = mw.get('phi_xyz', 0.25)
-    w_mac = mw.get('mac', 0.2)
-    w_frf = config.get('frf_loss_weight', 1.0)
+        # phi+omega 从 epoch 0 同步训练，omega_w=1 (Hz-space), phi_w=3 (平衡)
+        # zeta 前80轮停训防 spike
+        current_phi_w = 3.0
+        current_zeta_w = 0.0 if epoch < zeta_warmup_epochs else 10.0
+        current_omega_w = 1.0
 
-    def _r4(v):
-        """四舍五入到 4 位小数"""
-        return round(float(v), 4) if isinstance(v, (int, float, torch.Tensor)) else v
+        for batch in dataloader:
+            optimizer.zero_grad()
 
-    for epoch in range(start_epoch, epochs):
-        train_logs = trainer.train_epoch(dataloader, config, epoch)
+            img = batch['image_tensor'].to(args.device)
+            coords = batch['query_coords'].to(args.device)
+            batch_idx_t = batch['batch'].to(args.device)
 
-        # 当前学习率
+            # Node 信息 (传给 NodePhiRefiner)
+            node_xyz = batch.get('node_xyz')
+            node_features = batch.get('node_features')
+            node_xyz = node_xyz.to(args.device) if node_xyz is not None else None
+            node_features = node_features.to(args.device) if node_features is not None else None
+
+            with torch.cuda.amp.autocast(enabled=args.fp16):
+                if in_phase2:
+                    phase2_epoch = epoch - unlock_epoch
+                    alpha = max(1.0, 10.0 - 9.0 * phase2_epoch / 200.0)
+                    frequencies = batch['frequencies'].to(args.device)
+                    phi_exc = batch.get('modal_phi_exc')
+                    phi_exc = phi_exc.to(args.device) if phi_exc is not None else None
+
+                    # φ_exc 符号对齐
+                    if phi_exc is not None:
+                        with torch.no_grad():
+                            _, _, _, _, phi_scan = net(img, coords, None, None, batch_idx_t,
+                                                       node_xyz=node_xyz, node_features=node_features)
+                        modal_phi = batch['modal_phi'].to(args.device)
+                        phi_exc_corrected = phi_exc.clone()
+                        for i in range(int(batch_idx_t.max().item()) + 1):
+                            mask = (batch_idx_t == i)
+                            dot = torch.sum(phi_scan[mask] * modal_phi[mask], dim=0)
+                            phi_exc_corrected[i] = phi_exc[i] * torch.sign(dot + 1e-8)
+                        phi_exc = phi_exc_corrected
+
+                    frf_pred, omega_phys_pred, log_zeta_pred, zeta_pred, phi_pred = net(
+                        img, coords, frequencies, phi_exc, batch_idx_t, alpha=alpha,
+                        node_xyz=node_xyz, node_features=node_features)
+
+                    loss_m, l_w, l_z, l_p, mac_val = modal_loss(
+                        omega_phys_pred, batch['modal_omega_phys'].to(args.device),
+                        log_zeta_pred, batch['modal_zeta'].to(args.device),
+                        phi_pred, batch['modal_phi'].to(args.device),
+                        batch_idx=batch_idx_t,
+                        omega_weight=current_omega_w, zeta_weight=current_zeta_w,
+                        phi_weight=current_phi_w)
+                    mac_losses.append(mac_val.detach().cpu().numpy())
+
+                    raw_frf = frf_loss(frf_pred, batch['point_frf'].to(args.device))
+                    phase2_ep = epoch - unlock_epoch
+                    frf_warmup = config.get('frf_warmup_epochs', 20)
+                    current_frf_w = frf_weight * min(1.0, phase2_ep / max(frf_warmup, 1))
+                    loss = loss_m + current_frf_w * raw_frf
+                else:
+                    _, omega_phys_pred, log_zeta_pred, zeta_pred, phi_pred = net(
+                        img, coords, None, None, batch_idx_t,
+                        node_xyz=node_xyz, node_features=node_features)
+
+                    loss_m, l_w, l_z, l_p, mac_val = modal_loss(
+                        omega_phys_pred, batch['modal_omega_phys'].to(args.device),
+                        log_zeta_pred, batch['modal_zeta'].to(args.device),
+                        phi_pred, batch['modal_phi'].to(args.device),
+                        batch_idx=batch_idx_t,
+                        omega_weight=current_omega_w, zeta_weight=current_zeta_w,
+                        phi_weight=current_phi_w)
+                    loss = loss_m
+                    mac_losses.append(mac_val.detach().cpu().numpy())
+
+            losses.append(loss.detach().cpu().item())
+
+            # 日志: 物理单位直接算相对误差，OmegaHead 保证单调无需 sort
+            omega_target = batch['modal_omega_phys'].to(args.device)
+            omega_rel_err = torch.abs(omega_phys_pred - omega_target) / (omega_target + 1e-8)
+            omega_losses.append(omega_rel_err.mean(dim=0).detach().cpu().numpy())  # [K] per-mode
+
+            zeta_target = batch['modal_zeta'].to(args.device)
+            zeta_rel_err = torch.abs(zeta_pred - zeta_target) / (zeta_target + 1e-8)
+            zeta_losses.append(zeta_rel_err.mean(dim=0).detach().cpu().numpy())  # [K] per-mode
+
+            weighted_w_losses.append(l_w.detach().cpu().item())
+            weighted_z_losses.append(l_z.detach().cpu().item())
+            weighted_p_losses.append(l_p.detach().cpu().item())
+
+            scaler.scale(loss).backward()
+            _apply_gradient_clip(net, config)
+            scaler.step(optimizer)
+            scaler.update()
+
+        mean_loss = np.mean(losses)
+
+        if scheduler is not None:
+            scheduler.step()
+
+        if omega_losses:
+            omega_per_mode = np.stack(omega_losses).mean(axis=0) * 100
+            w_str = f'w=[{omega_per_mode[0]:.1f}/{omega_per_mode[1]:.1f}/{omega_per_mode[2]:.1f}]%'
+            omega_pct = omega_per_mode.mean()
+        else:
+            w_str = 'w=...'; omega_pct = 0; omega_per_mode = np.zeros(3)
+        if zeta_losses:
+            zeta_per_mode = np.stack(zeta_losses).mean(axis=0) * 100
+            z_str = f'z=[{zeta_per_mode[0]:.0f}/{zeta_per_mode[1]:.0f}/{zeta_per_mode[2]:.0f}]%'
+            zeta_pct = zeta_per_mode.mean()
+        else:
+            z_str = 'z=...'; zeta_pct = 0; zeta_per_mode = np.zeros(3)
+        wgt_w = np.mean(weighted_w_losses) if weighted_w_losses else 0
+        wgt_z = np.mean(weighted_z_losses) if weighted_z_losses else 0
+        wgt_p = np.mean(weighted_p_losses) if weighted_p_losses else 0
+        phi_loss = wgt_p if wgt_p > 0 else 0
+        omega_share = wgt_w / mean_loss * 100 if mean_loss > 0 else 0
+        zeta_share = wgt_z / mean_loss * 100 if mean_loss > 0 else 0
+        phi_share = wgt_p / mean_loss * 100 if mean_loss > 0 else 0
+        frf_s = 0 if in_phase1 else (100 - omega_share - zeta_share - phi_share)
+        if mac_losses:
+            mac_per_mode = np.stack(mac_losses).mean(axis=0)
+            mac_str = f'MAC=[{mac_per_mode[0]:.3f}/{mac_per_mode[1]:.3f}/{mac_per_mode[2]:.3f}]'
+            mac_scalar = mac_per_mode.mean()
+        else:
+            mac_str = 'MAC=...'; mac_scalar = 0
+        _log(f"Epoch {epoch:4d} | {w_str} {z_str} {mac_str} | w{omega_share:.0f}% z{zeta_share:.0f}% ph{phi_share:.0f}% | loss={mean_loss:.1f}", logger)
+
+        # 动态解锁: enable_phase2=True 且 epoch >= phase2_min_epoch
+        enable_phase2 = config.get('enable_phase2', False)
+        phase2_min_epoch = config.get('phase2_min_epoch', 200)
+        if not phase2_unlocked and enable_phase2 and epoch >= phase2_min_epoch:
+            phase2_unlocked = True
+            unlock_epoch = epoch
+            _log(f">>> Phase2 unlocked at epoch {epoch} (FRF weak constraint) <<<", logger)
+
         lr = optimizer.param_groups[0]['lr']
+        val_freq = config.get('validation_frequency', 5)
+        if epoch % val_freq == 0 or epoch % int(total_epochs / 10) == 0:
+            save_model(args.dir, epoch, net, optimizer, loss, "checkpoint_last")
+            if in_phase1:
+                val_results = evaluate(args, config, net, valloader, logger, epoch)
+                omega_mae = val_results.get("ω_MAE (rad/s)", -1)
+                _log(f"Epoch {epoch:4d} | ω_MAE={omega_mae:.1f} rad/s (Phase1: FRF metrics skipped)", logger)
+                log_writer.writerow([epoch, f'{mean_loss:.2e}', f'{omega_per_mode[0]:.3f}',f'{omega_per_mode[1]:.3f}',f'{omega_per_mode[2]:.3f}', f'{zeta_per_mode[0]:.1f}',f'{zeta_per_mode[1]:.1f}',f'{zeta_per_mode[2]:.1f}', f'{phi_loss:.2f}', f'{mac_per_mode[0]:.3f}',f'{mac_per_mode[1]:.3f}',f'{mac_per_mode[2]:.3f}', f'{omega_share:.1f}', f'{zeta_share:.1f}', f'{phi_share:.1f}', '0', '', '', '', f'{lr:.2e}'])
+            else:
+                val_results = evaluate(args, config, net, valloader, logger, epoch)
+                val_loss = val_results["loss (MSE)"]
+                frf_share = 100 - omega_share - zeta_share - phi_share
+                log_writer.writerow([epoch, f'{mean_loss:.2e}', f'{omega_per_mode[0]:.3f}',f'{omega_per_mode[1]:.3f}',f'{omega_per_mode[2]:.3f}', f'{zeta_per_mode[0]:.1f}',f'{zeta_per_mode[1]:.1f}',f'{zeta_per_mode[2]:.1f}', f'{phi_loss:.2f}', f'{mac_per_mode[0]:.3f}',f'{mac_per_mode[1]:.3f}',f'{mac_per_mode[2]:.3f}', f'{omega_share:.1f}', f'{zeta_share:.1f}', f'{phi_share:.1f}', f'{frf_share:.1f}', f'{val_loss:.4f}',
+                                     f'{val_results.get("Amplitude MAE", 0):.4f}',
+                                     f'{val_results.get("Amplitude MAPE (%)", 0):.2f}',
+                                     f'{lr:.2e}'])
+            log_file.flush()
 
-        # 计算各损失占比
-        raw_o = train_logs.get('loss_omega', 0)
-        raw_z = train_logs.get('loss_zeta', 0)
-        raw_p = train_logs.get('loss_phi_resp', 0)
-        raw_x = train_logs.get('loss_phi_xyz', 0)
-        raw_m = train_logs.get('loss_mac', 0)
-        raw_f = train_logs.get('loss_frf', 0)
+            # best checkpoint: 用验证集 ω_MAE (防过拟合)
+            if in_phase1:
+                best_metric = val_results.get("ω_MAE (rad/s)", omega_pct)
+                metric_name = "val_ω_MAE"
+                fmt = ".1f"
+            else:
+                best_metric = val_results["loss (MSE)"]
+                metric_name = "val_loss"
+                fmt = ".6f"
+            if best_metric < lowest:
+                _log(f"best model ({metric_name}={best_metric:{fmt}})", logger)
+                save_model(args.dir, epoch, net, optimizer, best_metric)
+                lowest = best_metric
+        else:
+            frf_s = 0 if in_phase1 else (100 - omega_share - zeta_share - phi_share)
+            log_writer.writerow([epoch, f'{mean_loss:.2e}', f'{omega_per_mode[0]:.3f}',f'{omega_per_mode[1]:.3f}',f'{omega_per_mode[2]:.3f}', f'{zeta_per_mode[0]:.1f}',f'{zeta_per_mode[1]:.1f}',f'{zeta_per_mode[2]:.1f}', f'{phi_loss:.2f}', f'{mac_per_mode[0]:.3f}',f'{mac_per_mode[1]:.3f}',f'{mac_per_mode[2]:.3f}', f'{omega_share:.1f}', f'{zeta_share:.1f}', f'{phi_share:.1f}', f'{frf_s:.1f}', '', '', '', f'{lr:.2e}'])
 
-        wv_o = w_omega * raw_o
-        wv_z = w_zeta * raw_z
-        wv_p = w_phi_resp * raw_p
-        wv_x = w_phi_xyz * raw_x
-        wv_m = w_mac * raw_m
-        wv_f = w_frf * raw_f
-        total_w = wv_o + wv_z + wv_p + wv_x + wv_m + wv_f + 1e-12
+        if epoch == (total_epochs - 1):
+            path = os.path.join(args.dir, "checkpoint_best")
+            if os.path.exists(path):
+                net.load_state_dict(torch.load(path, map_location='cpu')["model_state_dict"])
+            evaluate(args, config, net, valloader, logger, epoch, verbose=True)
 
-        pct_o = wv_o / total_w * 100
-        pct_z = wv_z / total_w * 100
-        pct_p = wv_p / total_w * 100
-        pct_x = wv_x / total_w * 100
+    finally:
+        log_file.close()
 
-        # 每轮打印（全部百分比形式 + 三阶分开展示 + 学习率）
-        omega_pct = ' '.join([f"{train_logs.get(f'omega_k{k}', 0)*100:.1f}%" for k in range(3)])
-        zeta_pct = ' '.join([f"{train_logs.get(f'zeta_k{k}', 0)*100:.1f}%" for k in range(3)])
-        phi_pct = ' '.join([f"{train_logs.get(f'phi_k{k}', 0)*100:.1f}%" for k in range(3)])
-        alpha = config.get('physics_alpha', 1.0)
-        train_msg = (f"Epoch {epoch:04d} | lr={lr:.1e} | α={alpha:.2f} | total={total_w:.3e} "
-                     f"[ω={pct_o:.0f}% ζ={pct_z:.0f}% φ_resp={pct_p:.0f}% φ_xyz={pct_x:.0f}%] "
-                     f"ω_k=[{omega_pct}] ζ_k=[{zeta_pct}] φ_k=[{phi_pct}]")
-        print(train_msg)
-
-        # 验证和保存 checkpoint 按频率触发
-        val_logs = None
-        if epoch % config.get('validation_frequency', 5) == 0 or epoch == epochs - 1:
-            val_logs = trainer.evaluate(valloader, config)
-            metric = val_logs.get('loss_total', val_logs.get('loss_modal', float('inf')))
-            val_omega_k = ' '.join(f"{val_logs.get(f'omega_k{k}', 0)*100:.1f}%" for k in range(3))
-            val_zeta_k = ' '.join(f"{val_logs.get(f'zeta_k{k}', 0)*100:.1f}%" for k in range(3))
-            val_phi_k = ' '.join(f"{val_logs.get(f'phi_k{k}', 0)*100:.1f}%" for k in range(3))
-            val_msg = (f"  -> val={metric:.4e} "
-                       f"ω_rel={val_logs.get('omega_rel', 0)*100:.1f}% "
-                       f"ζ_rel={val_logs.get('zeta_rel', 0)*100:.1f}% "
-                       f"ω_k=[{val_omega_k}] ζ_k=[{val_zeta_k}] "
-                       f"φ_resp={val_logs.get('loss_phi_resp', 0):.4f} "
-                       f"φ_xyz={val_logs.get('loss_phi_xyz', 0):.4f} "
-                       f"φ_k=[{val_phi_k}]")
-            print(val_msg)
-            save_checkpoint(os.path.join(out_dir, 'checkpoint_last'), net, optimizer, epoch, val_logs)
-            if metric < best:
-                best = metric
-                save_checkpoint(os.path.join(out_dir, 'checkpoint_best'), net, optimizer, epoch, val_logs)
-
-        # 写入 CSV
-        row = [epoch, f"{lr:.1e}", _r4(total_w),
-               _r4(raw_o), _r4(raw_z), _r4(raw_p), _r4(raw_x), _r4(raw_m),
-               _r4(pct_o), _r4(pct_z), _r4(pct_p), _r4(pct_x),
-               *[_r4(train_logs.get(f'omega_k{k}', 0) * 100) for k in range(3)],
-               *[_r4(train_logs.get(f'zeta_k{k}', 0) * 100) for k in range(3)],
-               *[_r4(train_logs.get(f'phi_k{k}', 0) * 100) for k in range(3)],
-
-               # 新增细分振型损失
-               _r4(train_logs.get('loss_phi_resp_shape', 0)),
-               _r4(train_logs.get('loss_phi_resp_scale', 0)),
-               _r4(train_logs.get('loss_phi_participation', 0)),
-               _r4(train_logs.get('loss_phi_xyz_shape', 0)),
-               _r4(train_logs.get('loss_phi_xyz_energy', 0)),
-               *[_r4(train_logs.get(f'z_scale_k{k}', 0)) for k in range(3)],
-               *[_r4(train_logs.get(f'part_k{k}', 0)) for k in range(3)],
-
-               _r4(raw_f),
-               _r4(train_logs.get('loss_frf_complex', 0)),
-               _r4(train_logs.get('loss_frf_log_amp', 0)),
-               _r4(train_logs.get('loss_frf_db', 0)),
-               _r4(val_logs.get('loss_total', '')) if val_logs else '',
-               _r4(val_logs.get('omega_rel', '')) if val_logs else '',
-               _r4(val_logs.get('zeta_rel', '')) if val_logs else '',
-               *[_r4(val_logs.get(f'phi_k{k}', 0) * 100) if val_logs else '' for k in range(3)]]
-        csv_writer.writerow(row)
-        csv_file.flush()
-
-    csv_file.close()
-    print(f"训练日志已保存: {csv_path}")
     return net
 
 
-def evaluate(args, config, net, dataloader, logger=None, epoch=None, verbose=False):
-    trainer = TransolverTrainer(net, optimizer=torch.optim.AdamW(net.parameters(), lr=1e-6), device=args.device)
-    metrics = trainer.evaluate(dataloader, config)
+def _apply_gradient_clip(net, config):
+    grad_clip = config.get('optimizer', {}).get('gradient_clip')
+    if grad_clip is None:
+        return
+    _clip_module(net, 'encoder', 3.0)
+    _clip_module(net, 'micro_decoder', 5.0)
+    _clip_module(net, 'omega_head', 2.0)
+    _clip_module(net, 'zeta_head', 2.0)
+    _clip_module(net, 'phi_refiner', 2.0)
+
+
+def _clip_module(net, prefix, max_norm):
+    params = [p for name, p in net.named_parameters()
+              if name.startswith(prefix + '.') and p.grad is not None]
+    if params:
+        torch.nn.utils.clip_grad_norm_(params, max_norm)
+
+
+def evaluate(args, config, net, dataloader, logger=None, epoch=None, verbose=True):
+    """验证/测试评估"""
+    prediction, output, omega_errs = _generate_preds(args, config, net, dataloader)
+    results = _evaluate(prediction, output, omega_errs, logger, epoch, verbose)
+    return results
+
+
+def _generate_preds(args, config, net, dataloader):
+    net.eval()
+    with torch.no_grad():
+        predictions, outputs = [], []
+        omega_errs = []
+        for batch in dataloader:
+            img = batch['image_tensor'].to(args.device)
+            coords = batch['query_coords'].to(args.device)
+            bt = batch['batch'].to(args.device)
+            target = batch['point_frf']
+            frequencies = batch['frequencies']
+            phi_exc = batch.get('modal_phi_exc')
+            omega_true = batch.get('modal_omega_phys')
+
+            _nx = batch.get('node_xyz'); _nf = batch.get('node_features')
+            _nx = _nx.to(args.device) if _nx is not None else None
+            _nf = _nf.to(args.device) if _nf is not None else None
+
+            if isinstance(frequencies, list):
+                for i, freqs_i in enumerate(frequencies):
+                    m = (bt == i)
+                    img_i = img[i:i+1]; c_i = coords[m].unsqueeze(0)
+                    bt_i = torch.zeros(m.sum(), dtype=torch.long, device=args.device)
+                    pe_i = phi_exc[i:i+1].to(args.device) if phi_exc is not None else None
+                    _nx_i = _nx[m] if _nx is not None else None
+                    _nf_i = _nf[m] if _nf is not None else None
+                    if pe_i is not None:
+                        with torch.no_grad():
+                            _, _, _, _, phi_scan = net(img_i, c_i, None, None, bt_i,
+                                                       node_xyz=_nx_i, node_features=_nf_i)
+                        dot = torch.sum(phi_scan.squeeze(0) * batch['modal_phi'].to(args.device)[m], dim=0)
+                        pe_i = pe_i * torch.sign(dot + 1e-8).unsqueeze(0)
+                    r = net(img_i, c_i, freqs_i.unsqueeze(0).to(args.device), pe_i, bt_i,
+                            node_xyz=_nx_i, node_features=_nf_i)
+                    if isinstance(r, tuple):
+                        predictions.append(r[0].squeeze(0).cpu())
+                        if omega_true is not None:
+                            omega_pred_val = r[1].cpu()  # 已是 rad/s, OmegaHead 保证单调
+                            omega_errs.append((omega_pred_val - omega_true[i]).abs())
+                    else:
+                        predictions.append(r.squeeze(0).cpu())
+                    outputs.append(target[i].cpu())
+            else:
+                target = target.to(args.device)
+                frequencies = frequencies.to(args.device)
+                phi_exc = phi_exc.to(args.device) if phi_exc is not None else None
+                if phi_exc is not None:
+                    with torch.no_grad():
+                        _, _, _, _, phi_scan = net(img, coords, None, None, bt,
+                                                   node_xyz=_nx, node_features=_nf)
+                    modal_phi = batch['modal_phi'].to(args.device)
+                    phi_exc_c = phi_exc.clone()
+                    for i in range(int(bt.max().item()) + 1):
+                        m = (bt == i)
+                        dot = torch.sum(phi_scan[m] * modal_phi[m], dim=0)
+                        phi_exc_c[i] = phi_exc[i] * torch.sign(dot + 1e-8)
+                    phi_exc = phi_exc_c
+                r = net(img, coords, frequencies, phi_exc, bt,
+                        node_xyz=_nx, node_features=_nf)
+                if isinstance(r, tuple):
+                    prediction = r[0]
+                    if omega_true is not None:
+                        omega_pred_val = r[1].detach().cpu()  # 已是 rad/s
+                        omega_errs.append((omega_pred_val - omega_true).abs())
+                else:
+                    prediction = r
+                pred_out = prediction.detach().cpu()
+                tgt_out = target.detach().cpu()
+                if pred_out.ndim == 3 and tgt_out.ndim == 4:
+                    tgt_out = tgt_out.reshape(-1, *tgt_out.shape[2:])
+                predictions.append(pred_out)
+                outputs.append(tgt_out)
+
+    try:
+        return torch.cat(predictions, dim=0), torch.cat(outputs, dim=0), omega_errs
+    except RuntimeError:
+        return predictions, outputs, omega_errs
+
+
+def _evaluate(prediction, output, omega_errs, logger, epoch, verbose=True):
+    if isinstance(prediction, list):
+        asinh_mse_vals = [F.mse_loss(p, o).item() for p, o in zip(prediction, output)]
+        results = {"loss (MSE)": np.mean(asinh_mse_vals)}
+        mae_list, mape_list = [], []
+        for p_asinh, o_asinh in zip(prediction, output):
+            p_phys = p_asinh; o_phys = o_asinh
+            p_amp = torch.sqrt(p_phys[..., 0]**2 + p_phys[..., 1]**2 + 1e-8)
+            o_amp = torch.sqrt(o_phys[..., 0]**2 + o_phys[..., 1]**2 + 1e-8)
+            mae_list.append(F.l1_loss(p_amp, o_amp).item())
+            mape_list.append((torch.abs(p_amp - o_amp) / (o_amp + 1e-6)).mean().item() * 100.0)
+        results["Amplitude MAE"] = np.mean(mae_list)
+        results["Amplitude MAPE (%)"] = np.mean(mape_list)
+    else:
+        results = {}
+        if prediction.shape != output.shape:
+            output = output.reshape(prediction.shape)
+        results["loss (MSE)"] = F.mse_loss(prediction, output).item()
+        if prediction.ndim >= 3 and prediction.shape[-1] == 2:
+            p_phys = prediction; o_phys = output
+            p_amp = torch.sqrt(p_phys[..., 0]**2 + p_phys[..., 1]**2 + 1e-8)
+            o_amp = torch.sqrt(o_phys[..., 0]**2 + o_phys[..., 1]**2 + 1e-8)
+            results["Amplitude MAE"] = F.l1_loss(p_amp, o_amp).item()
+            results["Amplitude MAPE (%)"] = (torch.abs(p_amp - o_amp) / (o_amp + 1e-6)).mean().item() * 100.0
+    if omega_errs:
+        results["ω_MAE (rad/s)"] = torch.cat([e.flatten() for e in omega_errs]).mean().item()
     if verbose:
-        print(metrics)
-    return metrics
+        for key, val in results.items():
+            _log(f"{key} = {val:4.4f}" if isinstance(val, float) else f"{key} = {val:4.4}", logger)
+    return results
+
+
+def save_model(savepath, epoch, model, optimizer, loss, name="checkpoint_best"):
+    os.makedirs(savepath, exist_ok=True)
+    torch.save({
+        'epoch': epoch,
+        'model_state_dict': model.state_dict(),
+        'optimizer_state_dict': optimizer.state_dict(),
+        'loss': loss,
+    }, os.path.join(savepath, name))
+
+
+def _log(msg, logger):
+    if logger and hasattr(logger, 'info'):
+        logger.info(msg)
+    else:
+        print(msg)
