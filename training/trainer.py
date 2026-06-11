@@ -28,7 +28,6 @@ def train(args, config, model_cfg, net, dataloader, optimizer,
 
     total_epochs = config.get('epochs', 2000)
     frf_weight = config.get('frf_loss_weight', 0.05)
-    freq_warmup_epochs = config.get('freq_warmup_epochs', 80)
     zeta_warmup_epochs = config.get('zeta_warmup_epochs', 40)
 
     # 损失日志
@@ -61,11 +60,11 @@ def train(args, config, model_cfg, net, dataloader, optimizer,
             net._phase2_logged = True
             lowest = np.inf
 
-        # phi+omega 从 epoch 0 同步训练，omega_w=1 (Hz-space), phi_w=3 (平衡)
-        # zeta 前80轮停训防 spike
-        current_phi_w = 3.0
-        current_zeta_w = 0.0 if epoch < zeta_warmup_epochs else 10.0
-        current_omega_w = 1.0
+        # phi+omega 从 epoch 0 同步训练
+        # zeta 前 zeta_warmup_epochs 轮停训防 spike
+        current_phi_w = config.get('phi_loss_weight', 3.0)
+        current_zeta_w = 0.0 if epoch < zeta_warmup_epochs else config.get('zeta_loss_weight', 10.0)
+        current_omega_w = config.get('omega_loss_weight', 1.0)
 
         for batch in dataloader:
             optimizer.zero_grad()
@@ -83,7 +82,13 @@ def train(args, config, model_cfg, net, dataloader, optimizer,
             with torch.cuda.amp.autocast(enabled=args.fp16):
                 if in_phase2:
                     phase2_epoch = epoch - unlock_epoch
-                    alpha = max(1.0, 10.0 - 9.0 * phase2_epoch / 200.0)
+                    # 阻尼退火: 初期放大阻尼→宽峰→容忍频率误差，逐步收紧
+                    damping_alpha = max(1.0, 10.0 - 9.0 * phase2_epoch / 200.0)
+                    # Teacher-Forced ω: 初期全用 ω_true (峰位完美对齐，只训 φ/ζ)，逐步放开
+                    teacher_anneal = config.get('teacher_anneal_epochs', 300)
+                    teacher_alpha = max(0.0, 1.0 - phase2_epoch / max(teacher_anneal, 1))
+                    omega_true = batch['modal_omega_phys'].to(args.device)
+
                     frequencies = batch['frequencies'].to(args.device)
                     phi_exc = batch.get('modal_phi_exc')
                     phi_exc = phi_exc.to(args.device) if phi_exc is not None else None
@@ -102,8 +107,9 @@ def train(args, config, model_cfg, net, dataloader, optimizer,
                         phi_exc = phi_exc_corrected
 
                     frf_pred, omega_phys_pred, log_zeta_pred, zeta_pred, phi_pred = net(
-                        img, coords, frequencies, phi_exc, batch_idx_t, alpha=alpha,
-                        node_xyz=node_xyz, node_features=node_features)
+                        img, coords, frequencies, phi_exc, batch_idx_t, alpha=damping_alpha,
+                        node_xyz=node_xyz, node_features=node_features,
+                        omega_true=omega_true, teacher_alpha=teacher_alpha)
 
                     loss_m, l_w, l_z, l_p, mac_val = modal_loss(
                         omega_phys_pred, batch['modal_omega_phys'].to(args.device),
@@ -118,9 +124,8 @@ def train(args, config, model_cfg, net, dataloader, optimizer,
                     phi_a_losses.append(pa.detach().cpu().numpy())
 
                     raw_frf = frf_loss(frf_pred, batch['point_frf'].to(args.device))
-                    phase2_ep = epoch - unlock_epoch
                     frf_warmup = config.get('frf_warmup_epochs', 20)
-                    current_frf_w = frf_weight * min(1.0, phase2_ep / max(frf_warmup, 1))
+                    current_frf_w = frf_weight * min(1.0, phase2_epoch / max(frf_warmup, 1))
                     loss = loss_m + current_frf_w * raw_frf
                 else:
                     _, omega_phys_pred, log_zeta_pred, zeta_pred, phi_pred = net(
