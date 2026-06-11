@@ -18,12 +18,17 @@ CONFIG = {
     # 阶段控制
     'enable_phase2': True,           # 开启 FRF 联合训练
     'phase2_min_epoch': 200,         # 200 轮模态预训练后进 Phase2
-    'freq_warmup_epochs': 80,        # 前80轮 omega_w=300, phi_w=0.01
     'zeta_warmup_epochs': 40,        # 前40轮 zeta_w=0 (防 spike)
+
+    # 模态损失权重 (trainer 内部: omega 在 Hz 空间, zeta 在 log 空间, phi 归一化后 MSE+MAC+std)
+    'omega_loss_weight': 1.0,        # 频率损失权重 (Hz-space smooth_l1)
+    'zeta_loss_weight': 10.0,        # 阻尼损失权重 (log-space smooth_l1)
+    'phi_loss_weight': 3.0,          # 振型损失权重 (归一化 MSE + MAC + std)
 
     # FRF 弱约束: dB空间 MSE×0.5 ≈ 10-20 损失贡献 (总损失 ~200-400 的 5-10%)
     'frf_loss_weight': 0.5,
     'frf_warmup_epochs': 50,
+    'teacher_anneal_epochs': 200,       # Teacher-Forced ω 退火周期: α 1.0→0.0
 
     'freq_min': 1.0, 'freq_max': 5000.0,
     'data_path_train': ['train.h5'],
