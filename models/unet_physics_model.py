@@ -1,26 +1,26 @@
 """
 unet_physics_model.py — 2.5D CNN-UNet 模态参数预测。
 
-架构: CNN Encoder + Macro MLP Decoder + Micro Upsample Decoder + PhysicsDecoder
+架构: ResNet+SE Encoder + OmegaHead + ZetaHead + MicroDecoder + PhysicsDecoder
 
   image_tensor [B,6,60,160]
        │
-  ┌────┴────┐
-  │ CNN Enc │ 4层Conv → [B,512]
-  └────┬────┘
-       │
   ┌────┴──────────┐
-  │               │
-  │ Macro MLP     │ Micro Upsample
-  │ → ω[B,K]      │ → mode_maps [B,K,60,160]
-  │ → ζ[B,K]      │        │
-  │               │   grid_sample(query_coords)
-  │               │   → phi [B,N,K]
+  │ ResNet+SE Enc │ 含 U-Net 跳连 → [B,512]
   └────┬──────────┘
        │
   ┌────┴──────────┐
+  │               │
+  │ OmegaHead     │ MicroDecoder (U-Net)
+  │ → ω[B,K]      │ → mode_maps [B,K,60,160]
+  │ ZetaHead      │        │
+  │ → ζ[B,K]      │   grid_sample(query_coords)
+  │               │   + PhiScaleHead (形数解耦)
+  └────┬──────────┘   → phi [B,N,K]
+       │
+  ┌────┴──────────┐
   │ PhysicsDecoder │ H=Σφ_kφ_k/(ω²-ω²+j2ζωω)
-  │ → FRF (asinh)  │
+  │ → FRF          │
   └───────────────┘
 """
 import torch
@@ -30,77 +30,122 @@ import torch.nn.functional as F
 from .physics_decoder import PhysicsDecoder
 
 
-class CNNEncoder(nn.Module):
-    """4层 CNN 编码器 + UNet 跳连"""
+# ============================================================
+# SE + ResNet 基础模块
+# ============================================================
+
+class SEBlock(nn.Module):
+    """Squeeze-and-Excitation 通道注意力"""
+
+    def __init__(self, channels, reduction=16):
+        super().__init__()
+        self.pool = nn.AdaptiveAvgPool2d(1)
+        self.fc = nn.Sequential(
+            nn.Linear(channels, channels // reduction, bias=False),
+            nn.ReLU(inplace=True),
+            nn.Linear(channels // reduction, channels, bias=False),
+            nn.Sigmoid(),
+        )
+
+    def forward(self, x):
+        b, c, _, _ = x.size()
+        y = self.pool(x).view(b, c)
+        y = self.fc(y).view(b, c, 1, 1)
+        return x * y
+
+
+class ResSEBlock(nn.Module):
+    """带 SE 通道注意力的残差块，支持下采样"""
+
+    def __init__(self, in_ch, out_ch, stride=1):
+        super().__init__()
+        self.conv1 = nn.Conv2d(in_ch, out_ch, 3, stride=stride, padding=1, bias=False)
+        self.bn1 = nn.BatchNorm2d(out_ch)
+        self.conv2 = nn.Conv2d(out_ch, out_ch, 3, stride=1, padding=1, bias=False)
+        self.bn2 = nn.BatchNorm2d(out_ch)
+        self.se = SEBlock(out_ch)
+        self.act = nn.GELU()
+
+        self.shortcut = nn.Sequential()
+        if stride != 1 or in_ch != out_ch:
+            self.shortcut = nn.Sequential(
+                nn.Conv2d(in_ch, out_ch, 1, stride=stride, bias=False),
+                nn.BatchNorm2d(out_ch),
+            )
+
+    def forward(self, x):
+        out = self.act(self.bn1(self.conv1(x)))
+        out = self.bn2(self.conv2(out))
+        out = self.se(out)
+        out = out + self.shortcut(x)
+        return self.act(out)
+
+
+class ImprovedCNNEncoder(nn.Module):
+    """ResNet+SE Encoder: 深度残差 + 通道注意力 + U-Net 跳连。
+
+    跳连输出通道: f1=64, f2=128, f3=256, f4=512 (逐层翻倍)
+    """
 
     def __init__(self, in_ch=6, hidden=512):
         super().__init__()
-        self.conv1 = nn.Sequential(nn.Conv2d(in_ch, 32, 3, stride=2, padding=1), nn.BatchNorm2d(32), nn.ReLU())
-        self.conv2 = nn.Sequential(nn.Conv2d(32, 64, 3, stride=2, padding=1), nn.BatchNorm2d(64), nn.ReLU())
-        self.conv3 = nn.Sequential(nn.Conv2d(64, 128, 3, stride=2, padding=1), nn.BatchNorm2d(128), nn.ReLU())
-        self.conv4 = nn.Sequential(nn.Conv2d(128, 256, 3, stride=2, padding=1), nn.BatchNorm2d(256), nn.ReLU())
-        self.pool = nn.AdaptiveAvgPool2d((2, 5))  # 保留 2×5 空间网格 (匹配板 160:60≈2.67:1)
-        self.fc = nn.Linear(256 * 10, hidden)     # 256 通道 × 10 个空间位置
+        self.stem = nn.Sequential(
+            nn.Conv2d(in_ch, 64, 3, stride=2, padding=1, bias=False),
+            nn.BatchNorm2d(64),
+            nn.GELU(),
+        )  # → [B, 64, 30, 80]
+
+        self.layer1 = ResSEBlock(64, 128, stride=2)   # → [B, 128, 15, 40]
+        self.layer2 = ResSEBlock(128, 256, stride=2)   # → [B, 256, 8, 20]
+        self.layer3 = ResSEBlock(256, 512, stride=2)   # → [B, 512, 4, 10]
+
+        self.pool = nn.AdaptiveAvgPool2d((2, 5))
+        self.fc = nn.Linear(512 * 10, hidden)
 
     def forward(self, x):
-        f1 = self.conv1(x)  # [B,32,30,80]
-        f2 = self.conv2(f1) # [B,64,15,40]
-        f3 = self.conv3(f2) # [B,128,8,20]
-        f4 = self.conv4(f3) # [B,256,4,10]
+        f1 = self.stem(x)
+        f2 = self.layer1(f1)
+        f3 = self.layer2(f2)
+        f4 = self.layer3(f3)
         latent = self.fc(self.pool(f4).flatten(1))
         return latent, (f1, f2, f3, f4)
 
 
-class MacroDecoder(nn.Module):
-    """宏观参数 MLP: latent+skip_pools → ω[B,K] + ζ[B,K]"""
-
-    def __init__(self, hidden=512, n_modes=3, omega_max=25000.0):
-        super().__init__()
-        self.n_modes = n_modes
-        self.omega_max = omega_max
-        input_dim = hidden  # 512
-        self.mlp = nn.Sequential(
-            nn.Linear(input_dim, 512), nn.GELU(), nn.Dropout(0.1),   # 加宽：256→512
-            nn.Linear(512, 256), nn.GELU(), nn.Dropout(0.1),          # 加深一层
-            nn.Linear(256, 128), nn.GELU(),
-            nn.Linear(128, n_modes * 2),
-        )
-        nn.init.constant_(self.mlp[-1].bias[:n_modes], -2.0)  # sigmoid(-2)≈0.12→3000Hz
-
-    def forward(self, latent):
-        out = self.mlp(latent)
-        omega_norm = torch.sigmoid(out[:, :self.n_modes])      # [0,1]
-        zeta = torch.sigmoid(out[:, self.n_modes:]) * 0.05 + 1e-4
-        return omega_norm, zeta
-
-
 class MicroDecoder(nn.Module):
-    """UNet 上采样解码器: 512 + skips → mode_maps [B,K,60,160]"""
+    """U-Net 上采样解码器: latent + skips → mode_maps [B,K,60,160]。
+
+    跳连通道: f1=64, f2=128, f3=256, f4=512 (来自 ImprovedCNNEncoder)。
+    """
 
     def __init__(self, hidden=512, n_modes=3):
         super().__init__()
-        C = 2  # 通道倍数
-        self.fc_up = nn.Linear(hidden, 256 * C * 8 * 20)
+        # fc_up 产生初始特征图 [B, 512, 8, 20]
+        self.fc_up = nn.Linear(hidden, 512 * 8 * 20)
 
-        self.up3 = nn.Sequential(nn.Conv2d(256*C + 128, 128*C, 3, padding=1), nn.BatchNorm2d(128*C), nn.GELU(), nn.Dropout2d(0.1))
-        self.up2 = nn.Sequential(nn.Conv2d(128*C + 64, 64*C, 3, padding=1), nn.BatchNorm2d(64*C), nn.GELU(), nn.Dropout2d(0.1))
-        self.up1 = nn.Sequential(nn.Conv2d(64*C + 32, 32*C, 3, padding=1), nn.BatchNorm2d(32*C), nn.GELU())
-        self.final = nn.Conv2d(32*C, n_modes, 3, padding=1)
-        self.C = C
+        # 逐层上采样 + 跳连: (当前通道 + 跳连通道) → 输出通道
+        self.up3 = nn.Sequential(
+            nn.Conv2d(512 + 256, 256, 3, padding=1), nn.BatchNorm2d(256),
+            nn.GELU(), nn.Dropout2d(0.1))
+        self.up2 = nn.Sequential(
+            nn.Conv2d(256 + 128, 128, 3, padding=1), nn.BatchNorm2d(128),
+            nn.GELU(), nn.Dropout2d(0.1))
+        self.up1 = nn.Sequential(
+            nn.Conv2d(128 + 64, 64, 3, padding=1), nn.BatchNorm2d(64),
+            nn.GELU())
+        self.final = nn.Conv2d(64, n_modes, 3, padding=1)
 
     def forward(self, latent, skips):
         f1, f2, f3, f4 = skips
-        C = self.C
-        x = self.fc_up(latent).view(-1, 256*C, 8, 20)
+        x = self.fc_up(latent).view(-1, 512, 8, 20)      # [B, 512, 8, 20]
 
         x = F.interpolate(x, size=f3.shape[2:], mode='bilinear', align_corners=False)
-        x = self.up3(torch.cat([x, f3], dim=1))
+        x = self.up3(torch.cat([x, f3], dim=1))           # cat(512, 256) → 256
 
         x = F.interpolate(x, size=f2.shape[2:], mode='bilinear', align_corners=False)
-        x = self.up2(torch.cat([x, f2], dim=1))
+        x = self.up2(torch.cat([x, f2], dim=1))           # cat(256, 128) → 128
 
         x = F.interpolate(x, size=f1.shape[2:], mode='bilinear', align_corners=False)
-        x = self.up1(torch.cat([x, f1], dim=1))
+        x = self.up1(torch.cat([x, f1], dim=1))           # cat(128, 64) → 64
 
         x = F.interpolate(x, size=(60, 160), mode='bilinear', align_corners=False)
         return self.final(x)
@@ -202,7 +247,7 @@ class UNetPhysicsModel(nn.Module):
         super().__init__()
         self.n_modes = n_modes
 
-        self.encoder = CNNEncoder(in_ch, hidden)
+        self.encoder = ImprovedCNNEncoder(in_ch, hidden)
         self.omega_head = OmegaHead(hidden, n_modes)
         self.zeta_head = ZetaHead(hidden, n_modes)
         self.micro_decoder = MicroDecoder(hidden, n_modes)
