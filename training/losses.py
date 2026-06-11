@@ -7,9 +7,9 @@ import torch.nn.functional as F
 
 
 def _mac_per_graph(phi_pred, phi_target):
-    """单图 MAC: phi [N,K] → mac [K]。目标: 最小化 1-MAC。"""
-    num = torch.sum(phi_pred * phi_target, dim=0) ** 2
-    den = torch.sum(phi_pred ** 2, dim=0) * torch.sum(phi_target ** 2, dim=0) + 1e-8
+    """三维单图 MAC: phi [N,K,3] → mac [K]。沿节点(dim=0)和坐标轴(dim=2)同时求内积。"""
+    num = torch.sum(phi_pred * phi_target, dim=(0, 2)) ** 2
+    den = torch.sum(phi_pred ** 2, dim=(0, 2)) * torch.sum(phi_target ** 2, dim=(0, 2)) + 1e-8
     return num / den
 
 
@@ -25,22 +25,19 @@ def modal_loss(omega_phys_pred, omega_phys_target,
         omega_phys_target:[B,K] 物理 rad/s
         log_zeta_pred:    [B,K] 对数阻尼
         zeta_target:      [B,K] 物理阻尼比
-        phi_pred:         [N,K] 或 [B,N,K] 预测振型
-        phi_target:       [N,K] 或 [B,N,K] 真实振型
-        batch_idx:        [N,]   批次索引 (phi 为 [N,K] 时)
+        phi_pred:         [N,K,3] 或 [B,N,K,3] 预测三维振型
+        phi_target:       [N,K,3] 或 [B,N,K,3] 真实三维振型
+        batch_idx:        [N,]   批次索引 (phi 为 [N,K,3] 时)
     """
 
     # ====================================================
     # 1. 频率损失: Hz-space smooth_l1 + peak-sensitive
-    #    smooth_l1 在 Hz 空间有恒定梯度 (|error|>1Hz → grad=1)
     # ====================================================
     f_pred_hz = omega_phys_pred / (2.0 * torch.pi)
     f_true_hz = omega_phys_target / (2.0 * torch.pi)
 
-    # Hz 空间 smooth_l1 — 永不衰减的恒定梯度引擎
     loss_freq_hz = F.smooth_l1_loss(f_pred_hz, f_true_hz)
 
-    # 峰值敏感: 阻尼越小惩罚越重
     rel = torch.abs(omega_phys_pred - omega_phys_target) / (omega_phys_target + 1e-8)
     peak_sensitive = rel / (zeta_target + 1e-8)
     peak_sensitive = torch.clamp(peak_sensitive, max=100.0)
@@ -54,26 +51,29 @@ def modal_loss(omega_phys_pred, omega_phys_target,
     loss_zeta = F.smooth_l1_loss(log_zeta_pred, log_zeta_target) * zeta_weight
 
     # ====================================================
-    # 3. 振型损失: MSE(归一化) + MAC + Std Ratio
-    #    phi 真实值极小 → 先 std 归一化再算 MSE，否则梯度近乎零
+    # 3. 三维振型损失: MSE(归一化) + MAC + Std Ratio
+    #    phi 为 [N,K,3]，沿 N 和 XYZ 两维共同计算
     # ====================================================
-    if phi_pred.dim() == 3:
-        phi_pred = phi_pred.view(-1, phi_pred.shape[-1])
-        phi_target = phi_target.view(-1, phi_target.shape[-1])
+    if phi_pred.dim() == 4:  # [B, N, K, 3]
+        phi_pred = phi_pred.view(-1, phi_pred.shape[-2], phi_pred.shape[-1])
+        phi_target = phi_target.view(-1, phi_target.shape[-2], phi_target.shape[-1])
 
-    # 符号对齐
-    dot = torch.sum(phi_pred * phi_target, dim=0, keepdim=True)
+    # 符号对齐: 三维内积 [N,K,3] → 沿 (0,2) 求和
+    dot = torch.sum(phi_pred * phi_target, dim=(0, 2), keepdim=True)   # [1, K, 1]
     sign = torch.sign(dot + 1e-8)
     aligned_target = phi_target * sign
 
-    # 逐模态归一化到 unit std，再算 MSE (解决 phi 真实值过小问题)
-    p_std = torch.std(phi_pred, dim=0) + 1e-8
-    t_std = torch.std(phi_target, dim=0) + 1e-8
-    phi_pred_norm = phi_pred / p_std
-    phi_target_norm = aligned_target / t_std
+    # 三维总 Std: [K, N*3] → std(dim=1) → [K]
+    p_std = torch.std(phi_pred.transpose(0, 1).reshape(phi_pred.shape[1], -1), dim=1) + 1e-8
+    t_std = torch.std(phi_target.transpose(0, 1).reshape(phi_target.shape[1], -1), dim=1) + 1e-8
+    p_std_view = p_std.view(1, -1, 1)
+    t_std_view = t_std.view(1, -1, 1)
+
+    phi_pred_norm = phi_pred / p_std_view
+    phi_target_norm = aligned_target / t_std_view
     raw_phi_mse = F.mse_loss(phi_pred_norm, phi_target_norm)
 
-    # MAC: 尺度无关，直接算 (按图)
+    # MAC: 三维，尺度无关
     if batch_idx is not None:
         n_graphs = int(batch_idx.max().item()) + 1
         mac_loss_total = 0.0
@@ -86,13 +86,11 @@ def modal_loss(omega_phys_pred, omega_phys_target,
         mac = _mac_per_graph(phi_pred, aligned_target)
         loss_mac = (1.0 - mac).mean()
 
-    # Std Ratio (对数域): 解决 PhiScaleHead 初始偏差大时 clamp 截断梯度的问题
-    # 对数域 smooth_l1 无论偏差几十倍还是几百倍，梯度始终稳定回传
+    # Std Ratio (对数域)
     log_p_std = torch.log(p_std)
     log_t_std = torch.log(t_std + 1e-8)
     loss_std = F.smooth_l1_loss(log_p_std, log_t_std)
 
-    # 归一化后 MSE 在 0~2 之间 (unit std 向量差), MAC 在 0~1
     # MAC (用于日志): 逐模态 [K]
     if batch_idx is not None:
         mac_list = []
