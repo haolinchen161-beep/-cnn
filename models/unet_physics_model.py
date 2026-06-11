@@ -132,7 +132,7 @@ class MicroDecoder(nn.Module):
         self.up1 = nn.Sequential(
             nn.Conv2d(128 + 64, 64, 3, padding=1), nn.BatchNorm2d(64),
             nn.GELU())
-        self.final = nn.Conv2d(64, n_modes, 3, padding=1)
+        self.final = nn.Conv2d(64, n_modes * 3, 3, padding=1)  # 每模态输出 XYZ 三向
 
     def forward(self, latent, skips):
         f1, f2, f3, f4 = skips
@@ -198,20 +198,23 @@ class NodePhiRefiner(nn.Module):
 
     def __init__(self, hidden=512, node_feat_dim=7, n_modes=3):
         super().__init__()
+        self.n_modes = n_modes
         self.net = nn.Sequential(
-            nn.Linear(hidden + 3 + node_feat_dim + n_modes, 256),
+            nn.Linear(hidden + 3 + node_feat_dim + n_modes * 3, 256),
             nn.LayerNorm(256), nn.GELU(), nn.Dropout(0.1),
             nn.Linear(256, 128), nn.GELU(),
-            nn.Linear(128, n_modes),
+            nn.Linear(128, n_modes * 3),
         )
 
     def forward(self, phi_base, latent, node_xyz, node_features, batch_idx):
         if node_xyz is None or node_features is None:
             return phi_base
         latent_n = latent[batch_idx]
-        x = torch.cat([latent_n, node_xyz, node_features, phi_base], dim=-1)
+        # phi_base [N, K, 3] → flatten to [N, K*3]
+        phi_flat = phi_base.reshape(phi_base.shape[0], -1)
+        x = torch.cat([latent_n, node_xyz, node_features, phi_flat], dim=-1)
         delta = 0.25 * torch.tanh(self.net(x))
-        return phi_base + delta
+        return phi_base + delta.view(-1, self.n_modes, 3)
 
 
 class PhiScaleHead(nn.Module):
@@ -265,7 +268,7 @@ class UNetPhysicsModel(nn.Module):
             omega_phys: [B, K] rad/s (单调递增保证)
             log_zeta:   [B, K] 对数阻尼
             zeta:       [B, K] 物理阻尼 = exp(log_zeta)
-            phi:        [total_N, K] 振型
+            phi:        [total_N, K, 3] 三维振型 (X, Y, Z)
 
         Teacher-Forced Omega (Phase2):
             teacher_alpha=1.0 → FRF 全用 ω_true (峰位置完美对齐，只训 φ/ζ)
@@ -287,14 +290,20 @@ class UNetPhysicsModel(nn.Module):
         log_zeta = self.zeta_head(latent)
         zeta = torch.exp(log_zeta)
 
-        # 振型: 2D map → grid_sample
+        # 振型: 2D map → grid_sample → [N, K, 3]
         # 形数解耦：UNet 输出纯形状(unit std)，PhiScaleHead 预测物理幅值
-        mode_maps = self.micro_decoder(latent, skips)                # [B, K, H, W]
-        maps_flat = mode_maps.view(B, self.n_modes, -1)
+        mode_maps = self.micro_decoder(latent, skips)                # [B, K*3, H, W]
+
+        # 拆分为 [B, K, 3, H, W] 以计算三维整体能量 Std
+        mode_maps_3d = mode_maps.view(B, self.n_modes, 3, mode_maps.shape[-2], mode_maps.shape[-1])
+        maps_flat = mode_maps_3d.reshape(B, self.n_modes, -1)       # [B, K, 3*H*W]
         maps_std = torch.std(maps_flat, dim=2) + 1e-8               # [B, K]
-        normalized_maps = mode_maps / maps_std.unsqueeze(-1).unsqueeze(-1)
+        normalized_maps = mode_maps_3d / maps_std.view(B, self.n_modes, 1, 1, 1)
         scale = self.phi_scale_head(latent)                          # [B, K]
-        mode_maps = normalized_maps * scale.unsqueeze(-1).unsqueeze(-1)
+        mode_maps_3d = normalized_maps * scale.view(B, self.n_modes, 1, 1, 1)
+
+        # 合并回 [B, K*3, H, W] 送入 grid_sample
+        mode_maps = mode_maps_3d.reshape(B, self.n_modes * 3, mode_maps.shape[-2], mode_maps.shape[-1])
         phi_list = []
         for b in range(B):
             mask = batch == b
@@ -302,20 +311,23 @@ class UNetPhysicsModel(nn.Module):
             maps_b = mode_maps[b:b+1]
             phi_b = F.grid_sample(maps_b, coords_b, mode='bilinear',
                                   align_corners=True, padding_mode='border')
-            phi_list.append(phi_b.squeeze(2).transpose(1, 2).squeeze(0))
-        phi = torch.cat(phi_list, dim=0)
+            # phi_b: [1, K*3, 1, N] → squeeze → [K*3, N] → T → [N, K*3] → view [N, K, 3]
+            phi_b = phi_b.squeeze(2).transpose(1, 2).squeeze(0)     # [N, K*3]
+            phi_list.append(phi_b.view(-1, self.n_modes, 3))
+        phi = torch.cat(phi_list, dim=0)                             # [total_N, K, 3]
 
         # 轻量节点级修正 (若提供了 node 信息)
         if node_xyz is not None and node_features is not None:
             phi = self.phi_refiner(phi, latent, node_xyz, node_features, batch)
 
-        # FRF 重建 (Teacher-Forced: 可混合 ω_true 与 ω_pred)
+        # FRF 重建 (Teacher-Forced: Z 向 FRF，从三维振型提取 dim=2)
         if frequencies is not None:
+            phi_z = phi[..., 2]                                      # [total_N, K] Z 向分量
             if omega_true is not None and teacher_alpha > 0.0:
                 omega_used = teacher_alpha * omega_true + (1.0 - teacher_alpha) * omega_phys
             else:
                 omega_used = omega_phys
-            frf = self.physics(phi, omega_used, zeta, frequencies, phi_exc,
+            frf = self.physics(phi_z, omega_used, zeta, frequencies, phi_exc,
                                batch_idx=batch, alpha=alpha)
         else:
             frf = None
