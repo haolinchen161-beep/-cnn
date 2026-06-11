@@ -1,31 +1,31 @@
 # geometric_frf_groove — 基于几何的频响函数预测
 
-输入 3D 几何 + 边界条件 → UNetPhysicsModel (2.5D CNN-UNet + PhysicsDecoder) → 模态参数 (ω, ζ, φ) → 物理公式重建 FRF。
+输入 3D 几何 + 边界条件 → UNetPhysicsModel (2.5D ResNet+SE UNet + PhysicsDecoder) → 模态参数 (ω, ζ, φ) → 物理公式重建 FRF。
 
 ## 1. 目录结构
 
 ```
 ├── models/
-│   ├── unet_physics_model.py   主模型: 2.5D CNN-UNet
+│   ├── unet_physics_model.py   主模型: ResNet+SE Encoder + OmegaHead + ZetaHead + MicroDecoder
 │   ├── frf_model.py             模型工厂 build_geometric_model()
 │   ├── physics_decoder.py       无参数物理解码器 (模态叠加→FRF)
 │   ├── geometry_data.py         GeometryData 数据容器
 ├── data/
-│   └── dataset.py               HDF5 数据集 (per-sample-group) + collate
+│   └── dataset.py               HDF5 数据集 (per-sample-group) + 2.5D 投影 + collate
 ├── training/
-│   ├── losses.py                modal_loss + frf_loss
-│   ├── trainer.py               两阶段训练循环 + 评估
-│   └── augmentations.py         数据增强 (坐标/特征噪声, 节点dropout, 频率子采样)
+│   ├── losses.py                modal_loss (ω/ζ/φ) + frf_loss (dB + CDF)
+│   ├── trainer.py               三阶段训练循环 + 动态退火 + 评估
+│   └── augmentations.py         数据增强 (未接入训练流程)
 ├── ansys/
 │   ├── generate_3d_test.py      ANSYS MAPDL 数据生成 (凹槽工件)
 │   ├── data/                    train/val/test.h5
-│   └── mesh_viz/                网格截图
+│   └── mesh_viz/                网格截图 + FRF 可视化
 └── sample/
-    ├── run_validation.py        训练入口
+    ├── run_validation.py        训练入口 + 超参数配置
     ├── evaluate.py              评估 + 保存 final_results.npz
-    ├── 测试.py                  查看原始 FRF
-    ├── 对比图.py                预测 vs 真实对比图
-    ├── predict.py               推理
+    ├── 对比图.py                预测 vs 真实对比图 (幅值+实部+虚部+振型)
+    ├── 对比图db.py              dB 对比图 (真实 vs 预测分列)
+    ├── 测试.py                  查看原始 FRF 数据
     └── output/                  checkpoint + 图表 + npz
 ```
 
@@ -35,16 +35,24 @@
 输入: 6ch 物理场图像 [B,6,60,160] + query_coords [N,2]
                     │
     ┌───────────────┴───────────────┐
-    │  CNN Encoder (4层Conv+UNet跳连) │ → latent [B,512]
+    │  ResNet+SE Encoder             │
+    │  Stem(64) + 3×ResSEBlock      │
+    │  f1=64 → f2=128 → f3=256      │
+    │  → f4=512 → latent [B,512]    │
+    │  含 U-Net 跳连 (f1~f4)        │
     └───────────────┬───────────────┘
                     │
          ┌──────────┴──────────┐
          │                     │
     ┌────┴────┐          ┌─────┴──────┐
-    │Macro MLP│          │Micro UNet  │
+    │OmegaHead│          │MicroDecoder│
     │→ ω[B,K]│          │→ mode_maps │ [B,K,60,160]
-    │→ ζ[B,K]│          │   grid_sample(query_coords)
-    └────┬────┘          │   → φ [N,K]│
+    │ZetaHead │          │    ↓        │
+    │→ ζ[B,K]│          │ PhiScaleHead│ (形数解耦)
+    └────┬────┘          │→ mode_maps │ × scale
+         │               │    ↓        │
+         │               │ grid_sample │
+         │               │ → φ [N,K]   │
          │               └─────┬──────┘
          │                     │
     ┌────┴─────────────────────┴──────┐
@@ -52,6 +60,18 @@
     │  H=Σφ_kφ_k/(ω_k²-ω²+j2ζ_kω_kω) │
     │  → FRF (N,F,2)                  │
     └─────────────────────────────────┘
+```
+
+### 形数解耦 (Shape-Amplitude Decoupling)
+
+- **MicroDecoder (UNet)**: 输出纯形状 (unit std 归一化)，专注空间分布
+- **PhiScaleHead (MLP)**: 从 latent 预测物理幅值标量 `scale [B,K]`，专注模态质量
+
+```
+mode_maps_raw = MicroDecoder(latent, skips)
+normalized = mode_maps_raw / std  (unit std)
+scale = exp(PhiScaleHead(latent))
+final_maps = normalized × scale
 ```
 
 ## 3. 数据
@@ -66,7 +86,7 @@
 | 凹槽加工 | 随机选择1~N个凹槽, 每个深度30~60%×H (3~6mm) |
 | 结构筋/边界 | 6mm 绝对宽度 |
 | 装夹 | 4角螺栓 (XYZ三向弹簧) + 3侧顶杆 (Y向弹簧) |
-| 弹簧刚度 K | 角点 K_c∈[5e6,1e8] N/m, 侧面 K_s∈[1e6,3e7] N/m, 每个装夹区独立采样 |
+| 弹簧刚度 K | 角点 K_c∈[5e6,1e8] N/m, 侧面 K_s∈[1e6,3e7] N/m |
 | 弹簧阻尼 C | C=2ζ√(K·M_ref), ζ_joint∈[0.005,0.05], M_ref=0.01kg |
 | 材料阻尼 | ζ_material=0.002 |
 | 总阻尼 | ζ_k = 0.002 + Σ(C·φ²)/(2ω_k) (三维耗散求和) |
@@ -92,41 +112,55 @@ HDF5 存储原始 3D 节点数据。`__getitem__` 时投影为 6 通道 160×60 
 坐标归一化到 [-1,1] (X/0.160×2-1, Y/0.060×2-1)。
 数据划分: 1200 训练 / 150 验证 / 150 测试。
 
-### HDF5 格式 (per-sample-group)
-
-```
-/sample_0/
-├── points         (N₀, 3)        3D 节点坐标 [x, y, z] (m)
-├── point_frf      (N₀, F₀, 2)   复数 FRF [Re, Im] (Z向, 物理空间)
-├── frequencies    (F₀,)          频率采样点 (Hz)
-├── point_features (N₀, 7)        逐节点: [E/E_base, PRXY, ρ/ρ_base, is_fixed, logK, logC, Z/H]
-├── modal_omega    (K,)           固有圆频率 (rad/s)
-├── modal_zeta     (K,)           阻尼比
-├── modal_phi      (N₀, K)        Z向模态振型
-└── modal_phi_exc  (K,)           激励点振型值
-```
-
 ## 4. 训练
 
-### 两阶段策略
+### 三阶段 + Teacher-Forced Omega
 
-| 阶段 | Epoch | 动作 | 损失 | 目的 |
+| 阶段 | Epoch | 策略 | 损失 | 目的 |
 |------|-------|------|------|------|
-| 1: modal warmup | dynamic unlock | sorted loss + phi x 100 | modal_loss | omega < 0.5%% or epoch > 1000 |
-| 2: FRF joint | unlock ~ 2000 | FRF warmup x 0.05 | modal + FRF(warmup) | damping anneal alpha: 10 -> 1 |
+| 1: modal warmup | 0 ~ phase2_min_epoch | ω/ζ/φ 各自逼近真值 | modal_loss | ω 收敛到 <1%, MAC > 0.95 |
+| 2: Teacher-Forced FRF | unlock ~ teacher_anneal | ω_used = α·ω_true + (1-α)·ω_pred, α: 1.0→0.0 | modal + FRF(warmup) | 峰位对齐时打磨 φ/ζ, 不背频率误差的锅 |
+| 3: 端到端 | teacher_α=0 后 | 完全自主预测 | modal + FRF | 真实推理场景 |
+
+**Teacher-Forced Omega 原理**: 共振峰极窄，ω 偏 1% 就会导致峰位错开、FRF Loss 爆炸。使用 ω_true 混合后，FRF Loss 只教 φ 调幅值、ζ 调宽度，各司其职。
 
 ### 超参数
 
 | 参数 | 值 |
 |------|-----|
-| 模型 | UNetPhysicsModel (~6.5M params) |
+| 模型 | UNetPhysicsModel (~52.8M params) |
+| Encoder | ImprovedCNNEncoder (ResNet+SE, 64→128→256→512) |
 | hidden / n_modes | 512 / 3 |
-| Conv layers / UNet skips | 4 / 3 |
-| dropout | 0.2 |
-| loss weights | rel_omega x 200 + rel_zeta x 10 + phi signMSE x 100 + FRF dB x 1 + CDF x 10 |
+| dropout | 0.1~0.2 |
+| 损失权重 | omega=1.0, zeta=10.0 (前40轮=0), phi=3.0 |
+| FRF 损失 | dB MSE + 10×CDF L1, weight=0.5 (warmup) |
 | optimizer | AdamW, lr=1e-3, wd=3e-4, CosineAnnealingLR |
-| 梯度裁剪 | encoder=3.0, micro=5.0, macro=2.0 |
+| 梯度裁剪 | encoder=3.0, micro=5.0, omega=2.0, zeta=2.0, phi_refiner=2.0, phi_scale_head=2.0 |
 | batch_size | 8 |
+
+### 损失函数
+
+| 损失项 | 空间 | 公式 |
+|--------|------|------|
+| ω | Hz 空间 | smooth_l1(f_pred, f_true) + 0.1×峰值敏感项 |
+| ζ | log 空间 | smooth_l1(log_ζ_pred, log_ζ_true) |
+| φ (MSE) | 归一化 | MSE(φ_pred/std, φ_true/std) |
+| φ (MAC) | 尺度无关 | 1 - MAC, 按图平均 |
+| φ (Std) | log 空间 | smooth_l1(log(std_pred), log(std_true)) |
+| FRF (dB) | dB 空间 | MSE(20·log10(amp_pred), 20·log10(amp_true)) |
+| FRF (CDF) | 累积分布 | L1(cumsum(amp_norm_pred), cumsum(amp_norm_true)) |
+
+### 训练监控指标
+
+```
+Epoch   50 | w=[1.8/2.3/2.2]% z=[7/22/24]% φn=[3.9/30.9/43.5]% φa=[3.9/120.0/147.9]% MAC=[0.998/0.963/0.908] | w63% z0% ph37% | loss=69.9
+```
+
+- **w%**: 频率相对误差 (越小越好)
+- **z%**: 阻尼相对误差 (越小越好)
+- **φn%**: 振型 NRMSE (越小越好，形状+幅值综合)
+- **φa%**: 振型范数幅值误差 (越小越好，致命指标)
+- **MAC**: 模态置信准则 (越接近 1 越好，纯形状)
 
 ## 5. 快速开始
 
@@ -145,4 +179,5 @@ F:/pytorch_cuda12/python.exe sample/evaluate.py
 
 # 对比图
 F:/pytorch_cuda12/python.exe sample/对比图.py
+F:/pytorch_cuda12/python.exe sample/对比图db.py
 ```
