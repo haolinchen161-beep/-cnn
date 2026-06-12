@@ -218,20 +218,24 @@ class NodePhiRefiner(nn.Module):
 
 
 class PhiScaleHead(nn.Module):
-    """模态幅值标量预测器。解耦形状与幅值：UNet 输出纯形状(unit std)，MLP 预测物理尺度。"""
+    """三向独立幅值预测器。每模态每方向独立 scale，Mode 2 断崖切换时可独立归零 Z。
+
+    输出 [B, K, 3]：scale_X, scale_Y, scale_Z 各自预测，不再共享。
+    """
 
     def __init__(self, hidden=512, n_modes=3):
         super().__init__()
+        self.n_modes = n_modes
         self.mlp = nn.Sequential(
             nn.Linear(hidden, 256), nn.GELU(), nn.Dropout(0.15),
             nn.Linear(256, 128), nn.GELU(),
-            nn.Linear(128, n_modes),
+            nn.Linear(128, n_modes * 3),
         )
         with torch.no_grad():
-            self.mlp[-1].bias.copy_(torch.tensor([0.0, 0.0, 0.0]))  # exp(0)=1.0
+            self.mlp[-1].bias.copy_(torch.zeros(n_modes * 3))
 
     def forward(self, latent):
-        return torch.exp(self.mlp(latent))  # [B, K] > 0
+        return torch.exp(self.mlp(latent).view(latent.shape[0], self.n_modes, 3))  # [B, K, 3]
 
 
 class UNetPhysicsModel(nn.Module):
@@ -299,8 +303,8 @@ class UNetPhysicsModel(nn.Module):
         maps_flat = mode_maps_3d.reshape(B, self.n_modes, -1)       # [B, K, 3*H*W]
         maps_std = torch.std(maps_flat, dim=2) + 1e-8               # [B, K]
         normalized_maps = mode_maps_3d / maps_std.view(B, self.n_modes, 1, 1, 1)
-        scale = self.phi_scale_head(latent)                          # [B, K]
-        mode_maps_3d = normalized_maps * scale.view(B, self.n_modes, 1, 1, 1)
+        scale = self.phi_scale_head(latent)                          # [B, K, 3]
+        mode_maps_3d = normalized_maps * scale.view(B, self.n_modes, 3, 1, 1)
 
         # 合并回 [B, K*3, H, W] 送入 grid_sample
         mode_maps = mode_maps_3d.reshape(B, self.n_modes * 3, mode_maps.shape[-2], mode_maps.shape[-1])
@@ -327,8 +331,9 @@ class UNetPhysicsModel(nn.Module):
                 omega_used = teacher_alpha * omega_true + (1.0 - teacher_alpha) * omega_phys
             else:
                 omega_used = omega_phys
-            frf = self.physics(phi_z, omega_used, zeta, frequencies, phi_exc,
-                               batch_idx=batch, alpha=alpha)
+            # FRF 梯度只流向 φ，ω/ζ 由 modal_loss 独立负责 (防 10^5 量级梯度冲毁)
+            frf = self.physics(phi_z, omega_used.detach(), zeta.detach(),
+                               frequencies, phi_exc, batch_idx=batch, alpha=alpha)
         else:
             frf = None
 
