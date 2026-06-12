@@ -136,21 +136,3 @@ def frf_loss(frf_pred, frf_target):
     loss_cdf = F.l1_loss(cdf_pred, cdf_target)
 
     return loss_db + 10.0 * loss_cdf
-
-
-def branch_loss(branch_log_probs, modal_effm):
-    """逐模态加权 KL 散度: Mode 2 权重压倒性, 防止其梯度被 Mode 1/3 稀释。
-
-    branch_log_probs: [B, K, 3] 来自 F.log_softmax
-    modal_effm:       [B, K, 3] 真实有效质量
-    """
-    effm_abs = torch.abs(modal_effm) + 1e-8
-    target_probs = effm_abs / effm_abs.sum(dim=-1, keepdim=True)
-
-    # 逐模态 KL (不取平均), shape [B, K]
-    kl_per_mode = F.kl_div(branch_log_probs, target_probs, reduction='none').sum(dim=-1)
-
-    # Mode 2 权重压倒性: [Mode1, Mode2, Mode3]
-    mode_weights = branch_log_probs.new_tensor([0.1, 5.0, 0.5])
-    weighted = kl_per_mode * mode_weights.view(1, -1)
-    return weighted.mean()
