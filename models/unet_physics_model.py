@@ -218,24 +218,22 @@ class NodePhiRefiner(nn.Module):
 
 
 class PhiScaleHead(nn.Module):
-    """三向独立幅值预测器。每模态每方向独立 scale，Mode 2 断崖切换时可独立归零 Z。
-
-    输出 [B, K, 3]：scale_X, scale_Y, scale_Z 各自预测，不再共享。
+    """模态幅值预测器。UNet 输出纯形状(unit std joint)，MLP 预测物理 joint scale。
+    loss_std 逐向监督驱动 MicroDecoder 学习正确的 XYZ 能量分布。
     """
 
     def __init__(self, hidden=512, n_modes=3):
         super().__init__()
-        self.n_modes = n_modes
         self.mlp = nn.Sequential(
             nn.Linear(hidden, 256), nn.GELU(), nn.Dropout(0.15),
             nn.Linear(256, 128), nn.GELU(),
-            nn.Linear(128, n_modes * 3),
+            nn.Linear(128, n_modes),
         )
         with torch.no_grad():
-            self.mlp[-1].bias.copy_(torch.zeros(n_modes * 3))
+            self.mlp[-1].bias.copy_(torch.zeros(n_modes))
 
     def forward(self, latent):
-        return torch.exp(self.mlp(latent).view(latent.shape[0], self.n_modes, 3))  # [B, K, 3]
+        return torch.exp(self.mlp(latent))  # [B, K]
 
 
 class UNetPhysicsModel(nn.Module):
@@ -303,8 +301,8 @@ class UNetPhysicsModel(nn.Module):
         maps_flat = mode_maps_3d.reshape(B, self.n_modes, -1)       # [B, K, 3*H*W]
         maps_std = torch.std(maps_flat, dim=2) + 1e-8               # [B, K] 联合 std
         normalized_maps = mode_maps_3d / maps_std.view(B, self.n_modes, 1, 1, 1)
-        scale = self.phi_scale_head(latent)                          # [B, K, 3] 逐向 scale
-        mode_maps_3d = normalized_maps * scale.view(B, self.n_modes, 3, 1, 1)
+        scale = self.phi_scale_head(latent)                          # [B, K]
+        mode_maps_3d = normalized_maps * scale.view(B, self.n_modes, 1, 1, 1)
 
         # 合并回 [B, K*3, H, W] 送入 grid_sample
         mode_maps = mode_maps_3d.reshape(B, self.n_modes * 3, mode_maps.shape[-2], mode_maps.shape[-1])
