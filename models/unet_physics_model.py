@@ -236,6 +236,26 @@ class PhiScaleHead(nn.Module):
         return torch.exp(self.mlp(latent))  # [B, K]
 
 
+class DirectionBranchHead(nn.Module):
+    """辅助分类头: 预测每阶模态在 X/Y/Z 三向的有效质量比例 (soft label)。
+
+    对 Mode 2 的断崖二分(纯Z vs 纯XY)施加 KL 散度监督,
+    迫使 latent 空间切分出清晰的模态类型边界。
+    """
+
+    def __init__(self, hidden=512, n_modes=3):
+        super().__init__()
+        self.n_modes = n_modes
+        self.mlp = nn.Sequential(
+            nn.Linear(hidden, 128), nn.GELU(),
+            nn.Linear(128, n_modes * 3),
+        )
+
+    def forward(self, latent):
+        logits = self.mlp(latent).view(latent.shape[0], self.n_modes, 3)
+        return F.log_softmax(logits, dim=-1)  # [B, K, 3]
+
+
 class UNetPhysicsModel(nn.Module):
     """2.5D CNN-UNet 模态参数预测模型。
 
@@ -258,6 +278,7 @@ class UNetPhysicsModel(nn.Module):
         self.micro_decoder = MicroDecoder(hidden, n_modes)
         self.phi_refiner = NodePhiRefiner(hidden, node_feat_dim=7, n_modes=n_modes)
         self.phi_scale_head = PhiScaleHead(hidden, n_modes)
+        self.branch_head = DirectionBranchHead(hidden, n_modes)
         self.physics = PhysicsDecoder(amp_scale, freq_min, freq_max)
 
     def forward(self, image_tensor, query_coords, frequencies=None,
@@ -285,6 +306,9 @@ class UNetPhysicsModel(nn.Module):
             batch = batch if batch is not None else torch.zeros(coords_flat.shape[0], dtype=torch.long, device=image_tensor.device)
 
         latent, skips = self.encoder(image_tensor)
+
+        # 辅助分支: 预测 XYZ 有效质量比例 (KL 散度监督, 切分 latent 空间)
+        self.branch_log_probs = self.branch_head(latent)            # [B, K, 3]
 
         # 频率: 直接输出物理 rad/s (单调保证)
         omega_phys = self.omega_head(latent)
