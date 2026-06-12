@@ -63,11 +63,11 @@ def modal_loss(omega_phys_pred, omega_phys_target,
     sign = torch.sign(dot + 1e-8)
     aligned_target = phi_target * sign
 
-    # 逐方向 Std: 每方向独立归一化, 与三向独立 PhiScaleHead [K,3] 一一对应
-    p_std_dir = torch.std(phi_pred, dim=0) + 1e-8          # [K, 3]
-    t_std_dir = torch.std(phi_target, dim=0) + 1e-8         # [K, 3]
-    p_std_view = p_std_dir.view(1, -1, 3)                   # [1, K, 3]
-    t_std_view = t_std_dir.view(1, -1, 3)
+    # 联合 Std: 每模态一个总幅值 [K]
+    p_std = torch.std(phi_pred.transpose(0, 1).reshape(phi_pred.shape[1], -1), dim=1) + 1e-8
+    t_std = torch.std(phi_target.transpose(0, 1).reshape(phi_target.shape[1], -1), dim=1) + 1e-8
+    p_std_view = p_std.view(1, -1, 1)
+    t_std_view = t_std.view(1, -1, 1)
 
     phi_pred_norm = phi_pred / p_std_view
     phi_target_norm = aligned_target / t_std_view
@@ -106,8 +106,8 @@ def modal_loss(omega_phys_pred, omega_phys_target,
         mac = _mac_per_graph(phi_pred, aligned_target)
         loss_mac = (1.0 - mac).mean()
 
-    # 逐方向 Std Ratio (对数域): 直接监督三向独立 scale
-    loss_std = F.smooth_l1_loss(torch.log(p_std_dir), torch.log(t_std_dir + 1e-8))
+    # 联合 Std Ratio (线性域)
+    loss_std = F.smooth_l1_loss(p_std, t_std)
 
     # MAC (用于日志): 逐模态 [K]
     if batch_idx is not None:
