@@ -217,23 +217,42 @@ class NodePhiRefiner(nn.Module):
         return phi_base + delta.view(-1, self.n_modes, 3)
 
 
-class PhiScaleHead(nn.Module):
-    """模态幅值预测器。UNet 输出纯形状(unit std joint)，MLP 预测物理 joint scale。
-    loss_std 逐向监督驱动 MicroDecoder 学习正确的 XYZ 能量分布。
+class DirectionBranchHead(nn.Module):
+    """辅助分类头: 预测每阶模态 X/Y/Z 方向能量比例 (soft label)。
+
+    输出 log_softmax，用于 KL 散度监督。概率拼接后喂给 PhiScaleHead 做条件特征。
     """
 
     def __init__(self, hidden=512, n_modes=3):
         super().__init__()
         self.mlp = nn.Sequential(
-            nn.Linear(hidden, 256), nn.GELU(), nn.Dropout(0.15),
+            nn.Linear(hidden, 128), nn.GELU(),
+            nn.Linear(128, n_modes * 3),
+        )
+
+    def forward(self, latent):
+        logits = self.mlp(latent).view(latent.shape[0], -1, 3)  # [B, K, 3]
+        return F.log_softmax(logits, dim=-1)
+
+
+class PhiScaleHead(nn.Module):
+    """模态幅值预测器。接收 latent + 方向概率 [B, 512+K*3]，预测物理 joint scale。
+
+    DirectionBranchHead 输出的方向比例作为"条件小抄"，让 scale 头知道每阶是 Z主导/XY主导。
+    """
+
+    def __init__(self, hidden=512, n_modes=3):
+        super().__init__()
+        self.mlp = nn.Sequential(
+            nn.Linear(hidden + n_modes * 3, 256), nn.GELU(), nn.Dropout(0.15),
             nn.Linear(256, 128), nn.GELU(),
             nn.Linear(128, n_modes),
         )
         with torch.no_grad():
             self.mlp[-1].bias.copy_(torch.zeros(n_modes))
 
-    def forward(self, latent):
-        return torch.exp(self.mlp(latent))  # [B, K]
+    def forward(self, conditioned_latent):
+        return torch.exp(self.mlp(conditioned_latent))  # [B, K]
 
 
 class UNetPhysicsModel(nn.Module):
@@ -258,6 +277,7 @@ class UNetPhysicsModel(nn.Module):
         self.micro_decoder = MicroDecoder(hidden, n_modes)
         self.phi_refiner = NodePhiRefiner(hidden, node_feat_dim=7, n_modes=n_modes)
         self.phi_scale_head = PhiScaleHead(hidden, n_modes)
+        self.branch_head = DirectionBranchHead(hidden, n_modes)
         self.physics = PhysicsDecoder(amp_scale, freq_min, freq_max)
 
     def forward(self, image_tensor, query_coords, frequencies=None,
@@ -292,16 +312,20 @@ class UNetPhysicsModel(nn.Module):
         log_zeta = self.zeta_head(latent)
         zeta = torch.exp(log_zeta)
 
+        # 方向分类头: 预测每模态 XYZ 能量比例, 作为 PhiScaleHead 的"条件小抄"
+        self.branch_log_probs = self.branch_head(latent)             # [B, K, 3]
+        branch_probs = torch.exp(self.branch_log_probs).view(B, -1)  # [B, K*3]
+        conditioned_latent = torch.cat([latent, branch_probs], dim=-1)  # [B, 512+K*3]
+
         # 振型: 2D map → grid_sample → [N, K, 3]
-        # 形数解耦：UNet 输出纯形状(unit std)，PhiScaleHead 预测物理幅值
         mode_maps = self.micro_decoder(latent, skips)                # [B, K*3, H, W]
 
-        # 联合归一化 + 逐向 scale: 特征层保持 XYZ 自然比例(不放大噪声), 幅值层独立控制每方向
+        # 联合归一化 + 共享 scale (有条件方向信息)
         mode_maps_3d = mode_maps.view(B, self.n_modes, 3, mode_maps.shape[-2], mode_maps.shape[-1])
         maps_flat = mode_maps_3d.reshape(B, self.n_modes, -1)       # [B, K, 3*H*W]
         maps_std = torch.std(maps_flat, dim=2) + 1e-8               # [B, K] 联合 std
         normalized_maps = mode_maps_3d / maps_std.view(B, self.n_modes, 1, 1, 1)
-        scale = self.phi_scale_head(latent)                          # [B, K]
+        scale = self.phi_scale_head(conditioned_latent)              # [B, K]
         mode_maps_3d = normalized_maps * scale.view(B, self.n_modes, 1, 1, 1)
 
         # 合并回 [B, K*3, H, W] 送入 grid_sample
