@@ -8,7 +8,7 @@ import torch, numpy as np
 import matplotlib; matplotlib.use('Agg'); import matplotlib.pyplot as plt
 from data.dataset import GeometricHDF5Dataset
 
-data_dir = os.path.join(os.path.dirname(__file__), "..", "ansys", "data")
+data_dir = os.path.join(os.path.dirname(__file__), "..", "ansys", "data_2")
 out_dir  = os.path.join(os.path.dirname(__file__), "output")
 os.makedirs(out_dir, exist_ok=True)
 
