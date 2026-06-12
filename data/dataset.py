@@ -40,7 +40,7 @@ class GeometricHDF5Dataset(Dataset):
                         omega = f[key]['modal_omega'][:]
                         fhz = omega / (2.0 * np.pi)
                         g32 = fhz[2] - fhz[1]
-                        if g32 < 150.0 or g32 > 900.0:
+                        if g32 < 200.0 or g32 > 900.0:
                             continue
                         self._samples.append((fp, key))
         if len(self._samples) == 0:
