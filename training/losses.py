@@ -136,3 +136,14 @@ def frf_loss(frf_pred, frf_target):
     loss_cdf = F.l1_loss(cdf_pred, cdf_target)
 
     return loss_db + 10.0 * loss_cdf
+
+
+def branch_loss(branch_log_probs, modal_effm):
+    """KL 散度辅助损失: 用有效质量比例切分 latent 空间 (Mode 2 断崖分类)
+
+    branch_log_probs: [B, K, 3] 来自 F.log_softmax
+    modal_effm:       [B, K, 3] 真实有效质量
+    """
+    effm_abs = torch.abs(modal_effm) + 1e-8
+    target_probs = effm_abs / effm_abs.sum(dim=-1, keepdim=True)
+    return F.kl_div(branch_log_probs, target_probs, reduction='batchmean')
