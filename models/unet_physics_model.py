@@ -298,11 +298,12 @@ class UNetPhysicsModel(nn.Module):
         # 形数解耦：UNet 输出纯形状(unit std)，PhiScaleHead 预测物理幅值
         mode_maps = self.micro_decoder(latent, skips)                # [B, K*3, H, W]
 
-        # 逐方向归一化: 每方向独立 unit std, 与 PhiScaleHead [B,K,3] 和 loss 逐向 std 一致
+        # 联合归一化 + 逐向 scale: 特征层保持 XYZ 自然比例(不放大噪声), 幅值层独立控制每方向
         mode_maps_3d = mode_maps.view(B, self.n_modes, 3, mode_maps.shape[-2], mode_maps.shape[-1])
-        maps_std = torch.std(mode_maps_3d, dim=(3, 4)) + 1e-8      # [B, K, 3] 逐方向
-        normalized_maps = mode_maps_3d / maps_std.view(B, self.n_modes, 3, 1, 1)
-        scale = self.phi_scale_head(latent)                          # [B, K, 3]
+        maps_flat = mode_maps_3d.reshape(B, self.n_modes, -1)       # [B, K, 3*H*W]
+        maps_std = torch.std(maps_flat, dim=2) + 1e-8               # [B, K] 联合 std
+        normalized_maps = mode_maps_3d / maps_std.view(B, self.n_modes, 1, 1, 1)
+        scale = self.phi_scale_head(latent)                          # [B, K, 3] 逐向 scale
         mode_maps_3d = normalized_maps * scale.view(B, self.n_modes, 3, 1, 1)
 
         # 合并回 [B, K*3, H, W] 送入 grid_sample
