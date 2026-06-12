@@ -78,8 +78,6 @@ def train(args, config, model_cfg, net, dataloader, optimizer,
             node_features = batch.get('node_features')
             node_xyz = node_xyz.to(args.device) if node_xyz is not None else None
             node_features = node_features.to(args.device) if node_features is not None else None
-            effm_target = batch.get('modal_effm')
-            effm_target = effm_target.to(args.device) if effm_target is not None else None
 
             with torch.cuda.amp.autocast(enabled=args.fp16):
                 if in_phase2:
@@ -119,7 +117,7 @@ def train(args, config, model_cfg, net, dataloader, optimizer,
                         phi_pred, batch['modal_phi'].to(args.device),
                         batch_idx=batch_idx_t,
                         omega_weight=current_omega_w, zeta_weight=current_zeta_w,
-                        phi_weight=current_phi_w, effm_target=effm_target)
+                        phi_weight=current_phi_w)
                     mac_losses.append(mac_val.detach().cpu().numpy())
                     pn, pa = _compute_phi_metrics(phi_pred, batch['modal_phi'].to(args.device), batch_idx_t)
                     phi_n_losses.append(pn.detach().cpu().numpy())
@@ -140,7 +138,7 @@ def train(args, config, model_cfg, net, dataloader, optimizer,
                         phi_pred, batch['modal_phi'].to(args.device),
                         batch_idx=batch_idx_t,
                         omega_weight=current_omega_w, zeta_weight=current_zeta_w,
-                        phi_weight=current_phi_w, effm_target=effm_target)
+                        phi_weight=current_phi_w)
                     loss = loss_m
                     mac_losses.append(mac_val.detach().cpu().numpy())
                     pn, pa = _compute_phi_metrics(phi_pred, batch['modal_phi'].to(args.device), batch_idx_t)
