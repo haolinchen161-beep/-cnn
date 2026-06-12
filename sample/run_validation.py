@@ -18,7 +18,7 @@ CONFIG = {
     # 阶段控制
     'enable_phase2': True,           # 开启 FRF 联合训练
     'phase2_min_epoch': 200,         # 200 轮模态预训练后进 Phase2
-    'zeta_warmup_epochs': 40,        # 前40轮 zeta_w=0 (防 spike)
+    'zeta_warmup_epochs': 0,        # 前40轮 zeta_w=0 (防 spike)
 
     # 模态损失权重 (trainer 内部: omega 在 Hz 空间, zeta 在 log 空间, phi 归一化后 MSE+MAC+std)
     'omega_loss_weight': 1.0,        # 频率损失权重 (Hz-space smooth_l1)
@@ -124,7 +124,7 @@ def main():
             log_z, batch['modal_zeta'].to(args.device),
             phi_p, batch['modal_phi'].to(args.device),
             batch_idx=batch_idx,
-            omega_weight=1.0, zeta_weight=0.0, phi_weight=3.0)
+            omega_weight=1.0, zeta_weight=10.0, phi_weight=3.0)
     mac_str = '/'.join(f'{x:.3f}' for x in mac_val.tolist())
     print(f"  Init loss: {init_loss.item():.0f} MAC=[{mac_str}]")
     print(f"  ω pred[0] Hz: {[f'{x/(2*torch.pi):.0f}' for x in omega_p[0].tolist()]}")
