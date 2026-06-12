@@ -63,30 +63,52 @@ def modal_loss(omega_phys_pred, omega_phys_target,
     sign = torch.sign(dot + 1e-8)
     aligned_target = phi_target * sign
 
-    # 联合 Std: 每模态一个总幅值 [K]
-    p_std = torch.std(phi_pred.transpose(0, 1).reshape(phi_pred.shape[1], -1), dim=1) + 1e-8
-    t_std = torch.std(phi_target.transpose(0, 1).reshape(phi_target.shape[1], -1), dim=1) + 1e-8
-    p_std_view = p_std.view(1, -1, 1)
-    t_std_view = t_std.view(1, -1, 1)
+    # 逐图联合 Std: Z主导/XY主导 不放一起归一化, 各自用自己的 std
+    if batch_idx is not None:
+        n_graphs = int(batch_idx.max().item()) + 1
+        p_std_list, t_std_list, direc_weight_list = [], [], []
+        for i in range(n_graphs):
+            mask = (batch_idx == i)
+            p_i = phi_pred[mask]          # [N_i, K, 3]
+            t_i = aligned_target[mask]    # [N_i, K, 3]
+
+            # 单图联合 Std: [K]
+            p_std_i = torch.std(p_i.transpose(0, 1).reshape(p_i.shape[1], -1), dim=1) + 1e-8
+            t_std_i = torch.std(t_i.transpose(0, 1).reshape(t_i.shape[1], -1), dim=1) + 1e-8
+            p_std_list.append(p_std_i)
+            t_std_list.append(t_std_i)
+
+            # 方向能量权重
+            energy_i = torch.sum(t_i ** 2, dim=0)                # [K, 3]
+            sum_energy_i = torch.sum(energy_i, dim=-1, keepdim=True) + 1e-8
+            w_i = (energy_i / sum_energy_i) * 3.0               # [K, 3]
+            direc_weight_list.append(w_i.unsqueeze(0).expand(mask.sum(), -1, -1))
+
+        p_std = torch.stack(p_std_list, dim=0)       # [B, K]
+        t_std = torch.stack(t_std_list, dim=0)       # [B, K]
+        # 每个节点用自己的图级 std 归一化
+        p_std_view = p_std[batch_idx].unsqueeze(-1)  # [total_N, K, 1]
+        t_std_view = t_std[batch_idx].unsqueeze(-1)
+
+        direc_weight = torch.cat(direc_weight_list, dim=0)
+    else:
+        p_std = torch.std(phi_pred.transpose(0, 1).reshape(phi_pred.shape[1], -1), dim=1) + 1e-8
+        t_std = torch.std(phi_target.transpose(0, 1).reshape(phi_target.shape[1], -1), dim=1) + 1e-8
+        p_std_view = p_std.view(1, -1, 1)
+        t_std_view = t_std.view(1, -1, 1)
+        energy = torch.sum(aligned_target ** 2, dim=0)
+        sum_energy = torch.sum(energy, dim=-1, keepdim=True) + 1e-8
+        direc_weight = (energy / sum_energy) * 3.0
 
     phi_pred_norm = phi_pred / p_std_view
     phi_target_norm = aligned_target / t_std_view
 
-    # 基于真实振型空间形变能量的方向加权 (平方和, 反对称不抵消)
     if batch_idx is not None:
-        n_graphs = int(batch_idx.max().item()) + 1
-        direc_weight_list = []
-        for i in range(n_graphs):
-            mask = (batch_idx == i)
-            t_i = aligned_target[mask]                           # [N_i, K, 3]
-            energy_i = torch.sum(t_i ** 2, dim=0)                # [K, 3] 平方和
-            sum_energy_i = torch.sum(energy_i, dim=-1, keepdim=True) + 1e-8
-            w_i = (energy_i / sum_energy_i) * 3.0               # [K, 3] 各向之和=3
-            direc_weight_list.append(w_i.unsqueeze(0).expand(mask.sum(), -1, -1))
-        direc_weight = torch.cat(direc_weight_list, dim=0)      # [N, K, 3]
         mse_elements = F.mse_loss(phi_pred_norm, phi_target_norm, reduction='none')
         raw_phi_mse = torch.mean(mse_elements * direc_weight)
     else:
+        mse_elements = F.mse_loss(phi_pred_norm, phi_target_norm, reduction='none')
+        raw_phi_mse = torch.mean(mse_elements * direc_weight.unsqueeze(0))
         energy = torch.sum(aligned_target ** 2, dim=0)
         sum_energy = torch.sum(energy, dim=-1, keepdim=True) + 1e-8
         direc_weight = (energy / sum_energy) * 3.0
