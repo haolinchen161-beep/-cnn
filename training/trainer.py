@@ -46,7 +46,7 @@ def train(args, config, model_cfg, net, dataloader, optimizer,
     try:
       for epoch in range(start_epoch, total_epochs):
         losses, omega_losses, zeta_losses, mac_losses = [], [], [], []
-        phi_n_losses, phi_a_losses, kl_losses, dir_accs, dir_accs_m2, dir_accs_m3 = [], [], [], [], []
+        phi_n_losses, phi_a_losses, kl_losses, dir_accs, dir_accs_m2, dir_accs_m3 = [], [], [], [], [], []
         weighted_w_losses, weighted_z_losses, weighted_p_losses = [], [], []
 
         in_phase1 = not phase2_unlocked
