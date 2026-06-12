@@ -11,7 +11,7 @@ import os
 import numpy as np
 import torch
 import torch.nn.functional as F
-from .losses import modal_loss, frf_loss
+from .losses import modal_loss, frf_loss, branch_loss
 
 
 def train(args, config, model_cfg, net, dataloader, optimizer,
@@ -38,7 +38,7 @@ def train(args, config, model_cfg, net, dataloader, optimizer,
     log_file = open(log_path, 'a', newline='')
     log_writer = csv.writer(log_file)
     if not log_exists:
-        log_writer.writerow(['轮次', '训练损失', 'w1%','w2%','w3%', 'z1%','z2%','z3%', 'φloss', 'φn1','φn2','φn3', 'φa1','φa2','φa3', 'MAC1','MAC2','MAC3', 'w占比%','z占比%','phi占比%','FRF占比%', '验证MSE', '幅值MAE', '幅值MAPE%', '学习率'])
+        log_writer.writerow(['轮次', '训练损失', 'w1%','w2%','w3%', 'z1%','z2%','z3%', 'φloss', 'φn1','φn2','φn3', 'φa1','φa2','φa3', 'MAC1','MAC2','MAC3', 'w占比%','z占比%','phi占比%','FRF占比%', 'kl', 'dir%', '验证MSE', '幅值MAE', '幅值MAPE%', '学习率'])
 
     phase2_unlocked = False
     unlock_epoch = start_epoch
@@ -46,7 +46,7 @@ def train(args, config, model_cfg, net, dataloader, optimizer,
     try:
       for epoch in range(start_epoch, total_epochs):
         losses, omega_losses, zeta_losses, mac_losses = [], [], [], []
-        phi_n_losses, phi_a_losses = [], []
+        phi_n_losses, phi_a_losses, kl_losses, dir_accs = [], [], [], []
         weighted_w_losses, weighted_z_losses, weighted_p_losses = [], [], []
 
         in_phase1 = not phase2_unlocked
@@ -126,7 +126,13 @@ def train(args, config, model_cfg, net, dataloader, optimizer,
                     raw_frf = frf_loss(frf_pred, batch['point_frf'].to(args.device))
                     frf_warmup = config.get('frf_warmup_epochs', 20)
                     current_frf_w = frf_weight * min(1.0, phase2_epoch / max(frf_warmup, 1))
-                    loss = loss_m + current_frf_w * raw_frf
+                    phi_tgt = batch['modal_phi'].to(args.device)
+                    kl = branch_loss(net.branch_log_probs, phi_tgt, batch_idx_t)
+                    kl_losses.append(kl.detach().cpu().item())
+                    pred_dir = net.branch_log_probs.argmax(dim=-1)  # [B, K]
+                    true_energy = torch.stack([torch.sum(phi_tgt[batch_idx_t == b] ** 2, dim=(0,)).argmax(dim=-1) for b in range(int(batch_idx_t.max())+1)])  # [B, K]
+                    dir_accs.append((pred_dir.cpu() == true_energy.cpu()).float().mean().item())
+                    loss = loss_m + current_frf_w * raw_frf + 20.0 * kl
                 else:
                     _, omega_phys_pred, log_zeta_pred, zeta_pred, phi_pred = net(
                         img, coords, None, None, batch_idx_t,
@@ -139,7 +145,13 @@ def train(args, config, model_cfg, net, dataloader, optimizer,
                         batch_idx=batch_idx_t,
                         omega_weight=current_omega_w, zeta_weight=current_zeta_w,
                         phi_weight=current_phi_w)
-                    loss = loss_m
+                    phi_tgt = batch['modal_phi'].to(args.device)
+                    kl = branch_loss(net.branch_log_probs, phi_tgt, batch_idx_t)
+                    kl_losses.append(kl.detach().cpu().item())
+                    pred_dir = net.branch_log_probs.argmax(dim=-1)
+                    true_energy = torch.stack([torch.sum(phi_tgt[batch_idx_t == b] ** 2, dim=(0,)).argmax(dim=-1) for b in range(int(batch_idx_t.max())+1)])
+                    dir_accs.append((pred_dir.cpu() == true_energy.cpu()).float().mean().item())
+                    loss = loss_m + 20.0 * kl
                     mac_losses.append(mac_val.detach().cpu().numpy())
                     pn, pa = _compute_phi_metrics(phi_pred, batch['modal_phi'].to(args.device), batch_idx_t)
                     phi_n_losses.append(pn.detach().cpu().numpy())
@@ -204,7 +216,9 @@ def train(args, config, model_cfg, net, dataloader, optimizer,
             mac_scalar = mac_per_mode.mean()
         else:
             mac_str = 'MAC=...'; mac_scalar = 0
-        _log(f"Epoch {epoch:4d} | {w_str} {z_str} {phi_str} {mac_str} | w{omega_share:.0f}% z{zeta_share:.0f}% ph{phi_share:.0f}% | loss={mean_loss:.1f}", logger)
+        kl_avg = np.mean(kl_losses) if kl_losses else 0
+        dir_acc = np.mean(dir_accs) * 100 if dir_accs else 0
+        _log(f"Epoch {epoch:4d} | {w_str} {z_str} {phi_str} {mac_str} | w{omega_share:.0f}z{zeta_share:.0f}ph{phi_share:.0f} | kl={kl_avg:.3f} dir={dir_acc:.0f}% | loss={mean_loss:.1f}", logger)
 
         # 动态解锁: enable_phase2=True 且 epoch >= phase2_min_epoch
         enable_phase2 = config.get('enable_phase2', False)
@@ -222,7 +236,7 @@ def train(args, config, model_cfg, net, dataloader, optimizer,
                 val_results = evaluate(args, config, net, valloader, logger, epoch, phase1=True)
                 omega_mae = val_results.get("ω_MAE (rad/s)", -1)
                 _log(f"Epoch {epoch:4d} | ω_MAE={omega_mae:.1f} rad/s (Phase1)", logger)
-                log_writer.writerow([epoch, f'{mean_loss:.2e}', f'{omega_per_mode[0]:.3f}',f'{omega_per_mode[1]:.3f}',f'{omega_per_mode[2]:.3f}', f'{zeta_per_mode[0]:.1f}',f'{zeta_per_mode[1]:.1f}',f'{zeta_per_mode[2]:.1f}', f'{phi_loss:.2f}', f'{phi_n_per_mode[0]:.1f}',f'{phi_n_per_mode[1]:.1f}',f'{phi_n_per_mode[2]:.1f}', f'{phi_a_per_mode[0]:.1f}',f'{phi_a_per_mode[1]:.1f}',f'{phi_a_per_mode[2]:.1f}', f'{mac_per_mode[0]:.3f}',f'{mac_per_mode[1]:.3f}',f'{mac_per_mode[2]:.3f}', f'{omega_share:.1f}', f'{zeta_share:.1f}', f'{phi_share:.1f}', '0', '', '', '', f'{lr:.2e}'])
+                log_writer.writerow([epoch, f'{mean_loss:.2e}', f'{omega_per_mode[0]:.3f}',f'{omega_per_mode[1]:.3f}',f'{omega_per_mode[2]:.3f}', f'{zeta_per_mode[0]:.1f}',f'{zeta_per_mode[1]:.1f}',f'{zeta_per_mode[2]:.1f}', f'{phi_loss:.2f}', f'{phi_n_per_mode[0]:.1f}',f'{phi_n_per_mode[1]:.1f}',f'{phi_n_per_mode[2]:.1f}', f'{phi_a_per_mode[0]:.1f}',f'{phi_a_per_mode[1]:.1f}',f'{phi_a_per_mode[2]:.1f}', f'{mac_per_mode[0]:.3f}',f'{mac_per_mode[1]:.3f}',f'{mac_per_mode[2]:.3f}', f'{omega_share:.1f}', f'{zeta_share:.1f}', f'{phi_share:.1f}', '0', '', '', '', f'{kl_avg:.4f}', f'{dir_acc:.1f}', f'{lr:.2e}'])
             else:
                 val_results = evaluate(args, config, net, valloader, logger, epoch)
                 val_loss = val_results["loss (MSE)"]
@@ -230,7 +244,7 @@ def train(args, config, model_cfg, net, dataloader, optimizer,
                 log_writer.writerow([epoch, f'{mean_loss:.2e}', f'{omega_per_mode[0]:.3f}',f'{omega_per_mode[1]:.3f}',f'{omega_per_mode[2]:.3f}', f'{zeta_per_mode[0]:.1f}',f'{zeta_per_mode[1]:.1f}',f'{zeta_per_mode[2]:.1f}', f'{phi_loss:.2f}', f'{phi_n_per_mode[0]:.1f}',f'{phi_n_per_mode[1]:.1f}',f'{phi_n_per_mode[2]:.1f}', f'{phi_a_per_mode[0]:.1f}',f'{phi_a_per_mode[1]:.1f}',f'{phi_a_per_mode[2]:.1f}', f'{mac_per_mode[0]:.3f}',f'{mac_per_mode[1]:.3f}',f'{mac_per_mode[2]:.3f}', f'{omega_share:.1f}', f'{zeta_share:.1f}', f'{phi_share:.1f}', f'{frf_share:.1f}', f'{val_loss:.4f}',
                                      f'{val_results.get("Amplitude MAE", 0):.4f}',
                                      f'{val_results.get("Amplitude MAPE (%)", 0):.2f}',
-                                     f'{lr:.2e}'])
+                                     f'{kl_avg:.4f}', f'{dir_acc:.1f}', f'{lr:.2e}'])
             log_file.flush()
 
             # best checkpoint: 用验证集 ω_MAE (防过拟合)
@@ -248,7 +262,7 @@ def train(args, config, model_cfg, net, dataloader, optimizer,
                 lowest = best_metric
         else:
             frf_s = 0 if in_phase1 else (100 - omega_share - zeta_share - phi_share)
-            log_writer.writerow([epoch, f'{mean_loss:.2e}', f'{omega_per_mode[0]:.3f}',f'{omega_per_mode[1]:.3f}',f'{omega_per_mode[2]:.3f}', f'{zeta_per_mode[0]:.1f}',f'{zeta_per_mode[1]:.1f}',f'{zeta_per_mode[2]:.1f}', f'{phi_loss:.2f}', f'{phi_n_per_mode[0]:.1f}',f'{phi_n_per_mode[1]:.1f}',f'{phi_n_per_mode[2]:.1f}', f'{phi_a_per_mode[0]:.1f}',f'{phi_a_per_mode[1]:.1f}',f'{phi_a_per_mode[2]:.1f}', f'{mac_per_mode[0]:.3f}',f'{mac_per_mode[1]:.3f}',f'{mac_per_mode[2]:.3f}', f'{omega_share:.1f}', f'{zeta_share:.1f}', f'{phi_share:.1f}', f'{frf_s:.1f}', '', '', '', f'{lr:.2e}'])
+            log_writer.writerow([epoch, f'{mean_loss:.2e}', f'{omega_per_mode[0]:.3f}',f'{omega_per_mode[1]:.3f}',f'{omega_per_mode[2]:.3f}', f'{zeta_per_mode[0]:.1f}',f'{zeta_per_mode[1]:.1f}',f'{zeta_per_mode[2]:.1f}', f'{phi_loss:.2f}', f'{phi_n_per_mode[0]:.1f}',f'{phi_n_per_mode[1]:.1f}',f'{phi_n_per_mode[2]:.1f}', f'{phi_a_per_mode[0]:.1f}',f'{phi_a_per_mode[1]:.1f}',f'{phi_a_per_mode[2]:.1f}', f'{mac_per_mode[0]:.3f}',f'{mac_per_mode[1]:.3f}',f'{mac_per_mode[2]:.3f}', f'{omega_share:.1f}', f'{zeta_share:.1f}', f'{phi_share:.1f}', f'{frf_s:.1f}', '', '', '', f'{kl_avg:.4f}', f'{dir_acc:.1f}', f'{lr:.2e}'])
 
         if epoch == (total_epochs - 1):
             path = os.path.join(args.dir, "checkpoint_best")
@@ -297,6 +311,7 @@ def _apply_gradient_clip(net, config):
     _clip_module(net, 'zeta_head', 2.0)
     _clip_module(net, 'phi_refiner', 2.0)
     _clip_module(net, 'phi_scale_head', 2.0)
+    _clip_module(net, 'branch_head', 2.0)
 
 
 def _clip_module(net, prefix, max_norm):
