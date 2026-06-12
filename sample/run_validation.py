@@ -41,7 +41,7 @@ CONFIG = {
 
     'optimizer': {
         'name': 'AdamW',
-        'kwargs': {'lr': 0.001, 'weight_decay': 0.0003, 'betas': (0.9, 0.999)},
+        'kwargs': {'lr': 0.001, 'weight_decay': 0.001, 'betas': (0.9, 0.999)},
         'gradient_clip': 2.0,
     },
 }
@@ -70,7 +70,7 @@ def main():
     print("UNetPhysicsModel (2.5D CNN) — ANSYS 3D 凹槽工件")
     print("=" * 60)
     args = SimpleArgs()
-    data_dir = os.path.join(os.path.dirname(__file__), "..", "ansys", "data")
+    data_dir = os.path.join(os.path.dirname(__file__), "..", "ansys", "data_2")
     print(f"Device: {args.device}, Batch: {args.batch_size}")
 
     # 数据
@@ -133,7 +133,7 @@ def main():
     # 训练
     print("\n--- Step 5: Train ---")
     optimizer = torch.optim.AdamW(net.parameters(), **CONFIG['optimizer']['kwargs'])
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=500, eta_min=1e-6)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(optimizer, T_0=400, T_mult=1, eta_min=1e-6)
     start_epoch = 0
     ckpt_path = os.path.join(args.dir, "checkpoint_last")
     if os.path.exists(ckpt_path):
