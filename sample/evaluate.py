@@ -40,7 +40,7 @@ MODEL_CFG = {
 }
 
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
-data_dir = os.path.join(os.path.dirname(__file__), '..', 'ansys', 'data')
+data_dir = os.path.join(os.path.dirname(__file__), '..', 'ansys', 'data_2')
 out_dir = os.path.join(os.path.dirname(__file__), 'output')
 ckpt_path = os.path.join(out_dir, 'checkpoint_best')
 
