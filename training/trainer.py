@@ -11,7 +11,7 @@ import os
 import numpy as np
 import torch
 import torch.nn.functional as F
-from .losses import modal_loss, frf_loss, branch_loss
+from .losses import modal_loss, frf_loss
 
 
 def train(args, config, model_cfg, net, dataloader, optimizer,
@@ -46,7 +46,6 @@ def train(args, config, model_cfg, net, dataloader, optimizer,
     try:
       for epoch in range(start_epoch, total_epochs):
         losses, omega_losses, zeta_losses, mac_losses = [], [], [], []
-        kl_losses = []
         phi_n_losses, phi_a_losses = [], []
         weighted_w_losses, weighted_z_losses, weighted_p_losses = [], [], []
 
@@ -79,8 +78,6 @@ def train(args, config, model_cfg, net, dataloader, optimizer,
             node_features = batch.get('node_features')
             node_xyz = node_xyz.to(args.device) if node_xyz is not None else None
             node_features = node_features.to(args.device) if node_features is not None else None
-            effm = batch.get('modal_effm')
-            effm = effm.to(args.device) if effm is not None else None
 
             with torch.cuda.amp.autocast(enabled=args.fp16):
                 if in_phase2:
@@ -129,9 +126,7 @@ def train(args, config, model_cfg, net, dataloader, optimizer,
                     raw_frf = frf_loss(frf_pred, batch['point_frf'].to(args.device))
                     frf_warmup = config.get('frf_warmup_epochs', 20)
                     current_frf_w = frf_weight * min(1.0, phase2_epoch / max(frf_warmup, 1))
-                    kl = branch_loss(net.branch_log_probs, effm) if effm is not None else torch.tensor(0.0)
-                    loss = loss_m + current_frf_w * raw_frf + 20.0 * kl
-                    kl_losses.append(kl.detach().cpu().item())
+                    loss = loss_m + current_frf_w * raw_frf
                 else:
                     _, omega_phys_pred, log_zeta_pred, zeta_pred, phi_pred = net(
                         img, coords, None, None, batch_idx_t,
@@ -144,9 +139,7 @@ def train(args, config, model_cfg, net, dataloader, optimizer,
                         batch_idx=batch_idx_t,
                         omega_weight=current_omega_w, zeta_weight=current_zeta_w,
                         phi_weight=current_phi_w)
-                    kl = branch_loss(net.branch_log_probs, effm) if effm is not None else torch.tensor(0.0)
-                    loss = loss_m + 20.0 * kl
-                    kl_losses.append(kl.detach().cpu().item())
+                    loss = loss_m
                     mac_losses.append(mac_val.detach().cpu().numpy())
                     pn, pa = _compute_phi_metrics(phi_pred, batch['modal_phi'].to(args.device), batch_idx_t)
                     phi_n_losses.append(pn.detach().cpu().numpy())
@@ -211,8 +204,7 @@ def train(args, config, model_cfg, net, dataloader, optimizer,
             mac_scalar = mac_per_mode.mean()
         else:
             mac_str = 'MAC=...'; mac_scalar = 0
-        mean_kl = np.mean(kl_losses) if kl_losses else 0
-        _log(f"Epoch {epoch:4d} | {w_str} {z_str} {phi_str} {mac_str} | w{omega_share:.0f}% z{zeta_share:.0f}% ph{phi_share:.0f}% | loss={mean_loss:.1f} kl={mean_kl:.2f}", logger)
+        _log(f"Epoch {epoch:4d} | {w_str} {z_str} {phi_str} {mac_str} | w{omega_share:.0f}% z{zeta_share:.0f}% ph{phi_share:.0f}% | loss={mean_loss:.1f}", logger)
 
         # 动态解锁: enable_phase2=True 且 epoch >= phase2_min_epoch
         enable_phase2 = config.get('enable_phase2', False)
