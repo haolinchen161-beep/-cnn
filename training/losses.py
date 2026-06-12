@@ -136,3 +136,32 @@ def frf_loss(frf_pred, frf_target):
     loss_cdf = F.l1_loss(cdf_pred, cdf_target)
 
     return loss_db + 10.0 * loss_cdf
+
+
+def branch_loss(branch_log_probs, phi_target, batch_idx, mode_weights=None):
+    """加权 KL 散度辅助损失: 方向分类头预测方向能量比例, Mode 2 权重最高。
+
+    branch_log_probs: [B, K, 3] log_softmax 输出
+    phi_target:        [total_N, K, 3] 真实振型 (用于计算 Σφ² 能量)
+    batch_idx:         [total_N] 批次索引
+    mode_weights:      [K] 每阶权重, 默认 Mode 2 权重 5.0
+    """
+    n_graphs = int(batch_idx.max().item()) + 1
+    kl_per_list = []
+
+    for i in range(n_graphs):
+        mask = (batch_idx == i)
+        phi_i = phi_target[mask]  # [N_i, K, 3]
+        energy = torch.sum(phi_i ** 2, dim=0)  # [K, 3] Σφ² 防抵消
+        target_probs = energy / (energy.sum(dim=-1, keepdim=True) + 1e-8)  # [K, 3]
+
+        kl_per = F.kl_div(branch_log_probs[i:i+1], target_probs.unsqueeze(0),
+                          reduction='none').sum(dim=-1)  # [1, K]
+        kl_per_list.append(kl_per)
+
+    kl_all = torch.cat(kl_per_list, dim=0)  # [B, K]
+
+    if mode_weights is None:
+        mode_weights = torch.tensor([0.1, 5.0, 0.5], device=kl_all.device)
+
+    return (kl_all * mode_weights.view(1, -1)).mean()
