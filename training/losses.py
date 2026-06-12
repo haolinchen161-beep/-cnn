@@ -58,10 +58,17 @@ def modal_loss(omega_phys_pred, omega_phys_target,
         phi_pred = phi_pred.view(-1, phi_pred.shape[-2], phi_pred.shape[-1])
         phi_target = phi_target.view(-1, phi_target.shape[-2], phi_target.shape[-1])
 
-    # 符号对齐: 三维内积 [N,K,3] → 沿 (0,2) 求和
-    dot = torch.sum(phi_pred * phi_target, dim=(0, 2), keepdim=True)   # [1, K, 1]
-    sign = torch.sign(dot + 1e-8)
-    aligned_target = phi_target * sign
+    # 逐图符号对齐: 不同样本的 ANSYS 振型符号可能相反, 不混一起
+    if batch_idx is not None:
+        aligned_target = torch.empty_like(phi_target)
+        n_graphs_sign = int(batch_idx.max().item()) + 1
+        for b in range(n_graphs_sign):
+            m = batch_idx == b
+            dot_b = torch.sum(phi_pred[m] * phi_target[m], dim=(0, 2), keepdim=True)
+            aligned_target[m] = phi_target[m] * torch.sign(dot_b + 1e-8)
+    else:
+        dot = torch.sum(phi_pred * phi_target, dim=(0, 2), keepdim=True)
+        aligned_target = phi_target * torch.sign(dot + 1e-8)
 
     # 逐图联合 Std: Z主导/XY主导 不放一起归一化, 各自用自己的 std
     if batch_idx is not None:
