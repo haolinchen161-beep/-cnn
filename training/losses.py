@@ -109,11 +109,6 @@ def modal_loss(omega_phys_pred, omega_phys_target,
     else:
         mse_elements = F.mse_loss(phi_pred_norm, phi_target_norm, reduction='none')
         raw_phi_mse = torch.mean(mse_elements * direc_weight.unsqueeze(0))
-        energy = torch.sum(aligned_target ** 2, dim=0)
-        sum_energy = torch.sum(energy, dim=-1, keepdim=True) + 1e-8
-        direc_weight = (energy / sum_energy) * 3.0
-        mse_elements = F.mse_loss(phi_pred_norm, phi_target_norm, reduction='none')
-        raw_phi_mse = torch.mean(mse_elements * direc_weight.unsqueeze(0))
 
     # MAC: 三维，尺度无关
     if batch_idx is not None:
@@ -128,8 +123,11 @@ def modal_loss(omega_phys_pred, omega_phys_target,
         mac = _mac_per_graph(phi_pred, aligned_target)
         loss_mac = (1.0 - mac).mean()
 
-    # 联合 Std Ratio (线性域)
+    # 联合 Std Ratio (线性域, 约束总尺度)
     loss_std = F.smooth_l1_loss(p_std, t_std)
+
+    # 逐方向范数对数约束 (约束 XYZ 比例绝对尺度, 防内部错配)
+    loss_dir_norm = per_graph_direction_norm_loss(phi_pred, aligned_target, batch_idx)
 
     # MAC (用于日志): 逐模态 [K]
     if batch_idx is not None:
@@ -141,7 +139,7 @@ def modal_loss(omega_phys_pred, omega_phys_target,
     else:
         mac_per_mode = _mac_per_graph(phi_pred, aligned_target)   # [K]
 
-    loss_phi = (10.0 * raw_phi_mse + 40.0 * loss_mac + 20.0 * loss_std) * phi_weight
+    loss_phi = (10.0 * raw_phi_mse + 40.0 * loss_mac + 20.0 * loss_std + 10.0 * loss_dir_norm) * phi_weight
 
     return loss_omega + loss_zeta + loss_phi, loss_omega, loss_zeta, loss_phi, mac_per_mode.detach()
 
@@ -158,6 +156,33 @@ def frf_loss(frf_pred, frf_target):
     loss_cdf = F.l1_loss(cdf_pred, cdf_target)
 
     return loss_db + 10.0 * loss_cdf
+
+
+def per_graph_direction_norm_loss(phi_pred, phi_target, batch_idx, mode_weights=None):
+    """逐方向范数对数误差: 强制约束每阶模态在 XYZ 三向的独立绝对幅值。
+
+    联合 std 可能正确但 XYZ 内部分配错误 (Z 大 X 小, 总和相同) — 此 loss 补盲。
+    """
+    if batch_idx is not None:
+        n_graphs = int(batch_idx.max().item()) + 1
+        losses = []
+        for b in range(n_graphs):
+            m = batch_idx == b
+            p = phi_pred[m]
+            t = phi_target[m]
+            p_norm = torch.sqrt(torch.sum(p ** 2, dim=0) + 1e-8)  # [K, 3]
+            t_norm = torch.sqrt(torch.sum(t ** 2, dim=0) + 1e-8)  # [K, 3]
+            losses.append(torch.abs(torch.log((p_norm + 1e-8) / (t_norm + 1e-8))))
+        loss = torch.stack(losses, dim=0)  # [B, K, 3]
+    else:
+        p_norm = torch.sqrt(torch.sum(phi_pred ** 2, dim=0) + 1e-8)
+        t_norm = torch.sqrt(torch.sum(phi_target ** 2, dim=0) + 1e-8)
+        loss = torch.abs(torch.log((p_norm + 1e-8) / (t_norm + 1e-8))).unsqueeze(0)
+
+    if mode_weights is None:
+        mode_weights = loss.new_tensor([0.2, 5.0, 0.5])
+
+    return torch.mean(loss * mode_weights.view(1, -1, 1))
 
 
 def branch_loss(branch_log_probs, phi_target, batch_idx, mode_weights=None):
