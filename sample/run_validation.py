@@ -28,7 +28,6 @@ CONFIG = {
     # FRF 弱约束: dB空间 MSE×0.5 ≈ 10-20 损失贡献 (总损失 ~200-400 的 5-10%)
     'frf_loss_weight': 0.5,
     'frf_warmup_epochs': 50,
-    'teacher_anneal_epochs': 200,       # Teacher-Forced ω 退火周期: α 1.0→0.0
 
     'freq_min': 1.0, 'freq_max': 5000.0,
     'data_path_train': ['train.h5'],
