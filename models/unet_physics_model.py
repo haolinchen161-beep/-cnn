@@ -173,7 +173,8 @@ class OmegaHead(nn.Module):
 
         # inv_sigmoid 初始化 → epoch 0 即站在均值附近
         def inv_sigmoid(p):
-            return torch.log(torch.tensor(p).clamp(1e-4, 1 - 1e-4))
+            p = torch.tensor(p).clamp(1e-4, 1 - 1e-4)
+            return torch.log(p / (1.0 - p))
 
         b1 = inv_sigmoid((957.0 - self.f1_min) / self.f1_span)
         b2 = inv_sigmoid((1632.0 - self.g21_min) / self.g21_span)
