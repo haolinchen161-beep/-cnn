@@ -152,12 +152,13 @@ class MicroDecoder(nn.Module):
 
 
 class OmegaHead(nn.Module):
-    """物理边界频率头: sigmoid 约束 → f1 + gap21 + gap32, Hz 建模, 最后转 rad/s。"""
+    """物理边界频率头: 接收 latent + 边界 C/K 特征，sigmoid 约束 → f1 + gap21 + gap32, Hz 建模, 最后转 rad/s。"""
 
     def __init__(self, hidden=512, n_modes=3):
         super().__init__()
+        # 输入维度: hidden(512) + 2(边界C/K) = 514
         self.mlp = nn.Sequential(
-            nn.Linear(hidden, 512), nn.GELU(), nn.Dropout(0.2),
+            nn.Linear(hidden + 2, 512), nn.GELU(), nn.Dropout(0.2),
             nn.Linear(512, 256), nn.GELU(), nn.Dropout(0.2),
             nn.Linear(256, 128), nn.GELU(),
             nn.Linear(128, n_modes),
@@ -330,10 +331,7 @@ class UNetPhysicsModel(nn.Module):
 
         latent, skips = self.encoder(image_tensor)
 
-        # 1. 频率: 先预测 ω，作为阻尼的已知物理条件
-        omega_phys = self.omega_head(latent)
-
-        # 2. 提取全图边界 C/K 特征 (弹簧节点平均 log10 值)
+        # 1. 首先提取全图边界 C/K 特征 (给频率和阻尼做联合小抄)
         c_k_features = torch.zeros(B, 2, device=latent.device)
         if node_features is not None and batch is not None:
             for b_idx in range(B):
@@ -342,7 +340,11 @@ class UNetPhysicsModel(nn.Module):
                     c_k_features[b_idx, 0] = node_features[mask, 4].mean()  # log10(K)
                     c_k_features[b_idx, 1] = node_features[mask, 5].mean()  # log10(C)
 
-        # 3. 阻尼输入: latent + ω(归一化, detach) + C/K 边界特征
+        # 2. 频率预测: 把 latent 和 c_k_features 拼起来喂给 OmegaHead
+        omega_input = torch.cat([latent, c_k_features], dim=-1)
+        omega_phys = self.omega_head(omega_input)
+
+        # 3. 阻尼预测: 输入保持不变 (latent + ω + C/K特征)
         zeta_input = torch.cat([
             latent,
             omega_phys.detach() / 5000.0,
