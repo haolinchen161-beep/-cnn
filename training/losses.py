@@ -36,13 +36,34 @@ def modal_loss(omega_phys_pred, omega_phys_target,
     f_pred_hz = omega_phys_pred / (2.0 * torch.pi)
     f_true_hz = omega_phys_target / (2.0 * torch.pi)
 
-    loss_freq_hz = F.smooth_l1_loss(f_pred_hz, f_true_hz)
+    mode_w = f_pred_hz.new_tensor([1.0, 1.3, 1.6]).view(1, 3)
 
-    rel = torch.abs(omega_phys_pred - omega_phys_target) / (omega_phys_target + 1e-8)
-    peak_sensitive = rel / (zeta_target + 1e-8)
-    peak_sensitive = torch.clamp(peak_sensitive, max=100.0)
+    # 1) 绝对 Hz 误差
+    abs_err = F.smooth_l1_loss(f_pred_hz, f_true_hz, reduction='none')
+    loss_freq_abs = torch.mean(abs_err * mode_w)
 
-    loss_omega = (loss_freq_hz + 0.1 * peak_sensitive.mean()) * omega_weight
+    # 2) 相对误差 (×100 对齐 w% 口径)
+    rel_err = (f_pred_hz - f_true_hz) / (f_true_hz + 1e-8)
+    rel_loss = F.smooth_l1_loss(rel_err * 100.0, torch.zeros_like(rel_err), reduction='none')
+    loss_freq_rel = torch.mean(rel_loss * mode_w)
+
+    # 3) Gap loss: 专杀高阶累积误差
+    if f_pred_hz.shape[-1] >= 3:
+        gap_pred = f_pred_hz[:, 1:] - f_pred_hz[:, :-1]
+        gap_true = f_true_hz[:, 1:] - f_true_hz[:, :-1]
+        gap_err = F.smooth_l1_loss(gap_pred, gap_true, reduction='none')
+        gap_w = f_pred_hz.new_tensor([1.2, 1.8]).view(1, 2)
+        loss_gap = torch.mean(gap_err * gap_w)
+    else:
+        loss_gap = f_pred_hz.new_tensor(0.0)
+
+    # 4) 峰值敏感
+    rel_abs = torch.abs(rel_err)
+    peak_sensitive = torch.clamp(rel_abs / (zeta_target + 1e-8), max=100.0)
+
+    loss_omega = (
+        0.5 * loss_freq_abs + 10.0 * loss_freq_rel + 0.5 * loss_gap + 0.05 * peak_sensitive.mean()
+    ) * omega_weight
 
     # ====================================================
     # 2. 对数域阻尼损失
