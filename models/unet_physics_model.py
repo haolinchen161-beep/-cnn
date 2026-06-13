@@ -152,13 +152,12 @@ class MicroDecoder(nn.Module):
 
 
 class OmegaHead(nn.Module):
-    """物理边界频率头: 接收 latent + 边界 C/K 特征，sigmoid 约束 → f1 + gap21 + gap32, Hz 建模, 最后转 rad/s。"""
+    """物理边界频率头: 接收 latent + 边界C/K + 材料特征, sigmoid 约束 → f1 + gap21 + gap32。"""
 
-    def __init__(self, hidden=512, n_modes=3):
+    def __init__(self, hidden=512, n_modes=3, global_feat_dim=2):
         super().__init__()
-        # 输入维度: hidden(512) + 2(边界C/K) = 514
         self.mlp = nn.Sequential(
-            nn.Linear(hidden + 2, 512), nn.GELU(), nn.Dropout(0.2),
+            nn.Linear(hidden + 2 + global_feat_dim, 512), nn.GELU(), nn.Dropout(0.2),
             nn.Linear(512, 256), nn.GELU(), nn.Dropout(0.2),
             nn.Linear(256, 128), nn.GELU(),
             nn.Linear(128, n_modes),
@@ -200,10 +199,7 @@ class OmegaHead(nn.Module):
 
 
 class ZetaHead(nn.Module):
-    """物理驱动阻尼预测器: latent + ω + 边界 C/K 特征 → ζ。
-
-    sigmoid 约束输出到 [0.001, 0.031]，覆盖真实数据 [0.002~0.022]。
-    """
+    """物理驱动阻尼预测器: latent + ω + 边界 C/K 特征 → ζ。"""
 
     def __init__(self, hidden=512, n_modes=3):
         super().__init__()
@@ -309,17 +305,11 @@ class UNetPhysicsModel(nn.Module):
     def forward(self, image_tensor, query_coords, frequencies=None,
                 phi_exc=None, batch=None, alpha=1.0,
                 node_xyz=None, node_features=None,
-                omega_true=None):
+                omega_true=None, global_features=None):
         """
         Returns:
             frf, omega_phys, log_zeta, zeta, phi
-            omega_phys: [B, K] rad/s (单调递增保证)
-            log_zeta:   [B, K] 对数阻尼
-            zeta:       [B, K] 物理阻尼 = exp(log_zeta)
-            phi:        [total_N, K, 3] 三维振型 (X, Y, Z)
-
-        训练时 omega_true 存在 → FRF 永久使用真实频率 (峰位对齐, 只训 φ/ζ)。
-        推理时 omega_true=None → FRF 使用预测频率。
+            omega_phys: [B, K] rad/s, zeta: [B, K], phi: [total_N, K, 3]
         """
         B = image_tensor.shape[0]
         if query_coords.ndim == 3:
@@ -340,11 +330,17 @@ class UNetPhysicsModel(nn.Module):
                     c_k_features[b_idx, 0] = node_features[mask, 4].mean()  # log10(K)
                     c_k_features[b_idx, 1] = node_features[mask, 5].mean()  # log10(C)
 
-        # 2. 频率预测: 把 latent 和 c_k_features 拼起来喂给 OmegaHead
-        omega_input = torch.cat([latent, c_k_features], dim=-1)
+        # 防御: global_features 不存在则补 0, 取前2维(E/E_base, ρ/ρ_base)给 ω/ζ
+        if global_features is None:
+            mat_feat = torch.zeros(B, 2, device=latent.device)
+        else:
+            mat_feat = global_features[:, :2]
+
+        # 2. 频率预测: latent + C/K + 材料(E, ρ)
+        omega_input = torch.cat([latent, c_k_features, mat_feat], dim=-1)
         omega_phys = self.omega_head(omega_input)
 
-        # 3. 阻尼预测: 输入保持不变 (latent + ω + C/K特征)
+        # 3. 阻尼预测: latent + ω + C/K
         zeta_input = torch.cat([
             latent,
             omega_phys.detach() / 5000.0,
