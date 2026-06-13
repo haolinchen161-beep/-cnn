@@ -399,14 +399,15 @@ def _generate_preds(args, config, net, dataloader, phase1=False):
                     pe_i = phi_exc[i:i+1].to(args.device) if phi_exc is not None else None
                     _nx_i = _nx[m] if _nx is not None else None
                     _nf_i = _nf[m] if _nf is not None else None
+                    _gf_i = _gf[i:i+1] if _gf is not None else None
                     if pe_i is not None:
                         with torch.no_grad():
                             _, _, _, _, phi_scan = net(img_i, c_i, None, None, bt_i,
-                                                       node_xyz=_nx_i, node_features=_nf_i)
+                                                       node_xyz=_nx_i, node_features=_nf_i, global_features=_gf_i)
                         dot = torch.sum(phi_scan.squeeze(0) * batch['modal_phi'].to(args.device)[m], dim=(0, 2))
                         pe_i = pe_i * torch.sign(dot + 1e-8).unsqueeze(0)
                     r = net(img_i, c_i, freqs_i.unsqueeze(0).to(args.device), pe_i, bt_i,
-                            node_xyz=_nx_i, node_features=_nf_i)
+                            node_xyz=_nx_i, node_features=_nf_i, global_features=_gf_i)
                     if isinstance(r, tuple):
                         predictions.append(r[0].squeeze(0).cpu())
                         if omega_true is not None:
