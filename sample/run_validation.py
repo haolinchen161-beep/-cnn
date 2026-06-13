@@ -25,9 +25,9 @@ CONFIG = {
     'zeta_loss_weight': 10.0,        # 阻尼损失权重 (log-space smooth_l1)
     'phi_loss_weight': 3.0,          # 振型损失权重 (归一化 MSE + MAC + std)
 
-    # FRF 弱约束: dB空间 MSE×0.5 ≈ 10-20 损失贡献 (总损失 ~200-400 的 5-10%)
-    'frf_loss_weight': 0.5,
-    'frf_warmup_epochs': 50,
+    # FRF 精调约束: 仅作为最后 1% 精度的打磨工具
+    'frf_loss_weight': 0.1,
+    'frf_warmup_epochs': 20,
 
     'freq_min': 1.0, 'freq_max': 5000.0,
     'data_path_train': ['train.h5'],
