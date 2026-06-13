@@ -152,7 +152,7 @@ class MicroDecoder(nn.Module):
 
 
 class OmegaHead(nn.Module):
-    """单调间隙频率预测器。softplus 保证 w1<w2<w3，无需 hardcode 统计量。"""
+    """物理边界频率头: sigmoid 约束 → f1 + gap21 + gap32, Hz 建模, 最后转 rad/s。"""
 
     def __init__(self, hidden=512, n_modes=3):
         super().__init__()
@@ -163,15 +163,38 @@ class OmegaHead(nn.Module):
             nn.Linear(128, n_modes),
         )
 
+        # 真实数据范围: f1∈[700,1250], gap21∈[700,2600], gap32∈[150,1000] Hz
+        self.f1_min, self.f1_max = 700.0, 1250.0
+        self.g21_min, self.g21_max = 700.0, 2600.0
+        self.g32_min, self.g32_max = 150.0, 1000.0
+        self.f1_span = self.f1_max - self.f1_min
+        self.g21_span = self.g21_max - self.g21_min
+        self.g32_span = self.g32_max - self.g32_min
+
+        # inv_sigmoid 初始化 → epoch 0 即站在均值附近
+        def inv_sigmoid(p):
+            return torch.log(torch.tensor(p).clamp(1e-4, 1 - 1e-4))
+
+        b1 = inv_sigmoid((957.0 - self.f1_min) / self.f1_span)
+        b2 = inv_sigmoid((1632.0 - self.g21_min) / self.g21_span)
+        b3 = inv_sigmoid((388.0 - self.g32_min) / self.g32_span)
+
+        with torch.no_grad():
+            self.mlp[-1].bias.copy_(torch.tensor([b1, b2, b3]))
+
     def forward(self, latent):
         out = self.mlp(latent)
-        # 过滤后统计: f1≈948Hz(5957), gap21≈1399Hz(8790), gap32≈498Hz(3130)
-        w1 = F.softplus(out[:, 0:1]) * 8000.0 + 500.0       # → ~6044 rad/s ≈ 962Hz
-        gap21 = F.softplus(out[:, 1:2]) * 12000.0 + 500.0   # → ~8816 rad/s ≈ 1403Hz
-        gap32 = F.softplus(out[:, 2:3]) * 4200.0 + 200.0    # → ~3111 rad/s ≈ 495Hz
-        w2 = w1 + gap21
-        w3 = w2 + gap32
-        return torch.cat([w1, w2, w3], dim=-1)  # [B, 3] rad/s
+        s = torch.sigmoid(out)
+
+        f1 = self.f1_min + self.f1_span * s[:, 0:1]
+        g21 = self.g21_min + self.g21_span * s[:, 1:2]
+        g32 = self.g32_min + self.g32_span * s[:, 2:3]
+
+        f2 = f1 + g21
+        f3 = f2 + g32
+
+        f_hz = torch.cat([f1, f2, f3], dim=-1)
+        return f_hz * (2.0 * torch.pi)  # [B, 3] rad/s
 
 
 class ZetaHead(nn.Module):
