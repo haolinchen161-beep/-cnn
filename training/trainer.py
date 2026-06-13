@@ -84,9 +84,6 @@ def train(args, config, model_cfg, net, dataloader, optimizer,
                     phase2_epoch = epoch - unlock_epoch
                     # 阻尼退火: 初期放大阻尼→宽峰→容忍频率误差，逐步收紧
                     damping_alpha = max(1.0, 10.0 - 9.0 * phase2_epoch / 200.0)
-                    # Teacher-Forced ω: 初期全用 ω_true (峰位完美对齐，只训 φ/ζ)，逐步放开
-                    teacher_anneal = config.get('teacher_anneal_epochs', 300)
-                    teacher_alpha = max(0.0, 1.0 - phase2_epoch / max(teacher_anneal, 1))
                     omega_true = batch['modal_omega_phys'].to(args.device)
 
                     frequencies = batch['frequencies'].to(args.device)
@@ -109,7 +106,7 @@ def train(args, config, model_cfg, net, dataloader, optimizer,
                     frf_pred, omega_phys_pred, log_zeta_pred, zeta_pred, phi_pred = net(
                         img, coords, frequencies, phi_exc, batch_idx_t, alpha=damping_alpha,
                         node_xyz=node_xyz, node_features=node_features,
-                        omega_true=omega_true, teacher_alpha=teacher_alpha)
+                        omega_true=omega_true)
 
                     loss_m, l_w, l_z, l_p, mac_val = modal_loss(
                         omega_phys_pred, batch['modal_omega_phys'].to(args.device),
