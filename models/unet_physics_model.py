@@ -325,16 +325,16 @@ class UNetPhysicsModel(nn.Module):
         c_k_features = torch.zeros(B, 2, device=latent.device)
         if node_features is not None and batch is not None:
             for b_idx in range(B):
-                mask = (batch == b_idx) & (node_features[:, 5] > -0.9)
+                mask = (batch == b_idx) & (node_features[:, 4] > 0)  # logK>0 = 弹簧节点
                 if mask.any():
                     c_k_features[b_idx, 0] = node_features[mask, 4].mean()  # log10(K)
                     c_k_features[b_idx, 1] = node_features[mask, 5].mean()  # log10(C)
 
-        # 防御: global_features 不存在则补 0, 取前2维(E/E_base, ρ/ρ_base)给 ω/ζ
+        # 防御: global_features 取 [E/E_base, ρ/ρ_base], 跳过硬编码的 prxy
         if global_features is None:
             mat_feat = torch.zeros(B, 2, device=latent.device)
         else:
-            mat_feat = global_features[:, :2]
+            mat_feat = global_features[:, [0, 2]]  # E_ratio, rho_ratio
 
         # 2. 频率预测: latent + C/K + 材料(E, ρ)
         omega_input = torch.cat([latent, c_k_features, mat_feat], dim=-1)
