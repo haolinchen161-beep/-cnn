@@ -60,11 +60,31 @@ def train(args, config, model_cfg, net, dataloader, optimizer,
             net._phase2_logged = True
             lowest = np.inf
 
-        # phi+omega 从 epoch 0 同步训练
-        # zeta 前 zeta_warmup_epochs 轮停训防 spike
-        current_phi_w = config.get('phi_loss_weight', 3.0)
-        current_zeta_w = 0.0 if epoch < zeta_warmup_epochs else config.get('zeta_loss_weight', 10.0)
-        current_omega_w = config.get('omega_loss_weight', 1.0)
+        # ================= 全新三阶段控制 =================
+        omega_pretrain_epochs = config.get('omega_pretrain_epochs', 40)
+        in_phase0 = epoch < omega_pretrain_epochs
+
+        if in_phase0:
+            if epoch == 0 and not getattr(net, '_phase0_logged', False):
+                _log(f"=== 阶段 0: 频率专属预训练 (仅训频率, 冻结振型/阻尼/KL, 前 {omega_pretrain_epochs} 轮) ===", logger)
+                net._phase0_logged = True
+
+            # Phase 0: 彻底清场，只给频率梯度
+            current_phi_w = 0.0
+            current_zeta_w = 0.0
+            current_omega_w = config.get('omega_loss_weight', 1.0) * 5.0  # 适当放大频率寻找速度
+            kl_weight = 0.0
+        else:
+            if epoch == omega_pretrain_epochs and not getattr(net, '_phase1_logged', False):
+                _log(f"=== 阶段 1: 全模态联合训练 (解锁振型与阻尼) ===", logger)
+                net._phase1_logged = True
+
+            # Phase 1 & 2: 恢复全模态正常权重
+            current_phi_w = config.get('phi_loss_weight', 3.0)
+            current_zeta_w = config.get('zeta_loss_weight', 10.0)
+            current_omega_w = config.get('omega_loss_weight', 1.0)
+            kl_weight = 20.0
+        # ===============================================
 
         for batch in dataloader:
             optimizer.zero_grad()
@@ -124,15 +144,12 @@ def train(args, config, model_cfg, net, dataloader, optimizer,
                     frf_warmup = config.get('frf_warmup_epochs', 20)
                     current_frf_w = frf_weight * min(1.0, phase2_epoch / max(frf_warmup, 1))
                     phi_tgt = batch['modal_phi'].to(args.device)
-                    kl = branch_loss(net.branch_log_probs, phi_tgt, batch_idx_t)
-                    kl_losses.append(kl.detach().cpu().item())
-                    pred_dir = net.branch_log_probs.argmax(dim=-1)  # [B, K]
-                    true_energy = torch.stack([torch.sum(phi_tgt[batch_idx_t == b] ** 2, dim=(0,)).argmax(dim=-1) for b in range(int(batch_idx_t.max())+1)])  # [B, K]
-                    per_mode_acc = (pred_dir.cpu() == true_energy.cpu()).float().mean(dim=0)  # [K]
-                    dir_accs.append(per_mode_acc.mean().item())
-                    dir_accs_m2.append(per_mode_acc[1].item())
-                    dir_accs_m3.append(per_mode_acc[2].item())
-                    loss = loss_m + current_frf_w * raw_frf + 20.0 * kl
+                    if kl_weight > 0:
+                        kl = branch_loss(net.branch_log_probs, phi_tgt, batch_idx_t)
+                        kl_losses.append(kl.detach().cpu().item())
+                        loss = loss_m + current_frf_w * raw_frf + kl_weight * kl
+                    else:
+                        loss = loss_m + current_frf_w * raw_frf
                 else:
                     _, omega_phys_pred, log_zeta_pred, zeta_pred, phi_pred = net(
                         img, coords, None, None, batch_idx_t,
@@ -146,15 +163,12 @@ def train(args, config, model_cfg, net, dataloader, optimizer,
                         omega_weight=current_omega_w, zeta_weight=current_zeta_w,
                         phi_weight=current_phi_w)
                     phi_tgt = batch['modal_phi'].to(args.device)
-                    kl = branch_loss(net.branch_log_probs, phi_tgt, batch_idx_t)
-                    kl_losses.append(kl.detach().cpu().item())
-                    pred_dir = net.branch_log_probs.argmax(dim=-1)
-                    true_energy = torch.stack([torch.sum(phi_tgt[batch_idx_t == b] ** 2, dim=(0,)).argmax(dim=-1) for b in range(int(batch_idx_t.max())+1)])
-                    per_mode_acc = (pred_dir.cpu() == true_energy.cpu()).float().mean(dim=0)
-                    dir_accs.append(per_mode_acc.mean().item())
-                    dir_accs_m2.append(per_mode_acc[1].item())
-                    dir_accs_m3.append(per_mode_acc[2].item())
-                    loss = loss_m + 20.0 * kl
+                    if kl_weight > 0:
+                        kl = branch_loss(net.branch_log_probs, phi_tgt, batch_idx_t)
+                        kl_losses.append(kl.detach().cpu().item())
+                        loss = loss_m + kl_weight * kl
+                    else:
+                        loss = loss_m  # Phase 0 时只有纯净的频率损失
                     mac_losses.append(mac_val.detach().cpu().numpy())
                     pn, pa = _compute_phi_metrics(phi_pred, batch['modal_phi'].to(args.device), batch_idx_t)
                     phi_n_losses.append(pn.detach().cpu().numpy())
