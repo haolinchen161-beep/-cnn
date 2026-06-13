@@ -104,14 +104,15 @@ def main():
         img = batch['image_tensor'].to(args.device)
         coords = batch['query_coords'].to(args.device)
         batch_idx = batch['batch'].to(args.device)
-        nx = batch.get('node_xyz'); nf = batch.get('node_features')
+        nx = batch.get('node_xyz'); nf = batch.get('node_features'); gf = batch.get('global_features')
         nx = nx.to(args.device) if nx is not None else None
         nf = nf.to(args.device) if nf is not None else None
+        gf = gf.to(args.device) if gf is not None else None
         phi_exc = batch.get('modal_phi_exc')
         phi_exc = phi_exc.to(args.device) if phi_exc is not None else None
         frf_p, omega_p, log_z, zeta_p, phi_p = net(
             img, coords, batch['frequencies'].to(args.device), phi_exc, batch_idx,
-            node_xyz=nx, node_features=nf)
+            node_xyz=nx, node_features=nf, global_features=gf)
     print(f"  FRF={list(frf_p.shape)}, omega_phys={list(omega_p.shape)}, phi={list(phi_p.shape)}")
     print(f"  omega_phys[0] rad/s: {omega_p[0].tolist()}")
     print(f"  freq_hz[0]: {[f'{w/(2*torch.pi):.1f}' for w in omega_p[0].tolist()]}")
