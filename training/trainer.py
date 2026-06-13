@@ -150,6 +150,14 @@ def train(args, config, model_cfg, net, dataloader, optimizer,
                         loss = loss_m + current_frf_w * raw_frf + kl_weight * kl
                     else:
                         loss = loss_m + current_frf_w * raw_frf
+                    # 方向准确率监控
+                    with torch.no_grad():
+                        pred_dir = net.branch_log_probs.argmax(dim=-1)
+                        true_energy = torch.stack([torch.sum(phi_tgt[batch_idx_t == b] ** 2, dim=(0,)).argmax(dim=-1) for b in range(int(batch_idx_t.max())+1)])
+                        per_mode_acc = (pred_dir.cpu() == true_energy.cpu()).float().mean(dim=0)
+                        dir_accs.append(per_mode_acc.mean().item())
+                        dir_accs_m2.append(per_mode_acc[1].item())
+                        dir_accs_m3.append(per_mode_acc[2].item())
                 else:
                     _, omega_phys_pred, log_zeta_pred, zeta_pred, phi_pred = net(
                         img, coords, None, None, batch_idx_t,
@@ -169,6 +177,14 @@ def train(args, config, model_cfg, net, dataloader, optimizer,
                         loss = loss_m + kl_weight * kl
                     else:
                         loss = loss_m  # Phase 0 时只有纯净的频率损失
+                    # 方向准确率监控
+                    with torch.no_grad():
+                        pred_dir = net.branch_log_probs.argmax(dim=-1)
+                        true_energy = torch.stack([torch.sum(phi_tgt[batch_idx_t == b] ** 2, dim=(0,)).argmax(dim=-1) for b in range(int(batch_idx_t.max())+1)])
+                        per_mode_acc = (pred_dir.cpu() == true_energy.cpu()).float().mean(dim=0)
+                        dir_accs.append(per_mode_acc.mean().item())
+                        dir_accs_m2.append(per_mode_acc[1].item())
+                        dir_accs_m3.append(per_mode_acc[2].item())
                     mac_losses.append(mac_val.detach().cpu().numpy())
                     pn, pa = _compute_phi_metrics(phi_pred, batch['modal_phi'].to(args.device), batch_idx_t)
                     phi_n_losses.append(pn.detach().cpu().numpy())
