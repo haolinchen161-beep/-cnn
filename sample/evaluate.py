@@ -54,66 +54,34 @@ def to_obj(arr_list):
 
 
 def sign_align_phi(pred_phi, true_phi, eps=1e-8):
-    """
-    对每阶振型做符号对齐。
-    pred_phi/true_phi: [N, K]
-    return:
-        pred_phi_aligned [N,K]
-        signs [K]
-    """
+    """三维振型符号对齐: pred_phi/true_phi [N,K,3] → aligned [N,K,3], signs [K]."""
     signs = []
     aligned = pred_phi.clone()
-
     for k in range(pred_phi.shape[1]):
-        dot = torch.sum(pred_phi[:, k] * true_phi[:, k])
+        dot = torch.sum(pred_phi[:, k, :] * true_phi[:, k, :])
         sign = torch.sign(dot + eps)
-        aligned[:, k] = pred_phi[:, k] * sign
+        aligned[:, k, :] = pred_phi[:, k, :] * sign
         signs.append(sign)
-
-    signs = torch.stack(signs)
-    return aligned, signs
+    return aligned, torch.stack(signs)
 
 
 def phi_metrics(pred_phi, true_phi, eps=1e-8):
-    """
-    pred_phi/true_phi: [N,K]，已做符号对齐或未对齐均可，内部会再次对齐。
-    return:
-        mac [K]
-        nrmse [K]
-        std_ratio [K]
-        pred_phi_aligned [N,K]
-    """
+    """三维振型指标: pred_phi/true_phi [N,K,3] → mac/nrmse/std_ratio [K]."""
     pred_phi_aligned, signs = sign_align_phi(pred_phi, true_phi, eps=eps)
-
-    macs = []
-    nrmse = []
-    std_ratio = []
-
+    macs, nrmse, std_ratio = [], [], []
     for k in range(true_phi.shape[1]):
-        p = pred_phi_aligned[:, k]
-        t = true_phi[:, k]
-
-        mac = (torch.sum(p * t) ** 2) / (
-            torch.sum(p ** 2) * torch.sum(t ** 2) + eps
-        )
-
+        p = pred_phi_aligned[:, k, :]  # [N, 3]
+        t = true_phi[:, k, :]          # [N, 3]
+        # 三维 MAC: 沿 (N, XYZ) 求内积
+        mac = (torch.sum(p * t) ** 2) / (torch.sum(p ** 2) * torch.sum(t ** 2) + eps)
         rmse = torch.sqrt(torch.mean((p - t) ** 2))
         t_std = torch.std(t) + eps
         p_std = torch.std(p) + eps
-        # 防极端样本: t_std 太小时用 p_std 替代
         safe_t_std = torch.max(t_std, p_std * 0.1)
-
         macs.append(mac)
         nrmse.append(rmse / safe_t_std)
         std_ratio.append(torch.clamp(p_std / safe_t_std, 0.1, 10.0))
-
-    return (
-        torch.stack(macs),
-        torch.stack(nrmse),
-        torch.stack(std_ratio),
-        pred_phi_aligned,
-        signs,
-    )
+    return torch.stack(macs), torch.stack(nrmse), torch.stack(std_ratio), pred_phi_aligned, signs
 
 
 def compute_peak_metrics(freqs_hz, pred_amp, true_amp, true_freq_hz, true_zeta):
@@ -255,7 +223,7 @@ def main():
         _nx = _nx.to(device).unsqueeze(0) if _nx is not None else None
         _nf = _nf.to(device).unsqueeze(0) if _nf is not None else None
 
-        true_phi = sn['modal_phi'].to(device)          # [N,K]
+        true_phi = sn['modal_phi'].to(device)          # [N,K,3]
         true_zeta = sn['modal_zeta'].to(device)        # [K]
         true_omega = sn['modal_omega_phys'].to(device) # [K]
         true_freq_hz = true_omega / (2.0 * torch.pi)
@@ -264,7 +232,6 @@ def main():
         phi_exc_true = phi_exc_true.to(device) if phi_exc_true is not None else None
 
         with torch.no_grad():
-            # OmegaHead 保证单调 → 不需要 sort; omega_phys 已是 rad/s
             _, omega_phys_pred, log_zeta_pred, zeta_pred, phi_pred = model(
                 img, coords, None, None, bt,
                 node_xyz=_nx.squeeze(0) if _nx is not None else None,
@@ -272,22 +239,21 @@ def main():
 
             omega_phys_pred = omega_phys_pred.squeeze(0)  # [K]
             zeta_pred = zeta_pred.squeeze(0)              # [K]
-            phi_pred = phi_pred                           # [N,K]
+            phi_pred = phi_pred                           # [N,K,3]
 
-            # 与真实振型符号对齐
             mac, nrmse, std_ratio, phi_aligned, signs = phi_metrics(phi_pred, true_phi)
 
-            # 频率 (已经是 rad/s)
             freq_hz_pred = omega_phys_pred / (2.0 * torch.pi)
 
-            # phi_aligned = phi_pred * sign → phi_exc 也要同符号翻转
+            # 取 Z 向分量算 FRF; phi_exc 同步符号翻转
+            phi_z = phi_aligned[..., 2]  # [N, K]
             if phi_exc_true is not None:
                 phi_exc_for_frf = (phi_exc_true * signs).unsqueeze(0)  # [1,K]
             else:
                 phi_exc_for_frf = None
 
             frf_pred = model.physics(
-                phi_aligned,
+                phi_z,
                 omega_phys_pred.unsqueeze(0),
                 zeta_pred.unsqueeze(0),
                 freqs_norm,
