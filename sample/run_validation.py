@@ -16,6 +16,7 @@ CONFIG = {
     'validation_frequency': 5,
 
     # 阶段控制
+    'omega_pretrain_epochs': 40,     # 前40轮频率专属预训练
     'enable_phase2': True,           # 开启 FRF 联合训练
     'phase2_min_epoch': 200,         # 200 轮模态预训练后进 Phase2
     'zeta_warmup_epochs': 0,        # 前40轮 zeta_w=0 (防 spike)
