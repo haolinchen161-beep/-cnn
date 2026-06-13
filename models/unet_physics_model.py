@@ -175,22 +175,23 @@ class OmegaHead(nn.Module):
 
 
 class ZetaHead(nn.Module):
-    """对数域阻尼预测器。exp(bias)≈0.02，clamp 防发散。"""
+    """物理驱动阻尼预测器: latent + ω + 边界 C/K 特征 → ζ。
+
+    sigmoid 约束输出到 [0.001, 0.031]，覆盖真实数据 [0.002~0.022]。
+    """
 
     def __init__(self, hidden=512, n_modes=3):
         super().__init__()
         self.mlp = nn.Sequential(
-            nn.Linear(hidden, 256), nn.GELU(), nn.Dropout(0.15),
+            nn.Linear(hidden + n_modes + 2, 256), nn.GELU(), nn.Dropout(0.15),
             nn.Linear(256, 128), nn.GELU(), nn.Dropout(0.15),
             nn.Linear(128, n_modes),
         )
-        # 过滤后真实 ζ: mode1≈0.0029, mode2≈0.0062, mode3≈0.0074
-        with torch.no_grad():
-            self.mlp[-1].bias.copy_(torch.tensor([-5.85, -5.08, -4.91]))
 
-    def forward(self, latent):
-        log_zeta = self.mlp(latent)
-        return torch.clamp(log_zeta, min=-9.0, max=-0.1)  # 1.2e-4 ~ 0.9 (收紧下限)
+    def forward(self, zeta_input):
+        out = self.mlp(zeta_input)
+        zeta = torch.sigmoid(out) * 0.030 + 0.001  # [0.001, 0.031]
+        return torch.log(zeta), zeta
 
 
 class NodePhiRefiner(nn.Module):
@@ -283,7 +284,7 @@ class UNetPhysicsModel(nn.Module):
     def forward(self, image_tensor, query_coords, frequencies=None,
                 phi_exc=None, batch=None, alpha=1.0,
                 node_xyz=None, node_features=None,
-                omega_true=None, teacher_alpha=0.0):
+                omega_true=None):
         """
         Returns:
             frf, omega_phys, log_zeta, zeta, phi
@@ -292,9 +293,8 @@ class UNetPhysicsModel(nn.Module):
             zeta:       [B, K] 物理阻尼 = exp(log_zeta)
             phi:        [total_N, K, 3] 三维振型 (X, Y, Z)
 
-        Teacher-Forced Omega (Phase2):
-            teacher_alpha=1.0 → FRF 全用 ω_true (峰位置完美对齐，只训 φ/ζ)
-            teacher_alpha=0.0 → FRF 全用 ω_pred (端到端推理模式)
+        训练时 omega_true 存在 → FRF 永久使用真实频率 (峰位对齐, 只训 φ/ζ)。
+        推理时 omega_true=None → FRF 使用预测频率。
         """
         B = image_tensor.shape[0]
         if query_coords.ndim == 3:
@@ -306,11 +306,27 @@ class UNetPhysicsModel(nn.Module):
 
         latent, skips = self.encoder(image_tensor)
 
-        # 频率: 直接输出物理 rad/s (单调保证)
+        # 1. 频率: 先预测 ω，作为阻尼的已知物理条件
         omega_phys = self.omega_head(latent)
-        # 阻尼: 对数域输出
-        log_zeta = self.zeta_head(latent)
-        zeta = torch.exp(log_zeta)
+
+        # 2. 提取全图边界 C/K 特征 (弹簧节点平均 log10 值)
+        c_k_features = torch.zeros(B, 2, device=latent.device)
+        if node_features is not None and batch is not None:
+            for b_idx in range(B):
+                mask = (batch == b_idx) & (node_features[:, 5] > -0.9)
+                if mask.any():
+                    c_k_features[b_idx, 0] = node_features[mask, 4].mean()  # log10(K)
+                    c_k_features[b_idx, 1] = node_features[mask, 5].mean()  # log10(C)
+
+        # 3. 阻尼输入: latent + ω(归一化, detach) + C/K 边界特征
+        zeta_input = torch.cat([
+            latent,
+            omega_phys.detach() / 5000.0,
+            c_k_features,
+        ], dim=-1)
+
+        # 4. 阻尼预测
+        log_zeta, zeta = self.zeta_head(zeta_input)
 
         # 方向分类头: 预测每模态 XYZ 能量比例, 作为 PhiScaleHead 的"条件小抄"
         self.branch_log_probs = self.branch_head(latent)             # [B, K, 3]
@@ -346,14 +362,11 @@ class UNetPhysicsModel(nn.Module):
         if node_xyz is not None and node_features is not None:
             phi = self.phi_refiner(phi, latent, node_xyz, node_features, batch)
 
-        # FRF 重建 (Teacher-Forced: Z 向 FRF，从三维振型提取 dim=2)
+        # FRF 重建: 训练时永久使用 ω_true, 推理时用 ω_pred
         if frequencies is not None:
             phi_z = phi[..., 2]                                      # [total_N, K] Z 向分量
-            if omega_true is not None and teacher_alpha > 0.0:
-                omega_used = teacher_alpha * omega_true + (1.0 - teacher_alpha) * omega_phys
-            else:
-                omega_used = omega_phys
-            # FRF 梯度只流向 φ，ω/ζ 由 modal_loss 独立负责 (防 10^5 量级梯度冲毁)
+            omega_used = omega_true if omega_true is not None else omega_phys
+            # ω/ζ detach: FRF 梯度只流向 φ, 不干扰频率和阻尼
             frf = self.physics(phi_z, omega_used.detach(), zeta.detach(),
                                frequencies, phi_exc, batch_idx=batch, alpha=alpha)
         else:
