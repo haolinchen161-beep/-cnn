@@ -93,11 +93,13 @@ def train(args, config, model_cfg, net, dataloader, optimizer,
             coords = batch['query_coords'].to(args.device)
             batch_idx_t = batch['batch'].to(args.device)
 
-            # Node 信息 (传给 NodePhiRefiner)
+            # Node / Global 信息
             node_xyz = batch.get('node_xyz')
             node_features = batch.get('node_features')
+            global_features = batch.get('global_features')
             node_xyz = node_xyz.to(args.device) if node_xyz is not None else None
             node_features = node_features.to(args.device) if node_features is not None else None
+            global_features = global_features.to(args.device) if global_features is not None else None
 
             with torch.cuda.amp.autocast(enabled=args.fp16):
                 if in_phase2:
@@ -114,7 +116,7 @@ def train(args, config, model_cfg, net, dataloader, optimizer,
                     if phi_exc is not None:
                         with torch.no_grad():
                             _, _, _, _, phi_scan = net(img, coords, None, None, batch_idx_t,
-                                                       node_xyz=node_xyz, node_features=node_features)
+                                                       node_xyz=node_xyz, node_features=node_features, global_features=global_features)
                         modal_phi = batch['modal_phi'].to(args.device)
                         phi_exc_corrected = phi_exc.clone()
                         for i in range(int(batch_idx_t.max().item()) + 1):
@@ -161,7 +163,7 @@ def train(args, config, model_cfg, net, dataloader, optimizer,
                 else:
                     _, omega_phys_pred, log_zeta_pred, zeta_pred, phi_pred = net(
                         img, coords, None, None, batch_idx_t,
-                        node_xyz=node_xyz, node_features=node_features)
+                        node_xyz=node_xyz, node_features=node_features, global_features=global_features)
 
                     loss_m, l_w, l_z, l_p, mac_val = modal_loss(
                         omega_phys_pred, batch['modal_omega_phys'].to(args.device),
@@ -376,14 +378,15 @@ def _generate_preds(args, config, net, dataloader, phase1=False):
             phi_exc = batch.get('modal_phi_exc')
             omega_true = batch.get('modal_omega_phys')
 
-            _nx = batch.get('node_xyz'); _nf = batch.get('node_features')
+            _nx = batch.get('node_xyz'); _nf = batch.get('node_features'); _gf = batch.get('global_features')
             _nx = _nx.to(args.device) if _nx is not None else None
             _nf = _nf.to(args.device) if _nf is not None else None
+            _gf = _gf.to(args.device) if _gf is not None else None
 
             # Phase1: 只取 ω，跳过 FRF 推理
             if phase1:
                 _, omega_pred, _, _, _ = net(img, coords, None, None, bt,
-                                             node_xyz=_nx, node_features=_nf)
+                                             node_xyz=_nx, node_features=_nf, global_features=_gf)
                 if omega_true is not None:
                     omega_errs.append((omega_pred.detach().cpu() - omega_true).abs())
                 continue
@@ -419,7 +422,7 @@ def _generate_preds(args, config, net, dataloader, phase1=False):
                 if phi_exc is not None:
                     with torch.no_grad():
                         _, _, _, _, phi_scan = net(img, coords, None, None, bt,
-                                                   node_xyz=_nx, node_features=_nf)
+                                                   node_xyz=_nx, node_features=_nf, global_features=_gf)
                     modal_phi = batch['modal_phi'].to(args.device)
                     phi_exc_c = phi_exc.clone()
                     for i in range(int(bt.max().item()) + 1):
@@ -428,7 +431,7 @@ def _generate_preds(args, config, net, dataloader, phase1=False):
                         phi_exc_c[i] = phi_exc[i] * torch.sign(dot + 1e-8)
                     phi_exc = phi_exc_c
                 r = net(img, coords, frequencies, phi_exc, bt,
-                        node_xyz=_nx, node_features=_nf)
+                        node_xyz=_nx, node_features=_nf, global_features=_gf)
                 if isinstance(r, tuple):
                     prediction = r[0]
                     if omega_true is not None:
