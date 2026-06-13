@@ -82,8 +82,8 @@ def train(args, config, model_cfg, net, dataloader, optimizer,
             with torch.cuda.amp.autocast(enabled=args.fp16):
                 if in_phase2:
                     phase2_epoch = epoch - unlock_epoch
-                    # 阻尼退火: 初期放大阻尼→宽峰→容忍频率误差，逐步收紧
-                    damping_alpha = max(1.0, 10.0 - 9.0 * phase2_epoch / 200.0)
+                    # 永久 Teacher Forcing 已启用，峰位绝对对齐，无需虚增阻尼
+                    damping_alpha = 1.0
                     omega_true = batch['modal_omega_phys'].to(args.device)
 
                     frequencies = batch['frequencies'].to(args.device)
