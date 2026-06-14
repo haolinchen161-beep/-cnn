@@ -42,6 +42,29 @@ def _set_phase2a_omega_tune(net):
                 p.requires_grad = True
 
 
+def _set_omega_prior_only(net):
+    """Phase0 前段: 只训练 omega_head.prior_mlp，禁止 CNN/delta 抢频率主趋势。"""
+    for p in net.parameters():
+        p.requires_grad = False
+
+    # 冻结整体 BN / Dropout 行为
+    net.eval()
+
+    if hasattr(net, 'omega_head'):
+        # omega_head 里只打开 prior_mlp
+        net.omega_head.train()
+
+        if hasattr(net.omega_head, 'delta_mlp'):
+            net.omega_head.delta_mlp.eval()
+            for p in net.omega_head.delta_mlp.parameters():
+                p.requires_grad = False
+
+        if hasattr(net.omega_head, 'prior_mlp'):
+            net.omega_head.prior_mlp.train()
+            for p in net.omega_head.prior_mlp.parameters():
+                p.requires_grad = True
+
+
 def train(args, config, model_cfg, net, dataloader, optimizer,
           valloader, scheduler, logger=None, start_epoch=0):
     """
@@ -96,6 +119,22 @@ def train(args, config, model_cfg, net, dataloader, optimizer,
             in_phase2a = phase2_epoch < phase2_omega_tune_epochs
         else:
             in_phase2a = False
+
+        # Phase0 前段: 纯物理 prior-only，防止 CNN/delta 抢功
+        omega_prior_only_epochs = config.get('omega_prior_only_epochs', 0)
+        in_omega_prior_only = in_phase1 and epoch < omega_prior_only_epochs
+
+        if in_omega_prior_only:
+            if not getattr(net, '_omega_prior_only_logged', False):
+                _log(f"=== Phase0a: 纯物理频率预训练，只训练 omega_head.prior_mlp，前 {omega_prior_only_epochs} 轮 ===", logger)
+                net._omega_prior_only_logged = True
+            _set_omega_prior_only(net)
+            net._omega_prior_only_active = True
+
+        elif in_phase1 and getattr(net, '_omega_prior_only_active', False):
+            _log("=== Phase0b: 解锁 CNN + omega delta，继续频率预训练 ===", logger)
+            _set_all_trainable(net)
+            net._omega_prior_only_active = False
 
         # 阶段切换
         if in_phase1 and epoch == 0:
