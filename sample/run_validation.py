@@ -12,13 +12,14 @@ from models import build_geometric_model
 from training import train, evaluate, modal_loss
 
 CONFIG = {
-    'epochs': 2000,
+    'epochs': 900,
     'validation_frequency': 5,
 
     # 阶段控制
     'omega_pretrain_epochs': 40,     # 前40轮频率专属预训练
     'enable_phase2': True,           # 开启 FRF 联合训练
     'phase2_min_epoch': 200,         # 200 轮模态预训练后进 Phase2
+    'frf_teacher_epochs': 50,        # Phase2 前50轮用真实频率稳定峰位，之后改用预测频率
     'zeta_warmup_epochs': 0,        # 前40轮 zeta_w=0 (防 spike)
 
     # 模态损失权重 (trainer 内部: omega 在 Hz 空间, zeta 在 log 空间, phi 归一化后 MSE+MAC+std)
@@ -134,7 +135,7 @@ def main():
     # 训练
     print("\n--- Step 5: Train ---")
     optimizer = torch.optim.AdamW(net.parameters(), **CONFIG['optimizer']['kwargs'])
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(optimizer, T_0=400, T_mult=1, eta_min=1e-6)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=CONFIG['epochs'], eta_min=1e-6)
     start_epoch = 0
     ckpt_path = os.path.join(args.dir, "checkpoint_last")
     if os.path.exists(ckpt_path):
