@@ -213,7 +213,7 @@ class PhysicsPriorOmegaHead(nn.Module):
         self.n_modes = n_modes
 
         self.prior_mlp = nn.Sequential(
-            nn.Linear(phys_dim, 128), nn.GELU(), nn.Dropout(0.10),
+            nn.Linear(phys_dim, 128), nn.GELU(),
             nn.Linear(128, 64), nn.GELU(),
             nn.Linear(64, n_modes),
         )
