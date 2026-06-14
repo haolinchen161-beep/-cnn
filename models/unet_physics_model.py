@@ -243,6 +243,7 @@ class PhysicsPriorOmegaHead(nn.Module):
         b3 = inv_sigmoid((388.0 - self.g32_min) / self.g32_span)
 
         with torch.no_grad():
+            nn.init.zeros_(self.prior_mlp[-1].weight)
             self.prior_mlp[-1].bias.copy_(torch.tensor([b1, b2, b3]))
             nn.init.zeros_(self.delta_mlp[-1].weight)
             nn.init.zeros_(self.delta_mlp[-1].bias)
@@ -377,7 +378,8 @@ class UNetPhysicsModel(nn.Module):
     def forward(self, image_tensor, query_coords, frequencies=None,
                 phi_exc=None, batch=None, alpha=1.0,
                 node_xyz=None, node_features=None,
-                omega_true=None, global_features=None):
+                omega_true=None, global_features=None,
+                detach_modal_for_frf=True):
         """
         Returns:
             frf, omega_phys, log_zeta, zeta, phi
@@ -461,8 +463,15 @@ class UNetPhysicsModel(nn.Module):
         if frequencies is not None:
             phi_z = phi[..., 2]                                      # [total_N, K] Z 向分量
             omega_used = omega_true if omega_true is not None else omega_phys
-            # ω/ζ detach: FRF 梯度只流向 φ, 不干扰频率和阻尼
-            frf = self.physics(phi_z, omega_used.detach(), zeta.detach(),
+
+            if detach_modal_for_frf:
+                omega_frf = omega_used.detach()
+                zeta_frf = zeta.detach()
+            else:
+                omega_frf = omega_used
+                zeta_frf = zeta
+
+            frf = self.physics(phi_z, omega_frf, zeta_frf,
                                frequencies, phi_exc, batch_idx=batch, alpha=alpha)
         else:
             frf = None
