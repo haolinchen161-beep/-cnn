@@ -151,41 +151,112 @@ class MicroDecoder(nn.Module):
         return self.final(x)
 
 
-class OmegaHead(nn.Module):
-    """物理边界频率头: 接收 latent + 边界C/K + 材料特征, sigmoid 约束 → f1 + gap21 + gap32。"""
-
-    def __init__(self, hidden=512, n_modes=3, global_feat_dim=2):
+class SineAct(nn.Module):
+    def __init__(self, w0=20.0):
         super().__init__()
-        self.mlp = nn.Sequential(
-            nn.Linear(hidden + 2 + global_feat_dim, 512), nn.GELU(), nn.Dropout(0.2),
-            nn.Linear(512, 256), nn.GELU(), nn.Dropout(0.2),
-            nn.Linear(256, 128), nn.GELU(),
+        self.w0 = w0
+
+    def forward(self, x):
+        return torch.sin(self.w0 * x)
+
+
+class CoordinatePhiResidual(nn.Module):
+    """CNN map φ + 坐标连续场 residual (SIREN)。"""
+
+    def __init__(self, hidden=256, node_feat_dim=7, n_modes=3, mode_dim=32):
+        super().__init__()
+        self.n_modes = n_modes
+        self.mode_emb = nn.Parameter(torch.randn(n_modes, mode_dim) * 0.02)
+
+        in_dim = hidden + 3 + node_feat_dim + mode_dim + 3
+
+        self.net = nn.Sequential(
+            nn.Linear(in_dim, 256),
+            SineAct(w0=15.0),
+            nn.Linear(256, 256),
+            SineAct(w0=15.0),
+            nn.Linear(256, 128),
+            nn.GELU(),
+            nn.Linear(128, 3),
+        )
+
+        with torch.no_grad():
+            nn.init.zeros_(self.net[-1].weight)
+            nn.init.zeros_(self.net[-1].bias)
+
+    def forward(self, phi_base, latent, node_xyz, node_features, batch_idx):
+        if node_xyz is None or node_features is None:
+            return phi_base
+
+        n_nodes = phi_base.shape[0]
+        k = self.n_modes
+
+        latent_n = latent[batch_idx]                            # [N, H]
+        latent_e = latent_n.unsqueeze(1).expand(n_nodes, k, -1)
+        xyz_e = node_xyz.unsqueeze(1).expand(n_nodes, k, -1)
+        feat_e = node_features.unsqueeze(1).expand(n_nodes, k, -1)
+        mode_e = self.mode_emb.unsqueeze(0).expand(n_nodes, k, -1)
+
+        x = torch.cat([latent_e, xyz_e, feat_e, mode_e, phi_base], dim=-1)
+
+        delta = self.net(x)
+
+        # 残差幅度不要太大，防止一开始破坏已有 map 解码器
+        return phi_base + 0.20 * torch.tanh(delta)
+
+
+class PhysicsPriorOmegaHead(nn.Module):
+    """物理先验频率头：global物理量给粗预测，CNN latent 给残差修正。"""
+
+    def __init__(self, hidden=256, n_modes=3, phys_dim=22):
+        super().__init__()
+        self.n_modes = n_modes
+
+        self.prior_mlp = nn.Sequential(
+            nn.Linear(phys_dim, 128), nn.GELU(), nn.Dropout(0.10),
+            nn.Linear(128, 64), nn.GELU(),
+            nn.Linear(64, n_modes),
+        )
+
+        self.delta_mlp = nn.Sequential(
+            nn.Linear(hidden + phys_dim, 256), nn.GELU(), nn.Dropout(0.20),
+            nn.Linear(256, 128), nn.GELU(), nn.Dropout(0.10),
             nn.Linear(128, n_modes),
         )
 
-        # 真实数据范围: f1∈[700,1250], gap21∈[700,2600], gap32∈[150,1000] Hz
+        # f1, gap21, gap32 的物理范围
         self.f1_min, self.f1_max = 700.0, 1250.0
         self.g21_min, self.g21_max = 700.0, 2600.0
         self.g32_min, self.g32_max = 150.0, 1000.0
+
         self.f1_span = self.f1_max - self.f1_min
         self.g21_span = self.g21_max - self.g21_min
         self.g32_span = self.g32_max - self.g32_min
 
-        # inv_sigmoid 初始化 → epoch 0 即站在均值附近
         def inv_sigmoid(p):
             p = torch.tensor(p).clamp(1e-4, 1 - 1e-4)
             return torch.log(p / (1.0 - p))
 
+        # 初始化到当前数据均值附近
         b1 = inv_sigmoid((957.0 - self.f1_min) / self.f1_span)
         b2 = inv_sigmoid((1632.0 - self.g21_min) / self.g21_span)
         b3 = inv_sigmoid((388.0 - self.g32_min) / self.g32_span)
 
         with torch.no_grad():
-            self.mlp[-1].bias.copy_(torch.tensor([b1, b2, b3]))
+            self.prior_mlp[-1].bias.copy_(torch.tensor([b1, b2, b3]))
+            nn.init.zeros_(self.delta_mlp[-1].weight)
+            nn.init.zeros_(self.delta_mlp[-1].bias)
 
-    def forward(self, latent):
-        out = self.mlp(latent)
-        s = torch.sigmoid(out)
+    def forward(self, latent, phys_features):
+        prior_raw = self.prior_mlp(phys_features)
+
+        # delta 只允许做有限修正，防止 CNN latent 直接盖过物理先验
+        delta_raw = 0.35 * torch.tanh(
+            self.delta_mlp(torch.cat([latent, phys_features], dim=-1))
+        )
+
+        raw = prior_raw + delta_raw
+        s = torch.sigmoid(raw)
 
         f1 = self.f1_min + self.f1_span * s[:, 0:1]
         g21 = self.g21_min + self.g21_span * s[:, 1:2]
@@ -193,9 +264,9 @@ class OmegaHead(nn.Module):
 
         f2 = f1 + g21
         f3 = f2 + g32
-
         f_hz = torch.cat([f1, f2, f3], dim=-1)
-        return f_hz * (2.0 * torch.pi)  # [B, 3] rad/s
+
+        return f_hz * (2.0 * torch.pi)
 
 
 class ZetaHead(nn.Module):
@@ -294,10 +365,11 @@ class UNetPhysicsModel(nn.Module):
         self.n_modes = n_modes
 
         self.encoder = ImprovedCNNEncoder(in_ch, hidden)
-        self.omega_head = OmegaHead(hidden, n_modes)
+        self.omega_head = PhysicsPriorOmegaHead(hidden, n_modes, phys_dim=22)
         self.zeta_head = ZetaHead(hidden, n_modes)
         self.micro_decoder = MicroDecoder(hidden, n_modes)
         self.phi_refiner = NodePhiRefiner(hidden, node_feat_dim=7, n_modes=n_modes)
+        self.coord_phi_residual = CoordinatePhiResidual(hidden, node_feat_dim=7, n_modes=n_modes)
         self.phi_scale_head = PhiScaleHead(hidden, n_modes)
         self.branch_head = DirectionBranchHead(hidden, n_modes)
         self.physics = PhysicsDecoder(amp_scale, freq_min, freq_max)
@@ -332,13 +404,13 @@ class UNetPhysicsModel(nn.Module):
 
         # 防御: global_features 取 [E/E_base, ρ/ρ_base], 跳过硬编码的 prxy
         if global_features is None:
-            mat_feat = torch.zeros(B, 2, device=latent.device)
+            mat_feat = torch.zeros(B, 20, device=latent.device)
         else:
-            mat_feat = global_features[:, [0, 2]]  # E_ratio, rho_ratio
+            mat_feat = global_features  # [B, 20]
 
-        # 2. 频率预测: latent + C/K + 材料(E, ρ)
-        omega_input = torch.cat([latent, c_k_features, mat_feat], dim=-1)
-        omega_phys = self.omega_head(omega_input)
+        # 2. 频率预测: 物理先验频率头 (global物理量给粗预测, CNN latent 给残差)
+        phys_features = torch.cat([mat_feat, c_k_features], dim=-1)  # [B, 22]
+        omega_phys = self.omega_head(latent, phys_features)
 
         # 3. 阻尼预测: latent + ω + C/K
         zeta_input = torch.cat([
@@ -383,6 +455,7 @@ class UNetPhysicsModel(nn.Module):
         # 轻量节点级修正 (若提供了 node 信息)
         if node_xyz is not None and node_features is not None:
             phi = self.phi_refiner(phi, latent, node_xyz, node_features, batch)
+            phi = self.coord_phi_residual(phi, latent, node_xyz, node_features, batch)
 
         # FRF 重建: 若传入 omega_true 则使用 teacher forcing，否则使用 omega_phys
         if frequencies is not None:
