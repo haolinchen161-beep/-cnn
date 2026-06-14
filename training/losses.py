@@ -36,7 +36,7 @@ def modal_loss(omega_phys_pred, omega_phys_target,
     f_pred_hz = omega_phys_pred / (2.0 * torch.pi)
     f_true_hz = omega_phys_target / (2.0 * torch.pi)
 
-    mode_w = f_pred_hz.new_tensor([1.0, 1.3, 1.6]).view(1, 3)
+    mode_w = f_pred_hz.new_tensor([1.0, 1.5, 2.2]).view(1, 3)
 
     # 1) 绝对 Hz 误差
     abs_err = F.smooth_l1_loss(f_pred_hz, f_true_hz, reduction='none')
