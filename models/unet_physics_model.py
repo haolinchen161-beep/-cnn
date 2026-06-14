@@ -277,17 +277,16 @@ class ZetaHead(nn.Module):
         super().__init__()
         self.n_modes = n_modes
 
-        # 物理先验分支: 只看频率 + 边界 K/C
-        # 输入: omega_norm [B,K] + c_k_features [B,2]
+        # 输入: omega_norm [B,K] + zeta_phys_features [B,4]
+        # zeta_phys_features = [mean_logK, mean_logC, E_ratio, rho_ratio]
         self.prior_mlp = nn.Sequential(
-            nn.Linear(n_modes + 2, 64),
+            nn.Linear(n_modes + 4, 64),
             nn.GELU(),
             nn.Linear(64, n_modes),
         )
 
-        # 几何残差分支: latent 只能做有限修正
         self.delta_mlp = nn.Sequential(
-            nn.Linear(hidden + n_modes + 2, 128),
+            nn.Linear(hidden + n_modes + 4, 128),
             nn.GELU(),
             nn.Dropout(0.20),
             nn.Linear(128, n_modes),
@@ -295,21 +294,16 @@ class ZetaHead(nn.Module):
 
         with torch.no_grad():
             nn.init.zeros_(self.prior_mlp[-1].weight)
-
-            # 初始 ζ ≈ 0.004:
-            # zeta = sigmoid(raw) * 0.030 + 0.001
-            # raw = inv_sigmoid((0.004 - 0.001) / 0.030) ≈ -2.197
             self.prior_mlp[-1].bias.fill_(-2.197)
 
             nn.init.zeros_(self.delta_mlp[-1].weight)
             nn.init.zeros_(self.delta_mlp[-1].bias)
 
-    def forward(self, latent, omega_norm, c_k_features):
-        phys_input = torch.cat([omega_norm, c_k_features], dim=-1)
+    def forward(self, latent, omega_norm, zeta_phys_features):
+        phys_input = torch.cat([omega_norm, zeta_phys_features], dim=-1)
 
         prior_raw = self.prior_mlp(phys_input)
 
-        # 限制 CNN latent 对阻尼的修改权限，防止直接背训练集
         delta_raw = 1.0 * torch.tanh(
             self.delta_mlp(torch.cat([latent, phys_input], dim=-1))
         )
@@ -448,7 +442,7 @@ class UNetPhysicsModel(nn.Module):
 
         latent, skips = self.encoder(image_tensor)
 
-        # 1. 首先提取全图边界 C/K 特征 (给频率和阻尼做联合小抄)
+        # 1. 提取全图边界 C/K 特征，主要给阻尼头使用
         c_k_features = torch.zeros(B, 2, device=latent.device)
         if node_features is not None and batch is not None:
             for b_idx in range(B):
@@ -472,9 +466,15 @@ class UNetPhysicsModel(nn.Module):
 
         omega_phys = self.omega_head(latent, omega_phys_features)
 
-        # 3 & 4. 物理驱动阻尼预测: 物理先验 + CNN 有限残差
+        # 3 & 4. 物理驱动阻尼预测: 频率 + 边界 K/C + 材料 E/rho
+        if global_features is not None:
+            mat_features = global_features[:, [0, 2]].to(device=latent.device, dtype=latent.dtype)
+        else:
+            mat_features = torch.zeros(B, 2, device=latent.device, dtype=latent.dtype)
+
         omega_norm = omega_phys.detach() / 5000.0
-        log_zeta, zeta = self.zeta_head(latent, omega_norm, c_k_features)
+        zeta_phys_features = torch.cat([c_k_features, mat_features], dim=-1)
+        log_zeta, zeta = self.zeta_head(latent, omega_norm, zeta_phys_features)
 
         # 方向分类头: 预测每模态 XYZ 能量比例, 作为 PhiScaleHead 的"条件小抄"
         self.branch_log_probs = self.branch_head(latent)             # [B, K, 3]
