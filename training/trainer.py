@@ -226,7 +226,8 @@ def train(args, config, model_cfg, net, dataloader, optimizer,
         mean_loss = np.mean(losses)
 
         if scheduler is not None:
-            scheduler.step()
+            if not isinstance(scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau):
+                scheduler.step()
 
         if omega_losses:
             omega_per_mode = np.stack(omega_losses).mean(axis=0) * 100
@@ -320,6 +321,10 @@ def train(args, config, model_cfg, net, dataloader, optimizer,
                     _log(f"best val modal model (val_modal_score={val_modal_score:.4f})", logger)
                     save_model(args.dir, epoch, net, optimizer, val_modal_score, "checkpoint_best_modal")
                     lowest_modal = val_modal_score
+
+                # plateau 调度器: 用验证集模态指标驱动学习率衰减
+                if scheduler is not None and isinstance(scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau):
+                    scheduler.step(val_modal_score)
         else:
             frf_s = 0 if in_phase1 else (100 - omega_share - zeta_share - phi_share)
             log_writer.writerow([epoch, f'{mean_loss:.2e}', f'{omega_per_mode[0]:.3f}',f'{omega_per_mode[1]:.3f}',f'{omega_per_mode[2]:.3f}', f'{zeta_per_mode[0]:.1f}',f'{zeta_per_mode[1]:.1f}',f'{zeta_per_mode[2]:.1f}', f'{phi_loss:.2f}', f'{phi_n_per_mode[0]:.1f}',f'{phi_n_per_mode[1]:.1f}',f'{phi_n_per_mode[2]:.1f}', f'{phi_a_per_mode[0]:.1f}',f'{phi_a_per_mode[1]:.1f}',f'{phi_a_per_mode[2]:.1f}', f'{mac_per_mode[0]:.3f}',f'{mac_per_mode[1]:.3f}',f'{mac_per_mode[2]:.3f}', f'{omega_share:.1f}', f'{zeta_share:.1f}', f'{phi_share:.1f}', f'{frf_s:.1f}', '', '', '', f'{kl_avg:.4f}', f'{dir2:.1f}', f'{dir3:.1f}', f'{lr:.2e}'] + [''] * 15)
