@@ -119,12 +119,12 @@ class MicroDecoder(nn.Module):
 
     def __init__(self, hidden=512, n_modes=3):
         super().__init__()
-        # fc_up 产生初始特征图 [B, 512, 8, 20]
-        self.fc_up = nn.Linear(hidden, 512 * 8 * 20)
+        # fc_up 产生初始特征图 [B, 256, 4, 10]
+        self.fc_up = nn.Linear(hidden, 256 * 4 * 10)
 
         # 逐层上采样 + 跳连: (当前通道 + 跳连通道) → 输出通道
         self.up3 = nn.Sequential(
-            nn.Conv2d(512 + 256, 256, 3, padding=1), nn.BatchNorm2d(256),
+            nn.Conv2d(256 + 256, 256, 3, padding=1), nn.BatchNorm2d(256),
             nn.GELU(), nn.Dropout2d(0.1))
         self.up2 = nn.Sequential(
             nn.Conv2d(256 + 128, 128, 3, padding=1), nn.BatchNorm2d(128),
@@ -136,10 +136,10 @@ class MicroDecoder(nn.Module):
 
     def forward(self, latent, skips):
         f1, f2, f3, f4 = skips
-        x = self.fc_up(latent).view(-1, 512, 8, 20)      # [B, 512, 8, 20]
+        x = self.fc_up(latent).view(-1, 256, 4, 10)      # [B, 256, 4, 10]
 
         x = F.interpolate(x, size=f3.shape[2:], mode='bilinear', align_corners=False)
-        x = self.up3(torch.cat([x, f3], dim=1))           # cat(512, 256) → 256
+        x = self.up3(torch.cat([x, f3], dim=1))           # cat(256, 256) → 256
 
         x = F.interpolate(x, size=f2.shape[2:], mode='bilinear', align_corners=False)
         x = self.up2(torch.cat([x, f2], dim=1))           # cat(256, 128) → 128
