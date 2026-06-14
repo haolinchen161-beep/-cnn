@@ -125,7 +125,7 @@ def main():
             node_xyz=nx, node_features=nf, global_features=gf)
     print(f"  FRF={list(frf_p.shape)}, omega_phys={list(omega_p.shape)}, phi={list(phi_p.shape)}")
     print(f"  omega_phys[0] rad/s: {omega_p[0].tolist()}")
-    print(f"  freq_hz[0]: {[f'{w/(2*torch.pi):.1f}' for w in omega_p[0].tolist()]}")
+    print(f"  freq_hz[0]: {[f'{float(w)/(2*np.pi):.1f}' for w in omega_p[0].tolist()]}")
 
     # 初始Loss
     print("\n--- Step 4: Initial Loss ---")
@@ -138,8 +138,8 @@ def main():
             omega_weight=1.0, zeta_weight=10.0, phi_weight=3.0)
     mac_str = '/'.join(f'{x:.3f}' for x in mac_val.tolist())
     print(f"  Init loss: {init_loss.item():.0f} MAC=[{mac_str}]")
-    print(f"  ω pred[0] Hz: {[f'{x/(2*torch.pi):.0f}' for x in omega_p[0].tolist()]}")
-    print(f"  ω true[0] Hz: {[f'{x/(2*torch.pi):.0f}' for x in batch['modal_omega_phys'][0].tolist()]}")
+    print(f"  ω pred[0] Hz: {[f'{float(x)/(2*np.pi):.0f}' for x in omega_p[0].tolist()]}")
+    print(f"  ω true[0] Hz: {[f'{float(x)/(2*np.pi):.0f}' for x in batch['modal_omega_phys'][0].tolist()]}")
 
     # 训练
     print("\n--- Step 5: Train ---")
