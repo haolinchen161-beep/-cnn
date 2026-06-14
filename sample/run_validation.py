@@ -67,7 +67,7 @@ class Args:
 
 def parse_args():
     parser = argparse.ArgumentParser(description='Transolver-Modal 训练脚本')
-    parser.add_argument('--data-dir', default=os.path.join(os.path.dirname(__file__), '..', 'ansys', 'data'))
+    parser.add_argument('--data-dir', default=os.path.join(os.path.dirname(__file__), '..', 'ansys', 'data_2'))
     parser.add_argument('--output-dir', default=os.path.join(os.path.dirname(__file__), 'output_transolver_modal'))
     parser.add_argument('--batch-size', type=int, default=2)
     parser.add_argument('--epochs', type=int, default=CONFIG['epochs'])
@@ -168,8 +168,8 @@ def main():
         init_loss, init_logs = modal_loss(out, batch_dev, {'omega': 1.0, 'zeta': 10.0, 'phi': 3.0})
     print(f"  FRF={None if out['frf'] is None else list(out['frf'].shape)}, omega={list(out['modal_omega'].shape)}, phi={list(out['modal_phi_xyz'].shape)}")
     print(f"  init modal loss={init_loss.item():.2f}")
-    print(f"  ω pred[0] Hz: {[f'{x/(2*torch.pi):.0f}' for x in out['modal_omega'][0].tolist()]}")
-    print(f"  ω true[0] Hz: {[f'{x/(2*torch.pi):.0f}' for x in batch_dev['modal_omega'][0].tolist()]}")
+    print(f"  ω pred[0] Hz: {[f'{float(x)/(2*np.pi):.0f}' for x in out['modal_omega'][0].detach().cpu().tolist()]}")
+    print(f"  ω true[0] Hz: {[f'{float(x)/(2*np.pi):.0f}' for x in batch_dev['modal_omega'][0].detach().cpu().tolist()]}")
 
     print('\n--- Step 4: Train ---')
     args = Args()
