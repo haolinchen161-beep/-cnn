@@ -38,7 +38,7 @@ def train(args, config, model_cfg, net, dataloader, optimizer,
     log_file = open(log_path, 'a', newline='')
     log_writer = csv.writer(log_file)
     if not log_exists:
-        log_writer.writerow(['轮次', '训练损失', 'w1%','w2%','w3%', 'z1%','z2%','z3%', 'φloss', 'φn1','φn2','φn3', 'φa1','φa2','φa3', 'MAC1','MAC2','MAC3', 'w占比%','z占比%','phi占比%','FRF占比%', 'kl', 'dir2%', 'dir3%', '验证MSE', '幅值MAE', '幅值MAPE%', '学习率'])
+        log_writer.writerow(['轮次', '训练损失', 'w1%','w2%','w3%', 'z1%','z2%','z3%', 'φloss', 'φn1','φn2','φn3', 'φa1','φa2','φa3', 'MAC1','MAC2','MAC3', 'w占比%','z占比%','phi占比%','FRF占比%', '验证MSE', '幅值MAE', '幅值MAPE%', 'kl', 'dir2%', 'dir3%', '学习率'])
 
     phase2_unlocked = False
     unlock_epoch = start_epoch
@@ -127,7 +127,7 @@ def train(args, config, model_cfg, net, dataloader, optimizer,
 
                     frf_pred, omega_phys_pred, log_zeta_pred, zeta_pred, phi_pred = net(
                         img, coords, frequencies, phi_exc, batch_idx_t, alpha=damping_alpha,
-                        node_xyz=node_xyz, node_features=node_features,
+                        node_xyz=node_xyz, node_features=node_features, global_features=global_features,
                         omega_true=omega_true)
 
                     loss_m, l_w, l_z, l_p, mac_val = modal_loss(
