@@ -206,9 +206,9 @@ class CoordinatePhiResidual(nn.Module):
 
 
 class PhysicsPriorOmegaHead(nn.Module):
-    """物理先验频率头：global物理量给粗预测，CNN latent 给残差修正。"""
+    """物理先验频率头：干净物理量给粗预测，CNN latent 给残差修正。"""
 
-    def __init__(self, hidden=256, n_modes=3, phys_dim=22):
+    def __init__(self, hidden=256, n_modes=3, phys_dim=13):
         super().__init__()
         self.n_modes = n_modes
 
@@ -366,7 +366,28 @@ class UNetPhysicsModel(nn.Module):
         self.n_modes = n_modes
 
         self.encoder = ImprovedCNNEncoder(in_ch, hidden)
-        self.omega_head = PhysicsPriorOmegaHead(hidden, n_modes, phys_dim=22)
+
+        # omega 只使用与固有频率强相关的 clean global features:
+        # 0  E_ratio
+        # 2  rho_ratio
+        # 3  z_h_mean
+        # 4  z_h_std
+        # 5  z_h_min
+        # 6  z_h_max
+        # 8  fixed_ratio
+        # 9  corner_ratio
+        # 10 side_ratio
+        # 11 logK_mean
+        # 12 logK_std
+        # 13 logK_min
+        # 14 logK_max
+        self.register_buffer(
+            "omega_phys_idx",
+            torch.tensor([0, 2, 3, 4, 5, 6, 8, 9, 10, 11, 12, 13, 14], dtype=torch.long),
+            persistent=False,
+        )
+
+        self.omega_head = PhysicsPriorOmegaHead(hidden, n_modes, phys_dim=13)
         self.zeta_head = ZetaHead(hidden, n_modes)
         self.micro_decoder = MicroDecoder(hidden, n_modes)
         self.phi_refiner = NodePhiRefiner(hidden, node_feat_dim=7, n_modes=n_modes)
@@ -404,15 +425,20 @@ class UNetPhysicsModel(nn.Module):
                     c_k_features[b_idx, 0] = node_features[mask, 4].mean()  # log10(K)
                     c_k_features[b_idx, 1] = node_features[mask, 5].mean()  # log10(C)
 
-        # 防御: global_features 取 [E/E_base, ρ/ρ_base], 跳过硬编码的 prxy
+        # 2. 频率预测: 只使用 clean physics，不把 logC / node_count / 重复 c_k 送入 omega
         if global_features is None:
-            mat_feat = torch.zeros(B, 20, device=latent.device)
+            omega_phys_features = torch.zeros(
+                B,
+                self.omega_phys_idx.numel(),
+                device=latent.device,
+                dtype=latent.dtype,
+            )
         else:
-            mat_feat = global_features  # [B, 20]
+            omega_idx = self.omega_phys_idx.to(global_features.device)
+            omega_phys_features = global_features.index_select(dim=1, index=omega_idx)
+            omega_phys_features = omega_phys_features.to(device=latent.device, dtype=latent.dtype)
 
-        # 2. 频率预测: 物理先验频率头 (global物理量给粗预测, CNN latent 给残差)
-        phys_features = torch.cat([mat_feat, c_k_features], dim=-1)  # [B, 22]
-        omega_phys = self.omega_head(latent, phys_features)
+        omega_phys = self.omega_head(latent, omega_phys_features)
 
         # 3. 阻尼预测: latent + ω + C/K
         zeta_input = torch.cat([
