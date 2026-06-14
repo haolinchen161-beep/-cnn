@@ -271,19 +271,51 @@ class PhysicsPriorOmegaHead(nn.Module):
 
 
 class ZetaHead(nn.Module):
-    """物理驱动阻尼预测器: latent + ω + 边界 C/K 特征 → ζ。"""
+    """物理驱动阻尼预测器: 物理先验 + CNN 几何残差。"""
 
     def __init__(self, hidden=512, n_modes=3):
         super().__init__()
-        self.mlp = nn.Sequential(
-            nn.Linear(hidden + n_modes + 2, 256), nn.GELU(), nn.Dropout(0.15),
-            nn.Linear(256, 128), nn.GELU(), nn.Dropout(0.15),
+        self.n_modes = n_modes
+
+        # 物理先验分支: 只看频率 + 边界 K/C
+        # 输入: omega_norm [B,K] + c_k_features [B,2]
+        self.prior_mlp = nn.Sequential(
+            nn.Linear(n_modes + 2, 64),
+            nn.GELU(),
+            nn.Linear(64, n_modes),
+        )
+
+        # 几何残差分支: latent 只能做有限修正
+        self.delta_mlp = nn.Sequential(
+            nn.Linear(hidden + n_modes + 2, 128),
+            nn.GELU(),
+            nn.Dropout(0.20),
             nn.Linear(128, n_modes),
         )
 
-    def forward(self, zeta_input):
-        out = self.mlp(zeta_input)
-        zeta = torch.sigmoid(out) * 0.030 + 0.001  # [0.001, 0.031]
+        with torch.no_grad():
+            nn.init.zeros_(self.prior_mlp[-1].weight)
+
+            # 初始 ζ ≈ 0.004:
+            # zeta = sigmoid(raw) * 0.030 + 0.001
+            # raw = inv_sigmoid((0.004 - 0.001) / 0.030) ≈ -2.197
+            self.prior_mlp[-1].bias.fill_(-2.197)
+
+            nn.init.zeros_(self.delta_mlp[-1].weight)
+            nn.init.zeros_(self.delta_mlp[-1].bias)
+
+    def forward(self, latent, omega_norm, c_k_features):
+        phys_input = torch.cat([omega_norm, c_k_features], dim=-1)
+
+        prior_raw = self.prior_mlp(phys_input)
+
+        # 限制 CNN latent 对阻尼的修改权限，防止直接背训练集
+        delta_raw = 1.0 * torch.tanh(
+            self.delta_mlp(torch.cat([latent, phys_input], dim=-1))
+        )
+
+        raw = prior_raw + delta_raw
+        zeta = torch.sigmoid(raw) * 0.030 + 0.001
         return torch.log(zeta), zeta
 
 
@@ -440,15 +472,9 @@ class UNetPhysicsModel(nn.Module):
 
         omega_phys = self.omega_head(latent, omega_phys_features)
 
-        # 3. 阻尼预测: latent + ω + C/K
-        zeta_input = torch.cat([
-            latent,
-            omega_phys.detach() / 5000.0,
-            c_k_features,
-        ], dim=-1)
-
-        # 4. 阻尼预测
-        log_zeta, zeta = self.zeta_head(zeta_input)
+        # 3 & 4. 物理驱动阻尼预测: 物理先验 + CNN 有限残差
+        omega_norm = omega_phys.detach() / 5000.0
+        log_zeta, zeta = self.zeta_head(latent, omega_norm, c_k_features)
 
         # 方向分类头: 预测每模态 XYZ 能量比例, 作为 PhiScaleHead 的"条件小抄"
         self.branch_log_probs = self.branch_head(latent)             # [B, K, 3]
