@@ -14,6 +14,21 @@ import torch.nn.functional as F
 from .losses import modal_loss, frf_loss, branch_loss
 
 
+def _set_all_trainable(net):
+    for p in net.parameters():
+        p.requires_grad = True
+
+
+def _set_phase2a_omega_tune(net):
+    """Phase2a: 冻结 φ 相关模块，只让 omega/zeta 头学习 FRF 峰位。"""
+    for p in net.parameters():
+        p.requires_grad = False
+    for name in ['omega_head', 'zeta_head']:
+        if hasattr(net, name):
+            for p in getattr(net, name).parameters():
+                p.requires_grad = True
+
+
 def train(args, config, model_cfg, net, dataloader, optimizer,
           valloader, scheduler, logger=None, start_epoch=0):
     """
@@ -60,6 +75,14 @@ def train(args, config, model_cfg, net, dataloader, optimizer,
         in_phase1 = not phase2_unlocked
         in_phase2 = phase2_unlocked
 
+        # Phase2a: 冻 φ 攻 ω/ζ, Phase2b: 解冻全模型联调
+        phase2_omega_tune_epochs = config.get('phase2_omega_tune_epochs', 40)
+        if in_phase2:
+            phase2_epoch = epoch - unlock_epoch
+            in_phase2a = phase2_epoch < phase2_omega_tune_epochs
+        else:
+            in_phase2a = False
+
         # 阶段切换
         if in_phase1 and epoch == 0:
             _log("=== 阶段1: 纯模态训练 (enable_phase2=False, FRF 未解锁) ===", logger)
@@ -67,6 +90,16 @@ def train(args, config, model_cfg, net, dataloader, optimizer,
             _log(f"=== 阶段2: FRF 联合训练 (第 {epoch} 轮解锁) ===", logger)
             net._phase2_logged = True
             lowest = np.inf
+
+        if in_phase2 and in_phase2a and not getattr(net, '_phase2a_logged', False):
+            _log("=== Phase2a: 冻 φ，FRF 反向修正 ω/ζ ===", logger)
+            _set_phase2a_omega_tune(net)
+            net._phase2a_logged = True
+
+        if in_phase2 and (not in_phase2a) and not getattr(net, '_phase2b_logged', False):
+            _log("=== Phase2b: 解冻全模型，小权重 FRF 联调 ===", logger)
+            _set_all_trainable(net)
+            net._phase2b_logged = True
 
         # ================= 全新三阶段控制 =================
         omega_pretrain_epochs = config.get('omega_pretrain_epochs', 40)
@@ -139,7 +172,8 @@ def train(args, config, model_cfg, net, dataloader, optimizer,
                     frf_pred, omega_phys_pred, log_zeta_pred, zeta_pred, phi_pred = net(
                         img, coords, frequencies, phi_exc, batch_idx_t, alpha=damping_alpha,
                         node_xyz=node_xyz, node_features=node_features, global_features=global_features,
-                        omega_true=omega_true)
+                        omega_true=omega_true if not in_phase2a else None,
+                        detach_modal_for_frf=not in_phase2a)
 
                     loss_m, l_w, l_z, l_p, mac_val = modal_loss(
                         omega_phys_pred, omega_true_label,
@@ -342,27 +376,31 @@ def train(args, config, model_cfg, net, dataloader, optimizer,
 
 
 def _compute_phi_metrics(phi_pred, phi_target, batch_idx):
-    """逐图计算 φn (NRMSE%) 和 φa (范数误差%)，phi 为 [N,K,3]。返回 per-mode [K]."""
-    dot = torch.sum(phi_pred * phi_target, dim=(0, 2), keepdim=True)
-    sign = torch.sign(dot + 1e-8)
-    aligned_target = phi_target * sign
-
+    """逐图计算 φn 和 φa，phi 为 [N,K,3]。返回 per-mode [K]."""
     n_graphs = int(batch_idx.max().item()) + 1
     nrmse_list, norm_err_list = [], []
+
     for i in range(n_graphs):
-        mask = (batch_idx == i)
-        p = phi_pred[mask]   # [N, K, 3]
-        t = aligned_target[mask]
-        # φn: 三维 RMSE / (max-min)，沿 (N, XYZ) 两维
+        mask = batch_idx == i
+        p = phi_pred[mask]
+        t = phi_target[mask]
+
+        dot = torch.sum(p * t, dim=(0, 2), keepdim=True)
+        t = t * torch.sign(dot + 1e-8)
+
         rmse = torch.sqrt(torch.mean((p - t) ** 2, dim=(0, 2)))
-        ptp = t.amax(dim=(0, 2)) - t.amin(dim=(0, 2)) + 1e-8
-        nrmse_list.append(rmse / ptp * 100.0)
-        # φa: 三维总体范数误差
+        t_std = torch.std(
+            t.transpose(0, 1).reshape(t.shape[1], -1),
+            dim=1
+        ) + 1e-8
+        nrmse_list.append(rmse / t_std * 100.0)
+
         norm_p = torch.sqrt(torch.sum(p ** 2, dim=(0, 2)))
         norm_t = torch.sqrt(torch.sum(t ** 2, dim=(0, 2))) + 1e-8
         norm_err_list.append(torch.abs(norm_p - norm_t) / norm_t * 100.0)
-    phi_n = torch.stack(nrmse_list, dim=0).mean(dim=0)  # [K]
-    phi_a = torch.stack(norm_err_list, dim=0).mean(dim=0)  # [K]
+
+    phi_n = torch.stack(nrmse_list, dim=0).mean(dim=0)
+    phi_a = torch.stack(norm_err_list, dim=0).mean(dim=0)
     return phi_n, phi_a
 
 
