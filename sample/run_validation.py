@@ -19,7 +19,8 @@ CONFIG = {
     'omega_pretrain_epochs': 40,     # 前40轮频率专属预训练
     'enable_phase2': True,           # 开启 FRF 联合训练
     'phase2_min_epoch': 160,         # 160 轮模态预训练后进 Phase2
-    'frf_teacher_epochs': 50,        # Phase2 前50轮用真实频率稳定峰位，之后改用预测频率
+    'phase2_omega_tune_epochs': 40,  # Phase2a: 前40轮冻 φ 攻 ω/ζ
+    'frf_teacher_epochs': 0,         # Phase2a 直接用预测频率 (FRF 训练 ω/ζ)
     'zeta_warmup_epochs': 0,        # 前40轮 zeta_w=0 (防 spike)
 
     # 模态损失权重 (trainer 内部: omega 在 Hz 空间, zeta 在 log 空间, phi 归一化后 MSE+MAC+std)
@@ -28,8 +29,9 @@ CONFIG = {
     'phi_loss_weight': 3.0,          # 振型损失权重 (归一化 MSE + MAC + std)
 
     # FRF 精调约束: 仅作为最后 1% 精度的打磨工具
-    'frf_loss_weight': 0.01,
+    'frf_loss_weight': 0.005,
     'frf_warmup_epochs': 20,
+    'detach_modal_for_frf_after_phase2a': False,
 
     'freq_min': 1.0, 'freq_max': 5000.0,
 
