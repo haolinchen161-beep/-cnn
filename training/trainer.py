@@ -461,43 +461,50 @@ def _clip_module(net, prefix, max_norm):
 
 def evaluate(args, config, net, dataloader, logger=None, epoch=None, verbose=True, phase1=False):
     """验证/测试评估。phase1=True 时跳过 FRF，但仍统计验证集模态指标。"""
-    prediction, output, omega_errs, modal_metrics = _generate_preds(
-        args, config, net, dataloader, phase1=phase1
-    )
+    was_training = net.training
 
-    results = _evaluate(prediction, output, omega_errs, logger, epoch, verbose, phase1=phase1)
+    try:
+        prediction, output, omega_errs, modal_metrics = _generate_preds(
+            args, config, net, dataloader, phase1=phase1
+        )
 
-    if modal_metrics:
-        val_w = np.stack([m['val_w_rel'] for m in modal_metrics], axis=0).mean(axis=0)
-        val_z = np.stack([m['val_z_rel'] for m in modal_metrics], axis=0).mean(axis=0)
-        val_mac = np.stack([m['val_mac'] for m in modal_metrics], axis=0).mean(axis=0)
-        val_phi_n = np.stack([m['val_phi_n'] for m in modal_metrics], axis=0).mean(axis=0)
-        val_phi_a = np.stack([m['val_phi_a'] for m in modal_metrics], axis=0).mean(axis=0)
+        results = _evaluate(prediction, output, omega_errs, logger, epoch, verbose, phase1=phase1)
 
-        results['val_w_rel_per_mode'] = val_w
-        results['val_z_rel_per_mode'] = val_z
-        results['val_mac_per_mode'] = val_mac
-        results['val_phi_n_per_mode'] = val_phi_n
-        results['val_phi_a_per_mode'] = val_phi_a
+        if modal_metrics:
+            val_w = np.stack([m['val_w_rel'] for m in modal_metrics], axis=0).mean(axis=0)
+            val_z = np.stack([m['val_z_rel'] for m in modal_metrics], axis=0).mean(axis=0)
+            val_mac = np.stack([m['val_mac'] for m in modal_metrics], axis=0).mean(axis=0)
+            val_phi_n = np.stack([m['val_phi_n'] for m in modal_metrics], axis=0).mean(axis=0)
+            val_phi_a = np.stack([m['val_phi_a'] for m in modal_metrics], axis=0).mean(axis=0)
 
-        results['val_w_rel_mean'] = float(val_w.mean())
-        results['val_z_rel_mean'] = float(val_z.mean())
-        results['val_mac_mean'] = float(val_mac.mean())
-        results['val_phi_n_mean'] = float(val_phi_n.mean())
-        results['val_phi_a_mean'] = float(val_phi_a.mean())
+            results['val_w_rel_per_mode'] = val_w
+            results['val_z_rel_per_mode'] = val_z
+            results['val_mac_per_mode'] = val_mac
+            results['val_phi_n_per_mode'] = val_phi_n
+            results['val_phi_a_per_mode'] = val_phi_a
 
-        if verbose:
-            _log(
-                f"Val modal | "
-                f"w=[{val_w[0]:.3f}/{val_w[1]:.3f}/{val_w[2]:.3f}]% "
-                f"z=[{val_z[0]:.1f}/{val_z[1]:.1f}/{val_z[2]:.1f}]% "
-                f"MAC=[{val_mac[0]:.3f}/{val_mac[1]:.3f}/{val_mac[2]:.3f}] "
-                f"φn=[{val_phi_n[0]:.1f}/{val_phi_n[1]:.1f}/{val_phi_n[2]:.1f}]% "
-                f"φa=[{val_phi_a[0]:.1f}/{val_phi_a[1]:.1f}/{val_phi_a[2]:.1f}]%",
-                logger
-            )
+            results['val_w_rel_mean'] = float(val_w.mean())
+            results['val_z_rel_mean'] = float(val_z.mean())
+            results['val_mac_mean'] = float(val_mac.mean())
+            results['val_phi_n_mean'] = float(val_phi_n.mean())
+            results['val_phi_a_mean'] = float(val_phi_a.mean())
 
-    return results
+            if verbose:
+                _log(
+                    f"Val modal | "
+                    f"w=[{val_w[0]:.3f}/{val_w[1]:.3f}/{val_w[2]:.3f}]% "
+                    f"z=[{val_z[0]:.1f}/{val_z[1]:.1f}/{val_z[2]:.1f}]% "
+                    f"MAC=[{val_mac[0]:.3f}/{val_mac[1]:.3f}/{val_mac[2]:.3f}] "
+                    f"φn=[{val_phi_n[0]:.1f}/{val_phi_n[1]:.1f}/{val_phi_n[2]:.1f}]% "
+                    f"φa=[{val_phi_a[0]:.1f}/{val_phi_a[1]:.1f}/{val_phi_a[2]:.1f}]%",
+                    logger
+                )
+
+        return results
+
+    finally:
+        if was_training:
+            net.train()
 
 
 def _generate_preds(args, config, net, dataloader, phase1=False):
