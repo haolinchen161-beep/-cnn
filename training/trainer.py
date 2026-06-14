@@ -42,6 +42,7 @@ def train(args, config, model_cfg, net, dataloader, optimizer,
 
     phase2_unlocked = False
     unlock_epoch = start_epoch
+    lowest_modal = np.inf
 
     try:
       for epoch in range(start_epoch, total_epochs):
@@ -104,9 +105,12 @@ def train(args, config, model_cfg, net, dataloader, optimizer,
             with torch.cuda.amp.autocast(enabled=args.fp16):
                 if in_phase2:
                     phase2_epoch = epoch - unlock_epoch
-                    # 永久 Teacher Forcing 已启用，峰位绝对对齐，无需虚增阻尼
                     damping_alpha = 1.0
-                    omega_true = batch['modal_omega_phys'].to(args.device)
+                    omega_true_label = batch['modal_omega_phys'].to(args.device)
+
+                    # Phase2 前 50 轮使用真实频率稳定峰位，之后改用预测频率
+                    teacher_epochs = config.get('frf_teacher_epochs', 50)
+                    omega_true = omega_true_label if phase2_epoch < teacher_epochs else None
 
                     frequencies = batch['frequencies'].to(args.device)
                     phi_exc = batch.get('modal_phi_exc')
@@ -131,7 +135,7 @@ def train(args, config, model_cfg, net, dataloader, optimizer,
                         omega_true=omega_true)
 
                     loss_m, l_w, l_z, l_p, mac_val = modal_loss(
-                        omega_phys_pred, batch['modal_omega_phys'].to(args.device),
+                        omega_phys_pred, omega_true_label,
                         log_zeta_pred, batch['modal_zeta'].to(args.device),
                         phi_pred, batch['modal_phi'].to(args.device),
                         batch_idx=batch_idx_t,
@@ -255,6 +259,13 @@ def train(args, config, model_cfg, net, dataloader, optimizer,
         dir2 = np.mean(dir_accs_m2) * 100 if dir_accs_m2 else 0
         dir3 = np.mean(dir_accs_m3) * 100 if dir_accs_m3 else 0
         _log(f"Epoch {epoch:4d} | {w_str} {z_str} {phi_str} {mac_str} | w{omega_share:.0f}z{zeta_share:.0f}ph{phi_share:.0f} | kl={kl_avg:.3f} dir2={dir2:.0f}% dir3={dir3:.0f}% | loss={mean_loss:.1f}", logger)
+
+        # 模态最优模型监控 (综合频率+阻尼+MAC)
+        modal_score = omega_pct + 0.3 * zeta_pct + (1.0 - mac_scalar) * 100.0
+        if modal_score < lowest_modal:
+            _log(f"  best modal model (modal_score={modal_score:.4f})", logger)
+            save_model(args.dir, epoch, net, optimizer, modal_score, "checkpoint_best_modal")
+            lowest_modal = modal_score
 
         # 动态解锁: enable_phase2=True 且 epoch >= phase2_min_epoch
         enable_phase2 = config.get('enable_phase2', False)
