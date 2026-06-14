@@ -222,6 +222,8 @@ def main():
         _nx = sn.get('node_xyz'); _nf = sn.get('node_features')
         _nx = _nx.to(device).unsqueeze(0) if _nx is not None else None
         _nf = _nf.to(device).unsqueeze(0) if _nf is not None else None
+        _gf = sn.get('global_features')
+        _gf = _gf.to(device).unsqueeze(0) if _gf is not None else None
 
         true_phi = sn['modal_phi'].to(device)          # [N,K,3]
         true_zeta = sn['modal_zeta'].to(device)        # [K]
@@ -235,7 +237,8 @@ def main():
             _, omega_phys_pred, log_zeta_pred, zeta_pred, phi_pred = model(
                 img, coords, None, None, bt,
                 node_xyz=_nx.squeeze(0) if _nx is not None else None,
-                node_features=_nf.squeeze(0) if _nf is not None else None)
+                node_features=_nf.squeeze(0) if _nf is not None else None,
+                global_features=_gf)
 
             omega_phys_pred = omega_phys_pred.squeeze(0)  # [K]
             zeta_pred = zeta_pred.squeeze(0)              # [K]
