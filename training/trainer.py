@@ -111,6 +111,11 @@ def train(args, config, model_cfg, net, dataloader, optimizer,
                 net._phase2a_logged = True
             _set_phase2a_omega_tune(net)
 
+            # Phase2a 用小学习率做 FRF 峰位微调，避免冲坏模态频率头
+            phase2a_lr = config.get('phase2a_lr', 1e-4)
+            for pg in optimizer.param_groups:
+                pg['lr'] = min(pg['lr'], phase2a_lr)
+
         if in_phase2 and (not in_phase2a) and not getattr(net, '_phase2b_logged', False):
             _log("=== Phase2b: 解冻全模型，小权重 FRF 联调 ===", logger)
             _set_all_trainable(net)
