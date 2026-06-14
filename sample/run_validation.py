@@ -35,6 +35,9 @@ CONFIG = {
 
     'freq_min': 1.0, 'freq_max': 5000.0,
 
+    # 防止 omega_head 记忆精确 global 统计量
+    'global_feature_noise_std': 0.003,
+
     # 学习率调度: plateau = 验证集不提升时衰减
     'lr_schedule': 'plateau',
     'plateau_patience': 6,
