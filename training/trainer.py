@@ -15,6 +15,7 @@ from .losses import modal_loss, frf_loss, branch_loss
 
 
 def _set_all_trainable(net):
+    net.train()
     for p in net.parameters():
         p.requires_grad = True
 
