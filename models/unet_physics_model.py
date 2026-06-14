@@ -407,6 +407,7 @@ class UNetPhysicsModel(nn.Module):
         # 12 logK_std
         # 13 logK_min
         # 14 logK_max
+        # +1 f_theory = z_h_mean * sqrt(E_ratio / rho_ratio)
         self.register_buffer(
             "omega_phys_idx",
             torch.tensor([0, 2, 3, 4, 5, 6, 8, 9, 10, 11, 12, 13, 14], dtype=torch.long),
