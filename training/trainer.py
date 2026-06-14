@@ -62,8 +62,9 @@ def train(args, config, model_cfg, net, dataloader, optimizer,
         ]
         log_writer.writerow(['轮次', '训练损失', 'w1%','w2%','w3%', 'z1%','z2%','z3%', 'φloss', 'φn1','φn2','φn3', 'φa1','φa2','φa3', 'MAC1','MAC2','MAC3', 'w占比%','z占比%','phi占比%','FRF占比%', '验证MSE', '幅值MAE', '幅值MAPE%', 'kl', 'dir2%', 'dir3%', '学习率'] + val_modal_header)
 
-    phase2_unlocked = False
-    unlock_epoch = start_epoch
+    phase2_min_epoch = config.get('phase2_min_epoch', 200)
+    phase2_unlocked = start_epoch >= phase2_min_epoch
+    unlock_epoch = phase2_min_epoch if phase2_unlocked else start_epoch
     lowest_modal = np.inf
 
     try:
@@ -125,6 +126,13 @@ def train(args, config, model_cfg, net, dataloader, optimizer,
             current_zeta_w = config.get('zeta_loss_weight', 10.0)
             current_omega_w = config.get('omega_loss_weight', 1.0)
             kl_weight = 20.0
+
+        # Phase2a: 冻 φ 攻 ω/ζ，清零 φ/KL loss
+        if in_phase2a:
+            current_phi_w = 0.0
+            current_zeta_w = config.get('zeta_loss_weight', 10.0)
+            current_omega_w = config.get('omega_loss_weight', 1.0)
+            kl_weight = 0.0
         # ===============================================
 
         for batch in dataloader:
