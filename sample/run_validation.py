@@ -28,7 +28,7 @@ CONFIG = {
     'phi_loss_weight': 3.0,          # 振型损失权重 (归一化 MSE + MAC + std)
 
     # FRF 精调约束: 仅作为最后 1% 精度的打磨工具
-    'frf_loss_weight': 0.1,
+    'frf_loss_weight': 0.02,
     'frf_warmup_epochs': 20,
 
     'freq_min': 1.0, 'freq_max': 5000.0,
