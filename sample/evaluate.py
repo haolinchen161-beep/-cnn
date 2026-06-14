@@ -24,7 +24,7 @@ class Args:
 
 def parse_args():
     parser = argparse.ArgumentParser(description='Evaluate Transolver Modal')
-    parser.add_argument('--data-dir', default=os.path.join(os.path.dirname(__file__), '..', 'ansys', 'data'))
+    parser.add_argument('--data-dir', default=os.path.join(os.path.dirname(__file__), '..', 'ansys', 'data_2'))
     parser.add_argument('--split', default='test.h5')
     parser.add_argument('--output-dir', default=os.path.join(os.path.dirname(__file__), 'output_transolver_modal'))
     parser.add_argument('--checkpoint', default=None)
