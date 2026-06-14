@@ -17,9 +17,9 @@ from typing import List
 DIRECTION_TO_INDEX = {"X": 0, "Y": 1, "Z": 2}
 INDEX_TO_DIRECTION = {0: "X", 1: "Y", 2: "Z"}
 
-# 默认训练 / 数据生成方向（铣削切削平面方向优先）
-DEFAULT_RESPONSE_DIRECTION = "Y"
-DEFAULT_FORCE_DIRECTION = "Y"
+# 默认训练 / 数据生成方向（薄板面外颤振主方向）
+DEFAULT_RESPONSE_DIRECTION = "Z"
+DEFAULT_FORCE_DIRECTION = "Z"
 
 
 def direction_to_index(direction: str) -> int:
