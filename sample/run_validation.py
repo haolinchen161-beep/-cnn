@@ -42,14 +42,14 @@ CONFIG = {
 
     'optimizer': {
         'name': 'AdamW',
-        'kwargs': {'lr': 0.001, 'weight_decay': 0.001, 'betas': (0.9, 0.999)},
+        'kwargs': {'lr': 0.001, 'weight_decay': 0.005, 'betas': (0.9, 0.999)},
         'gradient_clip': 2.0,
     },
 }
 
 MODEL_CFG = {
     'encoder_kwargs': {
-        'in_ch': 6, 'hidden': 768, 'n_modes': 3,
+        'in_ch': 6, 'hidden': 256, 'n_modes': 3,
         'amp_scale': 500000.0, 'freq_min': 1.0, 'freq_max': 5000.0,
     },
     'decoder_kwargs': {},
