@@ -164,6 +164,18 @@ def train(args, config, model_cfg, net, dataloader, optimizer,
             node_features = node_features.to(args.device) if node_features is not None else None
             global_features = global_features.to(args.device) if global_features is not None else None
 
+            # 训练期给 omega 使用的 clean global features 加微弱噪声，防止频率头把样本特征当哈希表记忆
+            noise_std = config.get('global_feature_noise_std', 0.0)
+            if global_features is not None and noise_std > 0.0 and not in_phase2:
+                global_features = global_features.clone()
+
+                if hasattr(net, 'omega_phys_idx'):
+                    idx = net.omega_phys_idx.to(global_features.device)
+                    noise = torch.randn_like(global_features[:, idx]) * noise_std
+                    global_features[:, idx] = global_features[:, idx] + noise
+                else:
+                    global_features = global_features + torch.randn_like(global_features) * noise_std
+
             with torch.cuda.amp.autocast(enabled=args.fp16):
                 if in_phase2:
                     phase2_epoch = epoch - unlock_epoch
