@@ -208,7 +208,7 @@ def per_graph_direction_norm_loss(phi_pred, phi_target, batch_idx, mode_weights=
         loss = torch.abs(torch.log((p_norm + 1e-8) / (t_norm + 1e-8))).unsqueeze(0)
 
     if mode_weights is None:
-        mode_weights = loss.new_tensor([0.2, 5.0, 0.5])
+        mode_weights = loss.new_tensor([0.5, 2.0, 3.0])
 
     return torch.mean(loss * mode_weights.view(1, -1, 1))
 
@@ -237,6 +237,6 @@ def branch_loss(branch_log_probs, phi_target, batch_idx, mode_weights=None):
     kl_all = torch.cat(kl_per_list, dim=0)  # [B, K]
 
     if mode_weights is None:
-        mode_weights = torch.tensor([0.1, 5.0, 0.5], device=kl_all.device)
+        mode_weights = torch.tensor([0.5, 2.0, 3.0], device=kl_all.device)
 
     return (kl_all * mode_weights.view(1, -1)).mean()
