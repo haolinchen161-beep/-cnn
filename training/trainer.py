@@ -150,7 +150,7 @@ def train(args, config, model_cfg, net, dataloader, optimizer,
         # ===============================================
 
         for batch in dataloader:
-            optimizer.zero_grad()
+            optimizer.zero_grad(set_to_none=True)
 
             img = batch['image_tensor'].to(args.device)
             coords = batch['query_coords'].to(args.device)
