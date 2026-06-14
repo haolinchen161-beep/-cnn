@@ -37,7 +37,7 @@ CONFIG = {
 
     # 学习率调度: plateau = 验证集不提升时衰减
     'lr_schedule': 'plateau',
-    'plateau_patience': 20,
+    'plateau_patience': 6,
     'plateau_factor': 0.5,
     'plateau_monitor': 'val_modal_score',
 
