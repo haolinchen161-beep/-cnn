@@ -50,7 +50,8 @@ class SirenLayer(nn.Module):
     def _init_weights(self):
         with torch.no_grad():
             if self.is_first:
-                b = 1.0 / self.linear.in_features
+                # 修复高维隐空间输入的线性崩溃，使用 Kaiming Uniform 标准
+                b = math.sqrt(3.0 / self.linear.in_features)
             else:
                 b = math.sqrt(6.0 / self.linear.in_features) / self.w0
             self.linear.weight.uniform_(-b, b)
@@ -418,7 +419,7 @@ class TransolverModalFRF(nn.Module):
             masked_mean(z_norm) + ratio(top_surface) - ratio(bottom_surface) + ratio(free_surface),
         ], dim=-1)
 
-        vals = torch.nan_to_num(vals, nan=0.0, posinf=20.0, neginf=-20.0).clamp(-20.0, 20.0)
+        vals = torch.nan_to_num(vals, nan=0.0, posinf=1e6, neginf=-1e6)
         return vals
 
     def global_feature_summary(self, node_features: torch.Tensor, node_counts: list) -> torch.Tensor:
@@ -535,7 +536,7 @@ class TransolverModalFRF(nn.Module):
         ]
 
         vals = torch.stack(physics_values, dim=-1)
-        vals = torch.nan_to_num(vals, nan=0.0, posinf=20.0, neginf=-20.0).clamp(-20.0, 20.0)
+        vals = torch.nan_to_num(vals, nan=0.0, posinf=1e6, neginf=-1e6)
         summary = feat_dense.new_zeros(B, self.branch_stats_dim)
         n = min(vals.shape[-1], self.branch_stats_dim)
         summary[:, :n] = vals[:, :n]
