@@ -384,7 +384,7 @@ class UNetPhysicsModel(nn.Module):
         if node_xyz is not None and node_features is not None:
             phi = self.phi_refiner(phi, latent, node_xyz, node_features, batch)
 
-        # FRF 重建: 训练时永久使用 ω_true, 推理时用 ω_pred
+        # FRF 重建: 若传入 omega_true 则使用 teacher forcing，否则使用 omega_phys
         if frequencies is not None:
             phi_z = phi[..., 2]                                      # [total_N, K] Z 向分量
             omega_used = omega_true if omega_true is not None else omega_phys
