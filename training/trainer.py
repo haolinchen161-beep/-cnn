@@ -210,7 +210,7 @@ def train(args, config, model_cfg, net, dataloader, optimizer,
 
             # 训练期给 omega 使用的 clean global features 加微弱噪声，防止频率头把样本特征当哈希表记忆
             noise_std = config.get('global_feature_noise_std', 0.0)
-            if global_features is not None and noise_std > 0.0 and not in_phase2:
+            if global_features is not None and noise_std > 0.0 and not in_phase2 and not in_omega_prior_only:
                 global_features = global_features.clone()
 
                 if hasattr(net, 'omega_phys_idx'):
