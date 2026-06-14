@@ -20,6 +20,7 @@ CONFIG = {
     'enable_phase2': True,           # 开启 FRF 联合训练
     'phase2_min_epoch': 160,         # 160 轮模态预训练后进 Phase2
     'phase2_omega_tune_epochs': 40,  # Phase2a: 前40轮冻 φ 攻 ω/ζ
+    'phase2a_lr': 1e-4,
     'frf_teacher_epochs': 0,         # Phase2a 直接用预测频率 (FRF 训练 ω/ζ)
     'zeta_warmup_epochs': 0,        # 前40轮 zeta_w=0 (防 spike)
 
