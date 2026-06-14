@@ -208,7 +208,7 @@ class CoordinatePhiResidual(nn.Module):
 class PhysicsPriorOmegaHead(nn.Module):
     """物理先验频率头：干净物理量给粗预测，CNN latent 给残差修正。"""
 
-    def __init__(self, hidden=256, n_modes=3, phys_dim=13):
+    def __init__(self, hidden=256, n_modes=3, phys_dim=14):
         super().__init__()
         self.n_modes = n_modes
 
@@ -413,7 +413,7 @@ class UNetPhysicsModel(nn.Module):
             persistent=False,
         )
 
-        self.omega_head = PhysicsPriorOmegaHead(hidden, n_modes, phys_dim=13)
+        self.omega_head = PhysicsPriorOmegaHead(hidden, n_modes, phys_dim=14)
         self.zeta_head = ZetaHead(hidden, n_modes)
         self.micro_decoder = MicroDecoder(hidden, n_modes)
         self.phi_refiner = NodePhiRefiner(hidden, node_feat_dim=7, n_modes=n_modes)
@@ -455,7 +455,7 @@ class UNetPhysicsModel(nn.Module):
         if global_features is None:
             omega_phys_features = torch.zeros(
                 B,
-                self.omega_phys_idx.numel(),
+                self.omega_phys_idx.numel() + 1,
                 device=latent.device,
                 dtype=latent.dtype,
             )
@@ -463,6 +463,13 @@ class UNetPhysicsModel(nn.Module):
             omega_idx = self.omega_phys_idx.to(global_features.device)
             omega_phys_features = global_features.index_select(dim=1, index=omega_idx)
             omega_phys_features = omega_phys_features.to(device=latent.device, dtype=latent.dtype)
+
+            E_ratio = global_features[:, 0:1].to(device=latent.device, dtype=latent.dtype)
+            rho_ratio = global_features[:, 2:3].to(device=latent.device, dtype=latent.dtype)
+            z_h_mean = global_features[:, 3:4].to(device=latent.device, dtype=latent.dtype)
+
+            f_theory = z_h_mean * torch.sqrt(torch.clamp(E_ratio / (rho_ratio + 1e-6), min=1e-6))
+            omega_phys_features = torch.cat([omega_phys_features, f_theory], dim=-1)
 
         omega_phys = self.omega_head(latent, omega_phys_features)
 
