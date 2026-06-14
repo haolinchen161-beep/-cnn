@@ -30,7 +30,7 @@ CONFIG = {
 MODEL_CFG = {
     'encoder_kwargs': {
         'in_ch': 6,
-        'hidden': 768,
+        'hidden': 256,
         'n_modes': 3,
         'amp_scale': 500000.0,
         'freq_min': 1.0,
@@ -41,8 +41,8 @@ MODEL_CFG = {
 
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
 data_dir = os.path.join(os.path.dirname(__file__), '..', 'ansys', 'data_2')
-out_dir = os.path.join(os.path.dirname(__file__), 'output')
-ckpt_path = os.path.join(out_dir, 'checkpoint_best')
+out_dir = os.path.join(os.path.dirname(__file__), 'output_small')
+ckpt_path = os.path.join(out_dir, 'checkpoint_best_modal')
 
 
 def to_obj(arr_list):
