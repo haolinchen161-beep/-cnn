@@ -564,8 +564,13 @@ def _generate_preds(args, config, net, dataloader, phase1=False):
                             omega_errs.append((omega_pred_val - omega_true[i]).abs())
                         # 收集模态指标
                         if 'modal_phi' in batch:
+                            sub_batch = {
+                                'modal_omega_phys': batch['modal_omega_phys'][i:i+1],
+                                'modal_zeta': batch['modal_zeta'][i:i+1],
+                                'modal_phi': batch['modal_phi'].to(args.device)[m],
+                            }
                             mm = _compute_val_modal_metrics(
-                                r[1], r[3], r[4], batch, bt_i)
+                                r[1], r[3], r[4], sub_batch, bt_i)
                             modal_metrics.append(mm)
                     else:
                         predictions.append(r.squeeze(0).cpu())
