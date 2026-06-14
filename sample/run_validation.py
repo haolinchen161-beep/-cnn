@@ -17,6 +17,7 @@ CONFIG = {
 
     # 阶段控制
     'omega_pretrain_epochs': 40,     # 前40轮频率专属预训练
+    'omega_prior_only_epochs': 20,   # 前20轮只训练 omega_head.prior_mlp
     'enable_phase2': True,           # 开启 FRF 联合训练
     'phase2_min_epoch': 160,         # 160 轮模态预训练后进 Phase2
     'phase2_omega_tune_epochs': 40,  # Phase2a: 前40轮冻 φ 攻 ω/ζ
