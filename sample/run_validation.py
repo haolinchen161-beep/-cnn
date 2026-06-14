@@ -62,7 +62,7 @@ class SimpleArgs:
         self.seed = 42
         self.device = 'cuda' if torch.cuda.is_available() else 'cpu'
         self.fp16 = False
-        self.dir = os.path.join(os.path.dirname(__file__), "output")
+        self.dir = os.path.join(os.path.dirname(__file__), "output_small")
         self.debug = False
 
 
