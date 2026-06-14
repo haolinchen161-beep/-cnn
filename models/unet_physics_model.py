@@ -172,9 +172,9 @@ class CoordinatePhiResidual(nn.Module):
 
         self.net = nn.Sequential(
             nn.Linear(in_dim, 256),
-            SineAct(w0=15.0),
+            SineAct(w0=4.0),
             nn.Linear(256, 256),
-            SineAct(w0=15.0),
+            SineAct(w0=4.0),
             nn.Linear(256, 128),
             nn.GELU(),
             nn.Linear(128, 3),
@@ -201,8 +201,8 @@ class CoordinatePhiResidual(nn.Module):
 
         delta = self.net(x)
 
-        # 残差幅度不要太大，防止一开始破坏已有 map 解码器
-        return phi_base + 0.20 * torch.tanh(delta)
+        # 残差幅度降低，避免节点级 residual 拟合高频噪声
+        return phi_base + 0.08 * torch.tanh(delta)
 
 
 class PhysicsPriorOmegaHead(nn.Module):
@@ -237,10 +237,10 @@ class PhysicsPriorOmegaHead(nn.Module):
             p = torch.tensor(p).clamp(1e-4, 1 - 1e-4)
             return torch.log(p / (1.0 - p))
 
-        # 初始化到当前数据均值附近
-        b1 = inv_sigmoid((957.0 - self.f1_min) / self.f1_span)
-        b2 = inv_sigmoid((1632.0 - self.g21_min) / self.g21_span)
-        b3 = inv_sigmoid((388.0 - self.g32_min) / self.g32_span)
+        # 初始化到过滤后训练集均值附近
+        b1 = inv_sigmoid((949.7 - self.f1_min) / self.f1_span)
+        b2 = inv_sigmoid((1390.8 - self.g21_min) / self.g21_span)
+        b3 = inv_sigmoid((522.1 - self.g32_min) / self.g32_span)
 
         with torch.no_grad():
             nn.init.zeros_(self.prior_mlp[-1].weight)
