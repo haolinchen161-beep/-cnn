@@ -1,13 +1,31 @@
-"""Training and evaluation loop for Transolver modal-FRF model."""
+"""Transolver-Modal 训练与评估循环。
+
+该文件不再使用旧版错误 trainer，而是对齐当前 CNN 中已经验证正确的训练策略：
+Phase0 频率专属预训练 → Phase1 全模态训练 → Phase2 FRF 弱约束；
+同时每次验证都打印验证集三阶 w/z/MAC/φn/φa，并用验证集模态指标保存 checkpoint_best_modal。
+"""
 from __future__ import annotations
 
+import csv
 import os
-from typing import Dict, Optional
+from typing import Dict
 
+import numpy as np
 import torch
-import torch.nn as nn
+import torch.nn.functional as F
 
-from .losses import total_loss
+from .losses import modal_loss, frf_loss
+
+
+# ---------------------------------------------------------------------------
+# 工具函数
+# ---------------------------------------------------------------------------
+
+def _log(msg: str, logger=None) -> None:
+    if logger is not None:
+        logger.info(msg)
+    else:
+        print(msg)
 
 
 def move_batch_to_device(batch: Dict, device: str) -> Dict:
@@ -17,261 +35,346 @@ def move_batch_to_device(batch: Dict, device: str) -> Dict:
     return out
 
 
-class TransolverTrainer:
-    """Small trainer for variable-size mesh batches."""
-
-    def __init__(self,
-                 model: nn.Module,
-                 optimizer: torch.optim.Optimizer,
-                 device: str = 'cpu',
-                 scheduler: Optional[torch.optim.lr_scheduler._LRScheduler] = None,
-                 fp16: bool = False):
-        self.model = model.to(device)
-        self.optimizer = optimizer
-        self.device = device
-        self.scheduler = scheduler
-        self.scaler = torch.cuda.amp.GradScaler(enabled=fp16)
-        self.fp16 = fp16
-
-    def forward_batch(self, batch: Dict, config: Dict | None = None) -> Dict[str, torch.Tensor]:
-        # 根据 use_frf_loss 决定是否传入 frequencies（节省计算）
-        use_frf = True if config is None else config.get('use_frf_loss', False)
-        # 渐进式物理融合权重：训练时由 epoch 计算，评估时默认 1.0（纯物理）
-        physics_alpha = 1.0 if config is None else config.get('physics_alpha', 1.0)
-
-        return self.model(
-            points=batch['points'],
-            node_features=batch['node_features'],
-            batch=batch['batch'],
-            edge_index=batch.get('edge_index'),
-            boundary_c_xyz=batch.get('boundary_c_xyz'),
-            excitation_index=batch.get('excitation_index'),
-            frequencies=batch.get('frequencies') if use_frf else None,
-            num_graphs=batch.get('num_graphs'),
-            node_counts=batch.get('node_counts'),
-            physics_alpha=physics_alpha,
-        )
-
-    def train_epoch(self, loader, config: Dict, epoch: int = 0) -> Dict[str, float]:
-        import time
-        self.model.train()
-        sums, count = {}, 0
-
-        # 渐进式物理融合：前 warmup_epochs 从 0 线性升到 1
-        # epoch=0 时 alpha≈0（纯数据驱动），epoch=warmup 时 alpha=1（纯物理路径）
-        warmup_epochs = config.get('physics_alpha_warmup', 50)
-        physics_alpha = min(1.0, epoch / max(warmup_epochs, 1))
-        config['physics_alpha'] = physics_alpha
-
-        t_fwd = t_bwd = 0.0
-        t_wait = 0.0  # DataLoader 批次间等待（含 HDF5 读盘）
-        t_loop_start = time.time()
-        for batch in loader:
-            t_wait += time.time() - t_loop_start  # 等 DataLoader 出下一批的时间
-
-            batch = move_batch_to_device(batch, self.device)
-            t0 = time.time()
-
-            self.optimizer.zero_grad(set_to_none=True)
-            with torch.cuda.amp.autocast(enabled=self.fp16):
-                outputs = self.forward_batch(batch, config)
-                loss, logs = total_loss(outputs, batch, config)
-            torch.cuda.synchronize()
-            t_fwd += time.time() - t0
-
-            t0 = time.time()
-            self.scaler.scale(loss).backward()
-            grad_clip = config.get('gradient_clip', 1.0)
-            if grad_clip is not None:
-                self.scaler.unscale_(self.optimizer)
-                torch.nn.utils.clip_grad_norm_(self.model.parameters(), grad_clip)
-            self.scaler.step(self.optimizer)
-            self.scaler.update()
-            torch.cuda.synchronize()
-            t_bwd += time.time() - t0
-
-            for key, value in logs.items():
-                sums[key] = sums.get(key, 0.0) + float(value.detach().cpu())
-            count += 1
-            t_loop_start = time.time()
-
-        if count > 0 and epoch % 10 == 0:
-            print(f"  [计时] epoch {epoch}: wait={t_wait:.1f}s fwd={t_fwd:.1f}s bwd={t_bwd:.1f}s ({count}批)")
-
-        if self.scheduler is not None:
-            self.scheduler.step()
-        return {key: value / max(1, count) for key, value in sums.items()}
-
-    @torch.no_grad()
-    def evaluate(self, loader, config: Dict) -> Dict[str, float]:
-        self.model.eval()
-        sums, count = {}, 0
-        for batch in loader:
-            batch = move_batch_to_device(batch, self.device)
-            outputs = self.forward_batch(batch, config)
-            # total_loss 返回当前 loss 结构下的评估日志
-            _, logs = total_loss(outputs, batch, config)
-            for key, value in logs.items():
-                sums[key] = sums.get(key, 0.0) + float(value.detach().cpu())
-            count += 1
-        metrics = {key: value / max(1, count) for key, value in sums.items()}
-        # 从对齐后的 loss 中提取真实的 ω_rel 和 zeta_rel
-        metrics['omega_rel'] = metrics.get('loss_omega', 0.0)
-        zeta_k_sum = sum([metrics.get(f'zeta_k{k}', 0.0) for k in range(3)])
-        metrics['zeta_rel'] = zeta_k_sum / 3.0
-        return metrics
+def _forward_model(net, batch: Dict, use_frf: bool, omega_true: torch.Tensor | None = None):
+    return net(
+        points=batch['points'],
+        node_features=batch['node_features'],
+        batch=batch['batch'],
+        edge_index=batch.get('edge_index'),
+        boundary_c_xyz=batch.get('boundary_c_xyz'),
+        excitation_index=batch.get('excitation_index'),
+        frequencies=batch.get('frequencies') if use_frf else None,
+        num_graphs=batch.get('num_graphs'),
+        node_counts=batch.get('node_counts'),
+        omega_true=omega_true,
+    )
 
 
-def save_checkpoint(path: str, model: nn.Module, optimizer, epoch: int, metrics: Dict[str, float]) -> None:
-    os.makedirs(os.path.dirname(path), exist_ok=True)
+def _mean_logs(log_list: list[Dict[str, torch.Tensor | float]]) -> Dict[str, float]:
+    sums, counts = {}, {}
+    for logs in log_list:
+        for k, v in logs.items():
+            if isinstance(v, torch.Tensor):
+                v = float(v.detach().cpu())
+            elif isinstance(v, (int, float, np.floating)):
+                v = float(v)
+            else:
+                continue
+            sums[k] = sums.get(k, 0.0) + v
+            counts[k] = counts.get(k, 0) + 1
+    return {k: sums[k] / max(1, counts[k]) for k in sums}
+
+
+def _apply_gradient_clip(net, optimizer, scaler, config, fp16: bool):
+    grad_clip = config.get('optimizer', {}).get('gradient_clip', config.get('gradient_clip', 2.0))
+    if grad_clip is None:
+        return
+    if fp16:
+        scaler.unscale_(optimizer)
+    torch.nn.utils.clip_grad_norm_(net.parameters(), float(grad_clip))
+
+
+def save_model(savepath: str, epoch: int, model, optimizer, loss, name: str = "checkpoint_best"):
+    os.makedirs(savepath, exist_ok=True)
     torch.save({
         'epoch': epoch,
         'model_state_dict': model.state_dict(),
         'optimizer_state_dict': optimizer.state_dict() if optimizer is not None else None,
-        'metrics': metrics,
-        'loss': metrics.get('loss_total', metrics.get('loss_modal', 0.0)),
-    }, path)
+        'loss': float(loss) if isinstance(loss, (int, float, np.floating)) else loss,
+    }, os.path.join(savepath, name))
 
 
-def train(args, config, model_cfg, net, dataloader, optimizer, valloader, scheduler=None, logger=None, start_epoch=0):
-    """训练入口，供 sample/run_validation.py 调用。"""
-    import csv
+def _format_val_modal_row(val_results: Dict) -> list[str]:
+    if not val_results or 'val_w_rel_per_mode' not in val_results:
+        return [''] * 15
+    vw = val_results['val_w_rel_per_mode']
+    vz = val_results['val_z_rel_per_mode']
+    vm = val_results['val_mac_per_mode']
+    vpn = val_results['val_phi_n_per_mode']
+    vpa = val_results['val_phi_a_per_mode']
+    return [
+        f'{vw[0]:.3f}', f'{vw[1]:.3f}', f'{vw[2]:.3f}',
+        f'{vz[0]:.1f}', f'{vz[1]:.1f}', f'{vz[2]:.1f}',
+        f'{vm[0]:.3f}', f'{vm[1]:.3f}', f'{vm[2]:.3f}',
+        f'{vpn[0]:.1f}', f'{vpn[1]:.1f}', f'{vpn[2]:.1f}',
+        f'{vpa[0]:.1f}', f'{vpa[1]:.1f}', f'{vpa[2]:.1f}',
+    ]
 
-    trainer = TransolverTrainer(net, optimizer, device=args.device, scheduler=scheduler, fp16=getattr(args, 'fp16', False))
-    best = float('inf')
-    epochs = config.get('epochs', 200)
-    out_dir = getattr(args, 'dir', 'output')
 
-    # 打开 CSV 日志
-    csv_path = os.path.join(out_dir, 'training_log.csv')
-    csv_file = open(csv_path, 'w', newline='', encoding='utf-8')
-    csv_writer = csv.writer(csv_file)
-    # CSV 表头
-    csv_header = ['epoch', 'lr',
-                  'total',  # 加权总损失
-                  'omega', 'zeta', 'phi_resp', 'phi_xyz', 'mac',  # 原始损失值
-                  'omega%', 'zeta%', 'phi_resp%', 'phi_xyz%',  # 损失占比(%)
-                  'omega_k0', 'omega_k1', 'omega_k2',
-                  'zeta_k0', 'zeta_k1', 'zeta_k2',
-                  'phi_k0', 'phi_k1', 'phi_k2',
+# ---------------------------------------------------------------------------
+# 训练主循环
+# ---------------------------------------------------------------------------
 
-                  # 新增细分振型损失
-                  'z_shape', 'z_scale', 'part', 'xyz_shape', 'xyz_energy',
-                  'z_scale_k0', 'z_scale_k1', 'z_scale_k2',
-                  'part_k0', 'part_k1', 'part_k2',
+def train(args, config, model_cfg, net, dataloader, optimizer,
+          valloader, scheduler=None, logger=None, start_epoch: int = 0):
+    total_epochs = int(config.get('epochs', 900))
+    frf_weight = float(config.get('frf_loss_weight', 0.02))
+    scaler = torch.cuda.amp.GradScaler(enabled=getattr(args, 'fp16', False))
+    os.makedirs(args.dir, exist_ok=True)
 
-                  'frf', 'frf_complex', 'frf_log_amp', 'frf_db',
-                  'val_total', 'omega_rel', 'zeta_rel',
-                  'val_phi_k0', 'val_phi_k1', 'val_phi_k2']
-    csv_writer.writerow(csv_header)
+    log_path = os.path.join(args.dir, 'loss_log.csv')
+    log_exists = os.path.exists(log_path) and start_epoch > 0
+    log_file = open(log_path, 'a', newline='', encoding='utf-8')
+    log_writer = csv.writer(log_file)
+    if not log_exists:
+        val_header = [
+            'val_w1%', 'val_w2%', 'val_w3%',
+            'val_z1%', 'val_z2%', 'val_z3%',
+            'val_MAC1', 'val_MAC2', 'val_MAC3',
+            'val_phiN1%', 'val_phiN2%', 'val_phiN3%',
+            'val_phiA1%', 'val_phiA2%', 'val_phiA3%',
+        ]
+        log_writer.writerow([
+            '轮次', '训练损失',
+            'w1%', 'w2%', 'w3%',
+            'z1%', 'z2%', 'z3%',
+            'φloss', 'φn1', 'φn2', 'φn3', 'φa1', 'φa2', 'φa3',
+            'MAC1', 'MAC2', 'MAC3',
+            'w占比%', 'z占比%', 'phi占比%', 'FRF占比%',
+            '验证MSE', '幅值MAE', '幅值MAPE%',
+            'FRFraw', '学习率',
+        ] + val_header)
 
-    # 损失权重
-    mw = config.get('modal_loss_weights', {})
-    w_omega = mw.get('omega', 1.0)
-    w_zeta = mw.get('zeta', 0.5)
-    w_phi_resp = mw.get('phi_resp', 1.0)
-    w_phi_xyz = mw.get('phi_xyz', 0.25)
-    w_mac = mw.get('mac', 0.2)
-    w_frf = config.get('frf_loss_weight', 1.0)
+    omega_pretrain_epochs = int(config.get('omega_pretrain_epochs', 50))
+    phase2_min_epoch = int(config.get('phase2_min_epoch', 300))
+    enable_phase2 = bool(config.get('enable_phase2', True))
+    phase2_unlocked = start_epoch > phase2_min_epoch
+    unlock_epoch = phase2_min_epoch if phase2_unlocked else start_epoch
+    lowest = np.inf
+    lowest_modal = np.inf
 
-    def _r4(v):
-        """四舍五入到 4 位小数"""
-        return round(float(v), 4) if isinstance(v, (int, float, torch.Tensor)) else v
+    try:
+        for epoch in range(start_epoch, total_epochs):
+            net.train()
+            in_phase0 = epoch < omega_pretrain_epochs
+            in_phase2 = phase2_unlocked
+            in_phase1 = not phase2_unlocked
 
-    for epoch in range(start_epoch, epochs):
-        train_logs = trainer.train_epoch(dataloader, config, epoch)
+            if epoch == 0:
+                _log("=== 阶段0: 频率专属预训练 (仅训频率) ===", logger)
+            if epoch == omega_pretrain_epochs:
+                _log("=== 阶段1: 全模态联合训练 (ω/ζ/φ) ===", logger)
 
-        # 当前学习率
-        lr = optimizer.param_groups[0]['lr']
+            if in_phase0:
+                current_weights = {
+                    'omega': config.get('omega_loss_weight', 1.0) * 5.0,
+                    'zeta': 0.0,
+                    'phi': 0.0,
+                }
+            else:
+                current_weights = {
+                    'omega': config.get('omega_loss_weight', 1.0),
+                    'zeta': config.get('zeta_loss_weight', 10.0),
+                    'phi': config.get('phi_loss_weight', 3.0),
+                }
 
-        # 计算各损失占比
-        raw_o = train_logs.get('loss_omega', 0)
-        raw_z = train_logs.get('loss_zeta', 0)
-        raw_p = train_logs.get('loss_phi_resp', 0)
-        raw_x = train_logs.get('loss_phi_xyz', 0)
-        raw_m = train_logs.get('loss_mac', 0)
-        raw_f = train_logs.get('loss_frf', 0)
+            batch_logs = []
+            losses = []
+            frf_raw_values = []
 
-        wv_o = w_omega * raw_o
-        wv_z = w_zeta * raw_z
-        wv_p = w_phi_resp * raw_p
-        wv_x = w_phi_xyz * raw_x
-        wv_m = w_mac * raw_m
-        wv_f = w_frf * raw_f
-        total_w = wv_o + wv_z + wv_p + wv_x + wv_m + wv_f + 1e-12
+            for batch in dataloader:
+                batch = move_batch_to_device(batch, args.device)
+                optimizer.zero_grad(set_to_none=True)
 
-        pct_o = wv_o / total_w * 100
-        pct_z = wv_z / total_w * 100
-        pct_p = wv_p / total_w * 100
-        pct_x = wv_x / total_w * 100
+                with torch.cuda.amp.autocast(enabled=getattr(args, 'fp16', False)):
+                    omega_true = None
+                    use_frf = False
+                    current_frf_w = 0.0
+                    if in_phase2:
+                        phase2_epoch = epoch - unlock_epoch
+                        teacher_epochs = int(config.get('frf_teacher_epochs', 50))
+                        omega_true = batch['modal_omega'] if phase2_epoch < teacher_epochs else None
+                        use_frf = True
+                        warm = int(config.get('frf_warmup_epochs', 20))
+                        current_frf_w = frf_weight * min(1.0, phase2_epoch / max(warm, 1))
 
-        # 每轮打印（全部百分比形式 + 三阶分开展示 + 学习率）
-        omega_pct = ' '.join([f"{train_logs.get(f'omega_k{k}', 0)*100:.1f}%" for k in range(3)])
-        zeta_pct = ' '.join([f"{train_logs.get(f'zeta_k{k}', 0)*100:.1f}%" for k in range(3)])
-        phi_pct = ' '.join([f"{train_logs.get(f'phi_k{k}', 0)*100:.1f}%" for k in range(3)])
-        alpha = config.get('physics_alpha', 1.0)
-        train_msg = (f"Epoch {epoch:04d} | lr={lr:.1e} | α={alpha:.2f} | total={total_w:.3e} "
-                     f"[ω={pct_o:.0f}% ζ={pct_z:.0f}% φ_resp={pct_p:.0f}% φ_xyz={pct_x:.0f}%] "
-                     f"ω_k=[{omega_pct}] ζ_k=[{zeta_pct}] φ_k=[{phi_pct}]")
-        print(train_msg)
+                    outputs = _forward_model(net, batch, use_frf=use_frf, omega_true=omega_true)
+                    loss_m, logs = modal_loss(outputs, batch, current_weights)
+                    loss = loss_m
+                    raw_frf = outputs['modal_omega'].new_tensor(0.0)
+                    if use_frf and outputs.get('frf') is not None:
+                        raw_frf, frf_logs = frf_loss(outputs['frf'], batch['point_frf'])
+                        logs.update(frf_logs)
+                        loss = loss + current_frf_w * raw_frf
 
-        # 验证和保存 checkpoint 按频率触发
-        val_logs = None
-        if epoch % config.get('validation_frequency', 5) == 0 or epoch == epochs - 1:
-            val_logs = trainer.evaluate(valloader, config)
-            metric = val_logs.get('loss_total', val_logs.get('loss_modal', float('inf')))
-            val_omega_k = ' '.join(f"{val_logs.get(f'omega_k{k}', 0)*100:.1f}%" for k in range(3))
-            val_zeta_k = ' '.join(f"{val_logs.get(f'zeta_k{k}', 0)*100:.1f}%" for k in range(3))
-            val_phi_k = ' '.join(f"{val_logs.get(f'phi_k{k}', 0)*100:.1f}%" for k in range(3))
-            val_msg = (f"  -> val={metric:.4e} "
-                       f"ω_rel={val_logs.get('omega_rel', 0)*100:.1f}% "
-                       f"ζ_rel={val_logs.get('zeta_rel', 0)*100:.1f}% "
-                       f"ω_k=[{val_omega_k}] ζ_k=[{val_zeta_k}] "
-                       f"φ_resp={val_logs.get('loss_phi_resp', 0):.4f} "
-                       f"φ_xyz={val_logs.get('loss_phi_xyz', 0):.4f} "
-                       f"φ_k=[{val_phi_k}]")
-            print(val_msg)
-            save_checkpoint(os.path.join(out_dir, 'checkpoint_last'), net, optimizer, epoch, val_logs)
-            if metric < best:
-                best = metric
-                save_checkpoint(os.path.join(out_dir, 'checkpoint_best'), net, optimizer, epoch, val_logs)
+                losses.append(float(loss.detach().cpu()))
+                logs['loss_total'] = loss.detach()
+                logs['loss_frf_raw'] = raw_frf.detach()
+                batch_logs.append(logs)
+                frf_raw_values.append(float(raw_frf.detach().cpu()))
 
-        # 写入 CSV
-        row = [epoch, f"{lr:.1e}", _r4(total_w),
-               _r4(raw_o), _r4(raw_z), _r4(raw_p), _r4(raw_x), _r4(raw_m),
-               _r4(pct_o), _r4(pct_z), _r4(pct_p), _r4(pct_x),
-               *[_r4(train_logs.get(f'omega_k{k}', 0) * 100) for k in range(3)],
-               *[_r4(train_logs.get(f'zeta_k{k}', 0) * 100) for k in range(3)],
-               *[_r4(train_logs.get(f'phi_k{k}', 0) * 100) for k in range(3)],
+                scaler.scale(loss).backward()
+                _apply_gradient_clip(net, optimizer, scaler, config, getattr(args, 'fp16', False))
+                scaler.step(optimizer)
+                scaler.update()
 
-               # 新增细分振型损失
-               _r4(train_logs.get('loss_phi_resp_shape', 0)),
-               _r4(train_logs.get('loss_phi_resp_scale', 0)),
-               _r4(train_logs.get('loss_phi_participation', 0)),
-               _r4(train_logs.get('loss_phi_xyz_shape', 0)),
-               _r4(train_logs.get('loss_phi_xyz_energy', 0)),
-               *[_r4(train_logs.get(f'z_scale_k{k}', 0)) for k in range(3)],
-               *[_r4(train_logs.get(f'part_k{k}', 0)) for k in range(3)],
+            if scheduler is not None:
+                scheduler.step()
 
-               _r4(raw_f),
-               _r4(train_logs.get('loss_frf_complex', 0)),
-               _r4(train_logs.get('loss_frf_log_amp', 0)),
-               _r4(train_logs.get('loss_frf_db', 0)),
-               _r4(val_logs.get('loss_total', '')) if val_logs else '',
-               _r4(val_logs.get('omega_rel', '')) if val_logs else '',
-               _r4(val_logs.get('zeta_rel', '')) if val_logs else '',
-               *[_r4(val_logs.get(f'phi_k{k}', 0) * 100) if val_logs else '' for k in range(3)]]
-        csv_writer.writerow(row)
-        csv_file.flush()
+            train_logs = _mean_logs(batch_logs)
+            mean_loss = float(np.mean(losses)) if losses else 0.0
+            lr = optimizer.param_groups[0]['lr']
 
-    csv_file.close()
-    print(f"训练日志已保存: {csv_path}")
+            w = np.array([train_logs.get(f'omega_k{k}', 0.0) * 100.0 for k in range(3)])
+            z = np.array([train_logs.get(f'zeta_k{k}', 0.0) * 100.0 for k in range(3)])
+            mac = np.array([train_logs.get(f'mac_k{k}', 0.0) for k in range(3)])
+            phi_n = np.array([train_logs.get(f'phi_n_k{k}', 0.0) for k in range(3)])
+            phi_a = np.array([train_logs.get(f'phi_a_k{k}', 0.0) for k in range(3)])
+
+            w_loss = train_logs.get('loss_omega', 0.0)
+            z_loss = train_logs.get('loss_zeta', 0.0)
+            p_loss = train_logs.get('loss_phi', 0.0)
+            f_loss = frf_weight * train_logs.get('loss_frf_raw', 0.0) if in_phase2 else 0.0
+            denom = max(w_loss + z_loss + p_loss + f_loss, 1e-12)
+            w_share, z_share, p_share, f_share = [x / denom * 100.0 for x in (w_loss, z_loss, p_loss, f_loss)]
+
+            _log(
+                f"Epoch {epoch:4d} | "
+                f"w=[{w[0]:.1f}/{w[1]:.1f}/{w[2]:.1f}]% "
+                f"z=[{z[0]:.0f}/{z[1]:.0f}/{z[2]:.0f}]% "
+                f"φn=[{phi_n[0]:.1f}/{phi_n[1]:.1f}/{phi_n[2]:.1f}]% "
+                f"φa=[{phi_a[0]:.1f}/{phi_a[1]:.1f}/{phi_a[2]:.1f}]% "
+                f"MAC=[{mac[0]:.3f}/{mac[1]:.3f}/{mac[2]:.3f}] | "
+                f"w{w_share:.0f}z{z_share:.0f}ph{p_share:.0f}frf{f_share:.0f} | "
+                f"loss={mean_loss:.1f}",
+                logger,
+            )
+
+            # Phase2 动态解锁在 epoch 末尾触发，与当前 CNN 训练逻辑一致。
+            if not phase2_unlocked and enable_phase2 and epoch >= phase2_min_epoch:
+                phase2_unlocked = True
+                unlock_epoch = epoch
+                _log(f">>> Phase2 unlocked at epoch {epoch} (FRF weak constraint) <<<", logger)
+
+            val_results = None
+            val_freq = int(config.get('validation_frequency', 5))
+            if epoch % val_freq == 0 or epoch == total_epochs - 1:
+                save_model(args.dir, epoch, net, optimizer, mean_loss, 'checkpoint_last')
+                val_results = evaluate(args, config, net, valloader, logger, epoch, verbose=True, phase1=not phase2_unlocked)
+
+                if in_phase1:
+                    best_metric = val_results.get('ω_MAE (rad/s)', val_results.get('val_w_rel_mean', np.inf))
+                    metric_name = 'val_ω_MAE'
+                else:
+                    best_metric = val_results.get('loss (MSE)', val_results.get('val_w_rel_mean', np.inf))
+                    metric_name = 'val_loss'
+                if best_metric < lowest:
+                    _log(f"best model ({metric_name}={best_metric:.6f})", logger)
+                    save_model(args.dir, epoch, net, optimizer, best_metric, 'checkpoint_best')
+                    lowest = best_metric
+
+                if epoch >= omega_pretrain_epochs and 'val_w_rel_mean' in val_results:
+                    val_modal_score = (
+                        val_results['val_w_rel_mean']
+                        + 0.3 * val_results['val_z_rel_mean']
+                        + (1.0 - val_results['val_mac_mean']) * 100.0
+                        + 0.05 * val_results['val_phi_a_mean']
+                    )
+                    if val_modal_score < lowest_modal:
+                        _log(f"best val modal model (val_modal_score={val_modal_score:.4f})", logger)
+                        save_model(args.dir, epoch, net, optimizer, val_modal_score, 'checkpoint_best_modal')
+                        lowest_modal = val_modal_score
+
+            row = [
+                epoch, f'{mean_loss:.2e}',
+                f'{w[0]:.3f}', f'{w[1]:.3f}', f'{w[2]:.3f}',
+                f'{z[0]:.1f}', f'{z[1]:.1f}', f'{z[2]:.1f}',
+                f'{p_loss:.2f}',
+                f'{phi_n[0]:.1f}', f'{phi_n[1]:.1f}', f'{phi_n[2]:.1f}',
+                f'{phi_a[0]:.1f}', f'{phi_a[1]:.1f}', f'{phi_a[2]:.1f}',
+                f'{mac[0]:.3f}', f'{mac[1]:.3f}', f'{mac[2]:.3f}',
+                f'{w_share:.1f}', f'{z_share:.1f}', f'{p_share:.1f}', f'{f_share:.1f}',
+                f'{val_results.get("loss (MSE)", 0):.4f}' if val_results else '',
+                f'{val_results.get("Amplitude MAE", 0):.4f}' if val_results else '',
+                f'{val_results.get("Amplitude MAPE (%)", 0):.2f}' if val_results else '',
+                f'{np.mean(frf_raw_values):.4f}', f'{lr:.2e}',
+            ] + (_format_val_modal_row(val_results) if val_results else [''] * 15)
+            log_writer.writerow(row)
+            log_file.flush()
+
+    finally:
+        log_file.close()
+
     return net
 
 
-def evaluate(args, config, net, dataloader, logger=None, epoch=None, verbose=False):
-    trainer = TransolverTrainer(net, optimizer=torch.optim.AdamW(net.parameters(), lr=1e-6), device=args.device)
-    metrics = trainer.evaluate(dataloader, config)
-    if verbose:
-        print(metrics)
-    return metrics
+# ---------------------------------------------------------------------------
+# 验证/测试
+# ---------------------------------------------------------------------------
+
+@torch.no_grad()
+def evaluate(args, config, net, dataloader, logger=None, epoch=None, verbose=True, phase1=False):
+    was_training = net.training
+    net.eval()
+    device = args.device
+
+    modal_logs = []
+    frf_preds, frf_targets = [], []
+    omega_abs_errs = []
+
+    try:
+        for batch in dataloader:
+            batch = move_batch_to_device(batch, device)
+            outputs = _forward_model(net, batch, use_frf=not phase1, omega_true=None)
+            _, logs = modal_loss(outputs, batch, {'omega': 1.0, 'zeta': 1.0, 'phi': 1.0})
+            modal_logs.append(logs)
+            omega_abs_errs.append(torch.abs(outputs['modal_omega'] - batch['modal_omega']).detach().cpu())
+            if not phase1 and outputs.get('frf') is not None:
+                frf_preds.append(outputs['frf'].detach().cpu())
+                frf_targets.append(batch['point_frf'].detach().cpu())
+
+        logs = _mean_logs(modal_logs)
+        results: Dict[str, object] = {}
+        omega_abs = torch.cat([e.flatten() for e in omega_abs_errs]) if omega_abs_errs else torch.tensor([])
+        if omega_abs.numel() > 0:
+            results['ω_MAE (rad/s)'] = float(omega_abs.mean())
+
+        val_w = np.array([logs.get(f'omega_k{k}', 0.0) * 100.0 for k in range(3)])
+        val_z = np.array([logs.get(f'zeta_k{k}', 0.0) * 100.0 for k in range(3)])
+        val_mac = np.array([logs.get(f'mac_k{k}', 0.0) for k in range(3)])
+        val_phi_n = np.array([logs.get(f'phi_n_k{k}', 0.0) for k in range(3)])
+        val_phi_a = np.array([logs.get(f'phi_a_k{k}', 0.0) for k in range(3)])
+
+        results['val_w_rel_per_mode'] = val_w
+        results['val_z_rel_per_mode'] = val_z
+        results['val_mac_per_mode'] = val_mac
+        results['val_phi_n_per_mode'] = val_phi_n
+        results['val_phi_a_per_mode'] = val_phi_a
+        results['val_w_rel_mean'] = float(val_w.mean())
+        results['val_z_rel_mean'] = float(val_z.mean())
+        results['val_mac_mean'] = float(val_mac.mean())
+        results['val_phi_n_mean'] = float(val_phi_n.mean())
+        results['val_phi_a_mean'] = float(val_phi_a.mean())
+
+        if frf_preds:
+            pred = torch.cat(frf_preds, dim=0)
+            target = torch.cat(frf_targets, dim=0)
+            if pred.shape != target.shape:
+                target = target.reshape(pred.shape)
+            results['loss (MSE)'] = float(F.mse_loss(pred, target))
+            p_amp = torch.linalg.norm(pred, dim=-1)
+            t_amp = torch.linalg.norm(target, dim=-1)
+            results['Amplitude MAE'] = float(F.l1_loss(p_amp, t_amp))
+            results['Amplitude MAPE (%)'] = float((torch.abs(p_amp - t_amp) / (t_amp + 1e-6)).mean() * 100.0)
+
+        if verbose:
+            if 'loss (MSE)' in results:
+                _log(
+                    f"Val FRF | MSE={results['loss (MSE)']:.4f} "
+                    f"MAE={results['Amplitude MAE']:.4f} "
+                    f"MAPE={results['Amplitude MAPE (%)']:.2f}%",
+                    logger,
+                )
+            _log(
+                f"Val modal | "
+                f"w=[{val_w[0]:.3f}/{val_w[1]:.3f}/{val_w[2]:.3f}]% "
+                f"z=[{val_z[0]:.1f}/{val_z[1]:.1f}/{val_z[2]:.1f}]% "
+                f"MAC=[{val_mac[0]:.3f}/{val_mac[1]:.3f}/{val_mac[2]:.3f}] "
+                f"φn=[{val_phi_n[0]:.1f}/{val_phi_n[1]:.1f}/{val_phi_n[2]:.1f}]% "
+                f"φa=[{val_phi_a[0]:.1f}/{val_phi_a[1]:.1f}/{val_phi_a[2]:.1f}]%",
+                logger,
+            )
+        return results
+    finally:
+        if was_training:
+            net.train()
