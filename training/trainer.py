@@ -23,9 +23,21 @@ def _set_phase2a_omega_tune(net):
     """Phase2a: 冻结 φ 相关模块，只让 omega/zeta 头学习 FRF 峰位。"""
     for p in net.parameters():
         p.requires_grad = False
+
+    # 冻结这些模块的 BN / Dropout 行为
+    for name in [
+        'encoder', 'micro_decoder', 'phi_refiner',
+        'coord_phi_residual', 'phi_scale_head', 'branch_head',
+    ]:
+        if hasattr(net, name):
+            getattr(net, name).eval()
+
+    # 只训练 omega/zeta
     for name in ['omega_head', 'zeta_head']:
         if hasattr(net, name):
-            for p in getattr(net, name).parameters():
+            module = getattr(net, name)
+            module.train()
+            for p in module.parameters():
                 p.requires_grad = True
 
 
@@ -92,10 +104,11 @@ def train(args, config, model_cfg, net, dataloader, optimizer,
             net._phase2_logged = True
             lowest = np.inf
 
-        if in_phase2 and in_phase2a and not getattr(net, '_phase2a_logged', False):
-            _log("=== Phase2a: 冻 φ，FRF 反向修正 ω/ζ ===", logger)
+        if in_phase2 and in_phase2a:
+            if not getattr(net, '_phase2a_logged', False):
+                _log("=== Phase2a: 冻 φ，FRF 反向修正 ω/ζ ===", logger)
+                net._phase2a_logged = True
             _set_phase2a_omega_tune(net)
-            net._phase2a_logged = True
 
         if in_phase2 and (not in_phase2a) and not getattr(net, '_phase2b_logged', False):
             _log("=== Phase2b: 解冻全模型，小权重 FRF 联调 ===", logger)
@@ -499,6 +512,7 @@ def _apply_gradient_clip(net, config):
     _clip_module(net, 'omega_head', 2.0)
     _clip_module(net, 'zeta_head', 2.0)
     _clip_module(net, 'phi_refiner', 2.0)
+    _clip_module(net, 'coord_phi_residual', 2.0)
     _clip_module(net, 'phi_scale_head', 2.0)
     _clip_module(net, 'branch_head', 2.0)
 
