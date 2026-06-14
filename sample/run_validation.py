@@ -12,13 +12,13 @@ from models import build_geometric_model
 from training import train, evaluate, modal_loss
 
 CONFIG = {
-    'epochs': 900,
+    'epochs': 600,
     'validation_frequency': 5,
 
     # 阶段控制
     'omega_pretrain_epochs': 40,     # 前40轮频率专属预训练
     'enable_phase2': True,           # 开启 FRF 联合训练
-    'phase2_min_epoch': 200,         # 200 轮模态预训练后进 Phase2
+    'phase2_min_epoch': 160,         # 160 轮模态预训练后进 Phase2
     'frf_teacher_epochs': 50,        # Phase2 前50轮用真实频率稳定峰位，之后改用预测频率
     'zeta_warmup_epochs': 0,        # 前40轮 zeta_w=0 (防 spike)
 
@@ -28,10 +28,17 @@ CONFIG = {
     'phi_loss_weight': 3.0,          # 振型损失权重 (归一化 MSE + MAC + std)
 
     # FRF 精调约束: 仅作为最后 1% 精度的打磨工具
-    'frf_loss_weight': 0.02,
+    'frf_loss_weight': 0.01,
     'frf_warmup_epochs': 20,
 
     'freq_min': 1.0, 'freq_max': 5000.0,
+
+    # 学习率调度: plateau = 验证集不提升时衰减
+    'lr_schedule': 'plateau',
+    'plateau_patience': 20,
+    'plateau_factor': 0.5,
+    'plateau_monitor': 'val_modal_score',
+
     'data_path_train': ['train.h5'],
     'data_path_val': ['val.h5'],
     'data_path_test': ['test.h5'],
@@ -42,7 +49,7 @@ CONFIG = {
 
     'optimizer': {
         'name': 'AdamW',
-        'kwargs': {'lr': 0.001, 'weight_decay': 0.005, 'betas': (0.9, 0.999)},
+        'kwargs': {'lr': 5e-4, 'weight_decay': 0.01, 'betas': (0.9, 0.999)},
         'gradient_clip': 2.0,
     },
 }
@@ -135,7 +142,16 @@ def main():
     # 训练
     print("\n--- Step 5: Train ---")
     optimizer = torch.optim.AdamW(net.parameters(), **CONFIG['optimizer']['kwargs'])
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=CONFIG['epochs'], eta_min=1e-6)
+    if CONFIG.get('lr_schedule') == 'plateau':
+        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+            optimizer,
+            mode='min',
+            patience=CONFIG.get('plateau_patience', 20),
+            factor=CONFIG.get('plateau_factor', 0.5),
+            min_lr=1e-6,
+        )
+    else:
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=CONFIG['epochs'], eta_min=1e-6)
     start_epoch = 0
     ckpt_path = os.path.join(args.dir, "checkpoint_last")
     if os.path.exists(ckpt_path):
