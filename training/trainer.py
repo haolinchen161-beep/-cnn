@@ -38,7 +38,14 @@ def train(args, config, model_cfg, net, dataloader, optimizer,
     log_file = open(log_path, 'a', newline='')
     log_writer = csv.writer(log_file)
     if not log_exists:
-        log_writer.writerow(['轮次', '训练损失', 'w1%','w2%','w3%', 'z1%','z2%','z3%', 'φloss', 'φn1','φn2','φn3', 'φa1','φa2','φa3', 'MAC1','MAC2','MAC3', 'w占比%','z占比%','phi占比%','FRF占比%', '验证MSE', '幅值MAE', '幅值MAPE%', 'kl', 'dir2%', 'dir3%', '学习率'])
+        val_modal_header = [
+            'val_w1%', 'val_w2%', 'val_w3%',
+            'val_z1%', 'val_z2%', 'val_z3%',
+            'val_MAC1', 'val_MAC2', 'val_MAC3',
+            'val_phiN1%', 'val_phiN2%', 'val_phiN3%',
+            'val_phiA1%', 'val_phiA2%', 'val_phiA3%',
+        ]
+        log_writer.writerow(['轮次', '训练损失', 'w1%','w2%','w3%', 'z1%','z2%','z3%', 'φloss', 'φn1','φn2','φn3', 'φa1','φa2','φa3', 'MAC1','MAC2','MAC3', 'w占比%','z占比%','phi占比%','FRF占比%', '验证MSE', '幅值MAE', '幅值MAPE%', 'kl', 'dir2%', 'dir3%', '学习率'] + val_modal_header)
 
     phase2_unlocked = False
     unlock_epoch = start_epoch
@@ -260,13 +267,6 @@ def train(args, config, model_cfg, net, dataloader, optimizer,
         dir3 = np.mean(dir_accs_m3) * 100 if dir_accs_m3 else 0
         _log(f"Epoch {epoch:4d} | {w_str} {z_str} {phi_str} {mac_str} | w{omega_share:.0f}z{zeta_share:.0f}ph{phi_share:.0f} | kl={kl_avg:.3f} dir2={dir2:.0f}% dir3={dir3:.0f}% | loss={mean_loss:.1f}", logger)
 
-        # 模态最优模型监控 (综合频率+阻尼+MAC)
-        modal_score = omega_pct + 0.3 * zeta_pct + (1.0 - mac_scalar) * 100.0
-        if modal_score < lowest_modal:
-            _log(f"  best modal model (modal_score={modal_score:.4f})", logger)
-            save_model(args.dir, epoch, net, optimizer, modal_score, "checkpoint_best_modal")
-            lowest_modal = modal_score
-
         # 动态解锁: enable_phase2=True 且 epoch >= phase2_min_epoch
         enable_phase2 = config.get('enable_phase2', False)
         phase2_min_epoch = config.get('phase2_min_epoch', 200)
@@ -283,7 +283,7 @@ def train(args, config, model_cfg, net, dataloader, optimizer,
                 val_results = evaluate(args, config, net, valloader, logger, epoch, phase1=True)
                 omega_mae = val_results.get("ω_MAE (rad/s)", -1)
                 _log(f"Epoch {epoch:4d} | ω_MAE={omega_mae:.1f} rad/s (Phase1)", logger)
-                log_writer.writerow([epoch, f'{mean_loss:.2e}', f'{omega_per_mode[0]:.3f}',f'{omega_per_mode[1]:.3f}',f'{omega_per_mode[2]:.3f}', f'{zeta_per_mode[0]:.1f}',f'{zeta_per_mode[1]:.1f}',f'{zeta_per_mode[2]:.1f}', f'{phi_loss:.2f}', f'{phi_n_per_mode[0]:.1f}',f'{phi_n_per_mode[1]:.1f}',f'{phi_n_per_mode[2]:.1f}', f'{phi_a_per_mode[0]:.1f}',f'{phi_a_per_mode[1]:.1f}',f'{phi_a_per_mode[2]:.1f}', f'{mac_per_mode[0]:.3f}',f'{mac_per_mode[1]:.3f}',f'{mac_per_mode[2]:.3f}', f'{omega_share:.1f}', f'{zeta_share:.1f}', f'{phi_share:.1f}', '0', '', '', '', f'{kl_avg:.4f}', f'{dir2:.1f}', f'{dir3:.1f}', f'{lr:.2e}'])
+                log_writer.writerow([epoch, f'{mean_loss:.2e}', f'{omega_per_mode[0]:.3f}',f'{omega_per_mode[1]:.3f}',f'{omega_per_mode[2]:.3f}', f'{zeta_per_mode[0]:.1f}',f'{zeta_per_mode[1]:.1f}',f'{zeta_per_mode[2]:.1f}', f'{phi_loss:.2f}', f'{phi_n_per_mode[0]:.1f}',f'{phi_n_per_mode[1]:.1f}',f'{phi_n_per_mode[2]:.1f}', f'{phi_a_per_mode[0]:.1f}',f'{phi_a_per_mode[1]:.1f}',f'{phi_a_per_mode[2]:.1f}', f'{mac_per_mode[0]:.3f}',f'{mac_per_mode[1]:.3f}',f'{mac_per_mode[2]:.3f}', f'{omega_share:.1f}', f'{zeta_share:.1f}', f'{phi_share:.1f}', '0', '', '', '', f'{kl_avg:.4f}', f'{dir2:.1f}', f'{dir3:.1f}', f'{lr:.2e}'] + _format_val_modal_row(val_results))
             else:
                 val_results = evaluate(args, config, net, valloader, logger, epoch)
                 val_loss = val_results["loss (MSE)"]
@@ -291,7 +291,7 @@ def train(args, config, model_cfg, net, dataloader, optimizer,
                 log_writer.writerow([epoch, f'{mean_loss:.2e}', f'{omega_per_mode[0]:.3f}',f'{omega_per_mode[1]:.3f}',f'{omega_per_mode[2]:.3f}', f'{zeta_per_mode[0]:.1f}',f'{zeta_per_mode[1]:.1f}',f'{zeta_per_mode[2]:.1f}', f'{phi_loss:.2f}', f'{phi_n_per_mode[0]:.1f}',f'{phi_n_per_mode[1]:.1f}',f'{phi_n_per_mode[2]:.1f}', f'{phi_a_per_mode[0]:.1f}',f'{phi_a_per_mode[1]:.1f}',f'{phi_a_per_mode[2]:.1f}', f'{mac_per_mode[0]:.3f}',f'{mac_per_mode[1]:.3f}',f'{mac_per_mode[2]:.3f}', f'{omega_share:.1f}', f'{zeta_share:.1f}', f'{phi_share:.1f}', f'{frf_share:.1f}', f'{val_loss:.4f}',
                                      f'{val_results.get("Amplitude MAE", 0):.4f}',
                                      f'{val_results.get("Amplitude MAPE (%)", 0):.2f}',
-                                     f'{kl_avg:.4f}', f'{dir2:.1f}', f'{dir3:.1f}', f'{lr:.2e}'])
+                                     f'{kl_avg:.4f}', f'{dir2:.1f}', f'{dir3:.1f}', f'{lr:.2e}'] + _format_val_modal_row(val_results))
             log_file.flush()
 
             # best checkpoint: 用验证集 ω_MAE (防过拟合)
@@ -307,9 +307,22 @@ def train(args, config, model_cfg, net, dataloader, optimizer,
                 _log(f"best model ({metric_name}={best_metric:{fmt}})", logger)
                 save_model(args.dir, epoch, net, optimizer, best_metric)
                 lowest = best_metric
+
+            # 模态最优模型: 用验证集模态指标保存
+            if 'val_w_rel_mean' in val_results:
+                val_modal_score = (
+                    val_results['val_w_rel_mean']
+                    + 0.3 * val_results['val_z_rel_mean']
+                    + (1.0 - val_results['val_mac_mean']) * 100.0
+                    + 0.05 * val_results['val_phi_a_mean']
+                )
+                if val_modal_score < lowest_modal:
+                    _log(f"best val modal model (val_modal_score={val_modal_score:.4f})", logger)
+                    save_model(args.dir, epoch, net, optimizer, val_modal_score, "checkpoint_best_modal")
+                    lowest_modal = val_modal_score
         else:
             frf_s = 0 if in_phase1 else (100 - omega_share - zeta_share - phi_share)
-            log_writer.writerow([epoch, f'{mean_loss:.2e}', f'{omega_per_mode[0]:.3f}',f'{omega_per_mode[1]:.3f}',f'{omega_per_mode[2]:.3f}', f'{zeta_per_mode[0]:.1f}',f'{zeta_per_mode[1]:.1f}',f'{zeta_per_mode[2]:.1f}', f'{phi_loss:.2f}', f'{phi_n_per_mode[0]:.1f}',f'{phi_n_per_mode[1]:.1f}',f'{phi_n_per_mode[2]:.1f}', f'{phi_a_per_mode[0]:.1f}',f'{phi_a_per_mode[1]:.1f}',f'{phi_a_per_mode[2]:.1f}', f'{mac_per_mode[0]:.3f}',f'{mac_per_mode[1]:.3f}',f'{mac_per_mode[2]:.3f}', f'{omega_share:.1f}', f'{zeta_share:.1f}', f'{phi_share:.1f}', f'{frf_s:.1f}', '', '', '', f'{kl_avg:.4f}', f'{dir2:.1f}', f'{dir3:.1f}', f'{lr:.2e}'])
+            log_writer.writerow([epoch, f'{mean_loss:.2e}', f'{omega_per_mode[0]:.3f}',f'{omega_per_mode[1]:.3f}',f'{omega_per_mode[2]:.3f}', f'{zeta_per_mode[0]:.1f}',f'{zeta_per_mode[1]:.1f}',f'{zeta_per_mode[2]:.1f}', f'{phi_loss:.2f}', f'{phi_n_per_mode[0]:.1f}',f'{phi_n_per_mode[1]:.1f}',f'{phi_n_per_mode[2]:.1f}', f'{phi_a_per_mode[0]:.1f}',f'{phi_a_per_mode[1]:.1f}',f'{phi_a_per_mode[2]:.1f}', f'{mac_per_mode[0]:.3f}',f'{mac_per_mode[1]:.3f}',f'{mac_per_mode[2]:.3f}', f'{omega_share:.1f}', f'{zeta_share:.1f}', f'{phi_share:.1f}', f'{frf_s:.1f}', '', '', '', f'{kl_avg:.4f}', f'{dir2:.1f}', f'{dir3:.1f}', f'{lr:.2e}'] + [''] * 15)
 
         if epoch == (total_epochs - 1):
             path = os.path.join(args.dir, "checkpoint_best")
@@ -348,6 +361,84 @@ def _compute_phi_metrics(phi_pred, phi_target, batch_idx):
     return phi_n, phi_a
 
 
+def _compute_val_modal_metrics(omega_pred, zeta_pred, phi_pred, batch, batch_idx):
+    """验证集三阶模态指标: w/z/MAC/φn/φa。"""
+    device = omega_pred.device
+
+    omega_true = batch['modal_omega_phys'].to(device)
+    zeta_true = batch['modal_zeta'].to(device)
+    phi_true = batch['modal_phi'].to(device)
+
+    # 频率、阻尼相对误差 [%]
+    omega_rel = torch.abs(omega_pred - omega_true) / (omega_true + 1e-8) * 100.0
+    zeta_rel = torch.abs(zeta_pred - zeta_true) / (zeta_true + 1e-8) * 100.0
+
+    n_graphs = int(batch_idx.max().item()) + 1
+
+    mac_list = []
+    phi_n_list = []
+    phi_a_list = []
+
+    for b in range(n_graphs):
+        mask = batch_idx == b
+
+        p = phi_pred[mask]      # [N, K, 3]
+        t = phi_true[mask]      # [N, K, 3]
+
+        # 每个样本、每阶模态独立符号对齐
+        dot = torch.sum(p * t, dim=(0, 2), keepdim=True)
+        t_aligned = t * torch.sign(dot + 1e-8)
+
+        # MAC
+        num = torch.sum(p * t_aligned, dim=(0, 2)) ** 2
+        den = torch.sum(p ** 2, dim=(0, 2)) * torch.sum(t_aligned ** 2, dim=(0, 2)) + 1e-8
+        mac = num / den
+        mac_list.append(mac)
+
+        # φn: 振型形状误差 NRMSE [%]
+        rmse = torch.sqrt(torch.mean((p - t_aligned) ** 2, dim=(0, 2)))
+        t_std = torch.std(
+            t_aligned.transpose(0, 1).reshape(t_aligned.shape[1], -1),
+            dim=1
+        ) + 1e-8
+        phi_n = rmse / t_std * 100.0
+        phi_n_list.append(phi_n)
+
+        # φa: 振型幅值/范数误差 [%]
+        norm_p = torch.sqrt(torch.sum(p ** 2, dim=(0, 2)))
+        norm_t = torch.sqrt(torch.sum(t_aligned ** 2, dim=(0, 2))) + 1e-8
+        phi_a = torch.abs(norm_p - norm_t) / norm_t * 100.0
+        phi_a_list.append(phi_a)
+
+    return {
+        'val_w_rel': omega_rel.mean(dim=0).detach().cpu().numpy(),
+        'val_z_rel': zeta_rel.mean(dim=0).detach().cpu().numpy(),
+        'val_mac': torch.stack(mac_list, dim=0).mean(dim=0).detach().cpu().numpy(),
+        'val_phi_n': torch.stack(phi_n_list, dim=0).mean(dim=0).detach().cpu().numpy(),
+        'val_phi_a': torch.stack(phi_a_list, dim=0).mean(dim=0).detach().cpu().numpy(),
+    }
+
+
+def _format_val_modal_row(val_results):
+    """把验证集模态指标格式化为 CSV 15 列。"""
+    if not val_results or 'val_w_rel_per_mode' not in val_results:
+        return [''] * 15
+
+    vw = val_results['val_w_rel_per_mode']
+    vz = val_results['val_z_rel_per_mode']
+    vm = val_results['val_mac_per_mode']
+    vpn = val_results['val_phi_n_per_mode']
+    vpa = val_results['val_phi_a_per_mode']
+
+    return [
+        f'{vw[0]:.3f}', f'{vw[1]:.3f}', f'{vw[2]:.3f}',
+        f'{vz[0]:.1f}', f'{vz[1]:.1f}', f'{vz[2]:.1f}',
+        f'{vm[0]:.3f}', f'{vm[1]:.3f}', f'{vm[2]:.3f}',
+        f'{vpn[0]:.1f}', f'{vpn[1]:.1f}', f'{vpn[2]:.1f}',
+        f'{vpa[0]:.1f}', f'{vpa[1]:.1f}', f'{vpa[2]:.1f}',
+    ]
+
+
 def _apply_gradient_clip(net, config):
     grad_clip = config.get('optimizer', {}).get('gradient_clip')
     if grad_clip is None:
@@ -369,9 +460,43 @@ def _clip_module(net, prefix, max_norm):
 
 
 def evaluate(args, config, net, dataloader, logger=None, epoch=None, verbose=True, phase1=False):
-    """验证/测试评估。phase1=True 时只计算 ω_MAE，跳过 FRF 推理。"""
-    prediction, output, omega_errs = _generate_preds(args, config, net, dataloader, phase1=phase1)
+    """验证/测试评估。phase1=True 时跳过 FRF，但仍统计验证集模态指标。"""
+    prediction, output, omega_errs, modal_metrics = _generate_preds(
+        args, config, net, dataloader, phase1=phase1
+    )
+
     results = _evaluate(prediction, output, omega_errs, logger, epoch, verbose, phase1=phase1)
+
+    if modal_metrics:
+        val_w = np.stack([m['val_w_rel'] for m in modal_metrics], axis=0).mean(axis=0)
+        val_z = np.stack([m['val_z_rel'] for m in modal_metrics], axis=0).mean(axis=0)
+        val_mac = np.stack([m['val_mac'] for m in modal_metrics], axis=0).mean(axis=0)
+        val_phi_n = np.stack([m['val_phi_n'] for m in modal_metrics], axis=0).mean(axis=0)
+        val_phi_a = np.stack([m['val_phi_a'] for m in modal_metrics], axis=0).mean(axis=0)
+
+        results['val_w_rel_per_mode'] = val_w
+        results['val_z_rel_per_mode'] = val_z
+        results['val_mac_per_mode'] = val_mac
+        results['val_phi_n_per_mode'] = val_phi_n
+        results['val_phi_a_per_mode'] = val_phi_a
+
+        results['val_w_rel_mean'] = float(val_w.mean())
+        results['val_z_rel_mean'] = float(val_z.mean())
+        results['val_mac_mean'] = float(val_mac.mean())
+        results['val_phi_n_mean'] = float(val_phi_n.mean())
+        results['val_phi_a_mean'] = float(val_phi_a.mean())
+
+        if verbose:
+            _log(
+                f"Val modal | "
+                f"w=[{val_w[0]:.3f}/{val_w[1]:.3f}/{val_w[2]:.3f}]% "
+                f"z=[{val_z[0]:.1f}/{val_z[1]:.1f}/{val_z[2]:.1f}]% "
+                f"MAC=[{val_mac[0]:.3f}/{val_mac[1]:.3f}/{val_mac[2]:.3f}] "
+                f"φn=[{val_phi_n[0]:.1f}/{val_phi_n[1]:.1f}/{val_phi_n[2]:.1f}]% "
+                f"φa=[{val_phi_a[0]:.1f}/{val_phi_a[1]:.1f}/{val_phi_a[2]:.1f}]%",
+                logger
+            )
+
     return results
 
 
@@ -380,6 +505,7 @@ def _generate_preds(args, config, net, dataloader, phase1=False):
     with torch.no_grad():
         predictions, outputs = [], []
         omega_errs = []
+        modal_metrics = []
         for batch in dataloader:
             img = batch['image_tensor'].to(args.device)
             coords = batch['query_coords'].to(args.device)
@@ -394,12 +520,17 @@ def _generate_preds(args, config, net, dataloader, phase1=False):
             _nf = _nf.to(args.device) if _nf is not None else None
             _gf = _gf.to(args.device) if _gf is not None else None
 
-            # Phase1: 只取 ω，跳过 FRF 推理
+            # Phase1: 只取 ω，跳过 FRF 推理，但仍收集模态指标
             if phase1:
-                _, omega_pred, _, _, _ = net(img, coords, None, None, bt,
+                _, omega_pred, log_zeta_pred, zeta_pred, phi_pred = net(img, coords, None, None, bt,
                                              node_xyz=_nx, node_features=_nf, global_features=_gf)
                 if omega_true is not None:
                     omega_errs.append((omega_pred.detach().cpu() - omega_true).abs())
+                # 收集验证集模态指标
+                if 'modal_phi' in batch and omega_true is not None:
+                    mm = _compute_val_modal_metrics(
+                        omega_pred, zeta_pred, phi_pred, batch, bt)
+                    modal_metrics.append(mm)
                 continue
 
             if isinstance(frequencies, list):
@@ -424,6 +555,11 @@ def _generate_preds(args, config, net, dataloader, phase1=False):
                         if omega_true is not None:
                             omega_pred_val = r[1].cpu()  # 已是 rad/s, OmegaHead 保证单调
                             omega_errs.append((omega_pred_val - omega_true[i]).abs())
+                        # 收集模态指标
+                        if 'modal_phi' in batch:
+                            mm = _compute_val_modal_metrics(
+                                r[1], r[3], r[4], batch, bt_i)
+                            modal_metrics.append(mm)
                     else:
                         predictions.append(r.squeeze(0).cpu())
                     outputs.append(target[i].cpu())
@@ -449,6 +585,11 @@ def _generate_preds(args, config, net, dataloader, phase1=False):
                     if omega_true is not None:
                         omega_pred_val = r[1].detach().cpu()  # 已是 rad/s
                         omega_errs.append((omega_pred_val - omega_true).abs())
+                    # 收集模态指标
+                    if 'modal_phi' in batch:
+                        mm = _compute_val_modal_metrics(
+                            r[1], r[3], r[4], batch, bt)
+                        modal_metrics.append(mm)
                 else:
                     prediction = r
                 pred_out = prediction.detach().cpu()
@@ -459,9 +600,9 @@ def _generate_preds(args, config, net, dataloader, phase1=False):
                 outputs.append(tgt_out)
 
     try:
-        return torch.cat(predictions, dim=0), torch.cat(outputs, dim=0), omega_errs
+        return torch.cat(predictions, dim=0), torch.cat(outputs, dim=0), omega_errs, modal_metrics
     except RuntimeError:
-        return predictions, outputs, omega_errs
+        return predictions, outputs, omega_errs, modal_metrics
 
 
 def _evaluate(prediction, output, omega_errs, logger, epoch, verbose=True, phase1=False):
