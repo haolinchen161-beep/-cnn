@@ -4,7 +4,7 @@ import torch
 from torch.utils.data import DataLoader
 from data import NODE_FEATURE_DIM, GraphHDF5Dataset, collate_geometry_batch
 from models import build_geometric_model
-from training.modal_trainer import evaluate_modal, train_modal
+from training.modal_trainer_simple import evaluate_modal, train_modal
 
 class Args:
     device = "cuda" if torch.cuda.is_available() else "cpu"
