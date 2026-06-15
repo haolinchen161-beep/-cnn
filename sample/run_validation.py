@@ -17,10 +17,13 @@ from training import train, evaluate, modal_loss
 CONFIG = {
     "epochs": 300,
     "validation_frequency": 5,
-    "omega_pretrain_epochs": 40,
-    "omega_prior_only_epochs": 20,
-    "phase2_min_epoch": 160,
-    "phase2_omega_tune_epochs": 40,
+    # GNN schedule: do not keep the CNN-style prior-only warmup.  The graph
+    # encoder should participate from epoch 0 so geometry/boundary information
+    # can immediately drive the frequency prediction.
+    "omega_pretrain_epochs": 30,
+    "omega_prior_only_epochs": 0,
+    "phase2_min_epoch": 120,
+    "phase2_omega_tune_epochs": 20,
     "phase2a_lr": 1e-4,
     "frf_teacher_epochs": 0,
     "omega_loss_weight": 1.0,
