@@ -1,4 +1,4 @@
-"""Model package exports for MeshGraphNet FRF surrogate."""
+"""Model package exports for FEM-aware MeshGraphNet modal surrogate."""
 
 from .frf_model import build_geometric_model
 from .meshgraphnet_frf_model import MeshGraphFRFModel
