@@ -1,4 +1,8 @@
-"""MeshGraphNet modal parameter evaluation + FRF result export."""
+"""MeshGraphNet modal parameter evaluation + FRF result export.
+
+Primary FRF metric/export uses self excitation: predicted phi at excitation_index.
+Teacher-phi-exc FRF is also exported for diagnosis only.
+"""
 from __future__ import annotations
 
 import os
@@ -103,9 +107,20 @@ def compute_peak_metrics(freqs_hz, pred_amp, true_amp, true_freq_hz, true_zeta):
     return [np.asarray(x, dtype=np.float32) for x in (peak_shift, peak_amp_rel, pred_peak_freq, true_peak_freq)]
 
 
+def frf_to_arrays(frf_tensor: torch.Tensor, target_tensor: torch.Tensor):
+    p = frf_tensor.detach().cpu()
+    t = target_tensor.detach().cpu()
+    pred_amp = torch.sqrt(p[..., 0] ** 2 + p[..., 1] ** 2 + EPS).numpy()
+    true_amp = torch.sqrt(t[..., 0] ** 2 + t[..., 1] ** 2 + EPS).numpy()
+    pred_re, pred_im = p[..., 0].numpy(), p[..., 1].numpy()
+    true_re, true_im = t[..., 0].numpy(), t[..., 1].numpy()
+    return pred_amp, true_amp, pred_re, pred_im, true_re, true_im
+
+
 def main():
     print("=" * 80)
     print("MeshGraphNet evaluation")
+    print("Primary FRF: self phi_exc from predicted phi at excitation_index")
     print("=" * 80)
 
     testset = GraphHDF5Dataset(["test.h5"], CONFIG, data_dir=data_dir, normalization=True, test=True)
@@ -123,15 +138,19 @@ def main():
 
     all_points, all_freqs = [], []
     all_pred_amp, all_true_amp = [], []
+    all_teacher_pred_amp = []
     all_pred_re, all_true_re = [], []
     all_pred_im, all_true_im = [], []
+    all_teacher_re, all_teacher_im = [], []
     all_pred_omega, all_true_omega = [], []
     all_pred_freq_hz, all_true_freq_hz, all_freq_rel = [], [], []
     all_pred_zeta, all_true_zeta, all_zeta_rel = [], [], []
     all_pred_phi, all_true_phi = [], []
     all_phi_mac, all_phi_nrmse, all_phi_a = [], [], []
     all_peak_shift_hz, all_peak_amp_rel = [], []
+    all_teacher_peak_shift_hz, all_teacher_peak_amp_rel = [], []
     all_pred_peak_freq, all_true_peak_freq = [], []
+    all_teacher_pred_peak_freq = []
 
     for idx in range(len(testset)):
         sn = testset[idx]
@@ -154,7 +173,14 @@ def main():
         exc_idx_global = exc_idx.unsqueeze(0).to(device) if exc_idx is not None else None
 
         with torch.no_grad():
+            # Primary final result: do not pass true modal_phi_exc.
             frf_pred, omega_pred, log_zeta, zeta_pred, phi_pred = model(
+                node_features, edge_index, edge_attr, batch_vec,
+                frequencies=frequencies,
+                phi_exc=None,
+                excitation_index_global=exc_idx_global,
+            )
+            frf_teacher, _, _, _, _ = model(
                 node_features, edge_index, edge_attr, batch_vec,
                 frequencies=frequencies,
                 phi_exc=phi_exc,
@@ -165,12 +191,8 @@ def main():
             mac, nrmse, phi_a, phi_aligned, _ = phi_metrics(phi_pred, true_phi)
             freq_hz_pred = omega_pred / (2.0 * torch.pi)
 
-        p = frf_pred.detach().cpu()
-        t = sr["point_frf"].detach().cpu()
-        pred_amp = torch.sqrt(p[..., 0] ** 2 + p[..., 1] ** 2 + EPS).numpy()
-        true_amp = torch.sqrt(t[..., 0] ** 2 + t[..., 1] ** 2 + EPS).numpy()
-        pred_re, pred_im = p[..., 0].numpy(), p[..., 1].numpy()
-        true_re, true_im = t[..., 0].numpy(), t[..., 1].numpy()
+        pred_amp, true_amp, pred_re, pred_im, true_re, true_im = frf_to_arrays(frf_pred, sr["point_frf"])
+        teacher_amp, _, teacher_re, teacher_im, _, _ = frf_to_arrays(frf_teacher, sr["point_frf"])
 
         true_omega_cpu = true_omega.detach().cpu()
         pred_omega_cpu = omega_pred.detach().cpu()
@@ -186,14 +208,20 @@ def main():
         peak_shift, peak_amp_rel, pred_peak_f, true_peak_f = compute_peak_metrics(
             freqs_phys, pred_amp, true_amp, true_freq_cpu.numpy(), true_zeta_cpu.numpy()
         )
+        teacher_peak_shift, teacher_peak_amp_rel, teacher_pred_peak_f, _ = compute_peak_metrics(
+            freqs_phys, teacher_amp, true_amp, true_freq_cpu.numpy(), true_zeta_cpu.numpy()
+        )
 
         all_points.append(sr["points"].numpy())
         all_freqs.append(freqs_phys)
         all_pred_amp.append(pred_amp)
+        all_teacher_pred_amp.append(teacher_amp)
         all_true_amp.append(true_amp)
         all_pred_re.append(pred_re)
-        all_true_re.append(true_re)
         all_pred_im.append(pred_im)
+        all_teacher_re.append(teacher_re)
+        all_teacher_im.append(teacher_im)
+        all_true_re.append(true_re)
         all_true_im.append(true_im)
         all_pred_omega.append(pred_omega_cpu.numpy())
         all_true_omega.append(true_omega_cpu.numpy())
@@ -210,7 +238,10 @@ def main():
         all_phi_a.append(phi_a.detach().cpu().numpy())
         all_peak_shift_hz.append(peak_shift)
         all_peak_amp_rel.append(peak_amp_rel)
+        all_teacher_peak_shift_hz.append(teacher_peak_shift)
+        all_teacher_peak_amp_rel.append(teacher_peak_amp_rel)
         all_pred_peak_freq.append(pred_peak_f)
+        all_teacher_pred_peak_freq.append(teacher_pred_peak_f)
         all_true_peak_freq.append(true_peak_f)
 
         if idx % 10 == 0:
@@ -224,14 +255,22 @@ def main():
     phi_a_all = np.stack(all_phi_a, axis=0)
     peak_shift_all = np.stack(all_peak_shift_hz, axis=0)
     peak_amp_rel_all = np.stack(all_peak_amp_rel, axis=0)
+    teacher_peak_shift_all = np.stack(all_teacher_peak_shift_hz, axis=0)
+    teacher_peak_amp_rel_all = np.stack(all_teacher_peak_amp_rel, axis=0)
+
     amp_mse_vals = [np.mean((all_pred_amp[i] - all_true_amp[i]) ** 2) for i in range(len(all_pred_amp))]
     amp_l1_vals = [np.mean(np.abs(all_pred_amp[i] - all_true_amp[i])) for i in range(len(all_pred_amp))]
+    teacher_amp_mse_vals = [np.mean((all_teacher_pred_amp[i] - all_true_amp[i]) ** 2) for i in range(len(all_teacher_pred_amp))]
+    teacher_amp_l1_vals = [np.mean(np.abs(all_teacher_pred_amp[i] - all_true_amp[i])) for i in range(len(all_teacher_pred_amp))]
 
     print("\n" + "=" * 80)
     print("Test summary")
     print("=" * 80)
+    print("Primary FRF uses predicted excitation phi at excitation_index.")
     print(f"FRF amplitude MSE mean = {np.mean(amp_mse_vals):.6e}")
     print(f"FRF amplitude L1  mean = {np.mean(amp_l1_vals):.6e}")
+    print(f"Teacher FRF amplitude MSE mean = {np.mean(teacher_amp_mse_vals):.6e}")
+    print(f"Teacher FRF amplitude L1  mean = {np.mean(teacher_amp_l1_vals):.6e}")
     print(f"Frequency relative error mean (%) = {np.mean(freq_rel_all) * 100.0:.4f}")
     print(f"Zeta relative error mean (%) = {np.mean(zeta_rel_all) * 100.0:.4f}")
     print(f"Mode MAC mean = {np.mean(phi_mac_all):.6f}")
@@ -239,6 +278,8 @@ def main():
     print(f"Mode phi_a mean (%) = {np.mean(phi_a_all) * 100.0:.4f}")
     print(f"FRF peak frequency shift mean (Hz) = {np.mean(peak_shift_all):.4f}")
     print(f"FRF peak amplitude relative error mean (%) = {np.mean(peak_amp_rel_all) * 100.0:.4f}")
+    print(f"Teacher peak frequency shift mean (Hz) = {np.mean(teacher_peak_shift_all):.4f}")
+    print(f"Teacher peak amplitude relative error mean (%) = {np.mean(teacher_peak_amp_rel_all) * 100.0:.4f}")
 
     os.makedirs(out_dir, exist_ok=True)
     save_path = os.path.join(out_dir, "final_results.npz")
@@ -247,10 +288,16 @@ def main():
         points=to_obj(all_points),
         frequencies=to_obj(all_freqs),
         predicted_frf=to_obj(all_pred_amp),
+        predicted_frf_self=to_obj(all_pred_amp),
+        predicted_frf_teacher=to_obj(all_teacher_pred_amp),
         target_frf=to_obj(all_true_amp),
         predicted_re=to_obj(all_pred_re),
-        target_re=to_obj(all_true_re),
         predicted_im=to_obj(all_pred_im),
+        predicted_re_self=to_obj(all_pred_re),
+        predicted_im_self=to_obj(all_pred_im),
+        predicted_re_teacher=to_obj(all_teacher_re),
+        predicted_im_teacher=to_obj(all_teacher_im),
+        target_re=to_obj(all_true_re),
         target_im=to_obj(all_true_im),
         pred_omega=to_obj(all_pred_omega),
         true_omega=to_obj(all_true_omega),
@@ -267,7 +314,10 @@ def main():
         phi_a=to_obj(all_phi_a),
         peak_shift_hz=to_obj(all_peak_shift_hz),
         peak_amp_rel=to_obj(all_peak_amp_rel),
+        teacher_peak_shift_hz=to_obj(all_teacher_peak_shift_hz),
+        teacher_peak_amp_rel=to_obj(all_teacher_peak_amp_rel),
         pred_peak_freq=to_obj(all_pred_peak_freq),
+        teacher_pred_peak_freq=to_obj(all_teacher_pred_peak_freq),
         true_peak_freq=to_obj(all_true_peak_freq),
     )
     print(f"\nSaved: {save_path}")
