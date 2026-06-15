@@ -1,7 +1,7 @@
 import os
 from collections import defaultdict
 import torch
-from .modal_losses import modal_loss
+from .modal_losses_scaled import modal_loss
 
 
 def to_device(batch, device):
@@ -21,7 +21,7 @@ def train_modal(args, cfg, model, train_loader, val_loader=None):
         if va["loss"] < best:
             best = va["loss"]
             torch.save({"model_state_dict": model.state_dict(), "optimizer_state_dict": opt.state_dict(), "epoch": epoch, "best_val": best, "config": cfg}, best_path)
-        print(f"Epoch {epoch:04d} | train={tr['loss']:.4g} val={va['loss']:.4g} freq={va['freq_mape_percent']:.3f}% MAC={va['phi_mac']:.4f}")
+        print(f"Epoch {epoch:04d} | train={tr['loss']:.4g} val={va['loss']:.4g} freq={va['freq_mape_percent']:.3f}% scale={va['phi_scale']:.4f} MAC={va['phi_mac']:.4f}")
     if os.path.exists(best_path):
         model.load_state_dict(torch.load(best_path, map_location=device)["model_state_dict"])
     return model
@@ -36,7 +36,7 @@ def run_epoch(model, loader, device, cfg, opt=None):
         if opt is not None:
             opt.zero_grad(set_to_none=True)
         out = model(batch["node_features"], batch["edge_index"], batch["edge_attr"], batch["batch"])
-        loss, metrics = modal_loss(out, batch, freq_weight=cfg.get("freq_weight", 1.0), phi_weight=cfg.get("phi_weight", 1.0), mac_weight=cfg.get("mac_weight", 5.0))
+        loss, metrics = modal_loss(out, batch, freq_weight=cfg.get("freq_weight", 1.0), phi_weight=cfg.get("phi_weight", 1.0), mac_weight=cfg.get("mac_weight", 5.0), scale_weight=cfg.get("scale_weight", 1.0))
         if opt is not None:
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), float(cfg.get("gradient_clip", 2.0)))
@@ -56,11 +56,11 @@ def evaluate_modal(args, cfg, model, loader, verbose=False):
     for batch in loader:
         batch = to_device(batch, device)
         out = model(batch["node_features"], batch["edge_index"], batch["edge_attr"], batch["batch"])
-        _, metrics = modal_loss(out, batch, freq_weight=cfg.get("freq_weight", 1.0), phi_weight=cfg.get("phi_weight", 1.0), mac_weight=cfg.get("mac_weight", 5.0))
+        _, metrics = modal_loss(out, batch, freq_weight=cfg.get("freq_weight", 1.0), phi_weight=cfg.get("phi_weight", 1.0), mac_weight=cfg.get("mac_weight", 5.0), scale_weight=cfg.get("scale_weight", 1.0))
         for k, v in metrics.items():
             sums[k] += float(v.detach().cpu())
         n += 1
     res = {k: v / max(n, 1) for k, v in sums.items()}
     if verbose:
-        print(f"Eval | loss={res['loss']:.4g} freq={res['freq_mape_percent']:.3f}% MAC={res['phi_mac']:.4f}")
+        print(f"Eval | loss={res['loss']:.4g} freq={res['freq_mape_percent']:.3f}% scale={res['phi_scale']:.4f} MAC={res['phi_mac']:.4f}")
     return res
