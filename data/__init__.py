@@ -1,8 +1,9 @@
-"""Data package exports for MeshGraphNet graph HDF5 datasets."""
+"""Data package exports for modal-only graph HDF5 datasets."""
 
-from .dataset import GraphHDF5Dataset, GeometricHDF5Dataset, collate_geometry_batch
+from .dataset import NODE_FEATURE_DIM, GraphHDF5Dataset, GeometricHDF5Dataset, collate_geometry_batch
 
 __all__ = [
+    "NODE_FEATURE_DIM",
     "GraphHDF5Dataset",
     "GeometricHDF5Dataset",
     "collate_geometry_batch",
