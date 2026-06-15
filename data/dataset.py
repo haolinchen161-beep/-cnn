@@ -10,7 +10,7 @@ from torch.utils.data import Dataset
 
 L_BASE, W_BASE, H_BASE = 0.160, 0.060, 0.010
 OMEGA_MAX_DEFAULT = 32000.0
-NODE_FEATURE_DIM = 25
+NODE_FEATURE_DIM = 26
 DEFAULT_FORCE_VECTOR = [0.0, 0.0, 1.0]
 
 
@@ -138,9 +138,11 @@ class GraphHDF5Dataset(Dataset):
             frequencies = (frequencies - self.freq_min) / (self.freq_max - self.freq_min) * 2.0 - 1.0
 
         coords_norm = normalize_points(points)
-        node_features = build_node_features(points, coords_norm, point_features, spring_k_xyz, spring_c_xyz,
-                                            node_type, pocket_bottom_mask, cut_region_mask,
-                                            out["excitation_index"], out["excitation_coord"])
+        node_features = build_node_features(
+            points, coords_norm, point_features, spring_k_xyz, spring_c_xyz,
+            node_type, pocket_bottom_mask, cut_region_mask, pocket_depth_ratio,
+            out["excitation_index"], out["excitation_coord"]
+        )
 
         result = {
             "points": points,
@@ -215,13 +217,15 @@ def normalize_log_positive(x: torch.Tensor, max_log: float = 8.0) -> torch.Tenso
 
 
 def build_node_features(points, coords_norm, point_features, spring_k_xyz, spring_c_xyz,
-                        node_type, pocket_bottom_mask, cut_region_mask, excitation_index, excitation_coord):
+                        node_type, pocket_bottom_mask, cut_region_mask, pocket_depth_ratio,
+                        excitation_index, excitation_coord):
     point_features = sanitize_features(point_features)
     spring_k_norm = normalize_log_positive(spring_k_xyz, max_log=8.0)
     spring_c_norm = normalize_log_positive(spring_c_xyz, max_log=4.0)
     node_type_onehot = F.one_hot(torch.clamp(node_type.long(), min=0, max=4), num_classes=5).float()
     bottom = pocket_bottom_mask.float().unsqueeze(-1)
     cut = cut_region_mask.float().unsqueeze(-1)
+    depth = pocket_depth_ratio.float().unsqueeze(-1)
 
     excitation_flag = torch.zeros(points.shape[0], 1, dtype=points.dtype, device=points.device)
     ei = int(excitation_index.item())
@@ -234,7 +238,7 @@ def build_node_features(points, coords_norm, point_features, spring_k_xyz, sprin
 
     node_features = torch.cat([
         coords_norm, point_features, spring_k_norm, spring_c_norm, node_type_onehot,
-        bottom, cut, excitation_flag, dist_to_exc,
+        bottom, cut, depth, excitation_flag, dist_to_exc,
     ], dim=-1).float()
     if node_features.shape[-1] != NODE_FEATURE_DIM:
         raise RuntimeError(f"NODE_FEATURE_DIM mismatch: got {node_features.shape[-1]}, expected {NODE_FEATURE_DIM}")
