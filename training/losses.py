@@ -1,270 +1,133 @@
-"""
-losses.py — MeshGraphNet modal parameter losses + dB/CDF FRF loss.
-
-Rebuilt to match the current CNN physics branch:
-- omega is physical rad/s, not normalized.
-- phi is full 3D [total_N,K,3].
-- mode-shape loss uses per-graph sign alignment, joint std normalization,
-  3D MAC, and XYZ direction norm consistency.
-- branch_loss supervises each mode's XYZ energy ratio and mildly reweights
-  mode-3 X/Y minority types.
-"""
 from __future__ import annotations
+
+from typing import Dict, Tuple
 
 import torch
 import torch.nn.functional as F
 
 
-def _mac_per_graph(phi_pred, phi_target):
-    """3D single-graph MAC: phi [N,K,3] -> [K]."""
-    num = torch.sum(phi_pred * phi_target, dim=(0, 2)) ** 2
-    den = torch.sum(phi_pred ** 2, dim=(0, 2)) * torch.sum(phi_target ** 2, dim=(0, 2)) + 1e-8
-    return num / den
+def modal_loss(outputs: Dict[str, torch.Tensor],
+               batch: Dict[str, torch.Tensor],
+               freq_weight: float = 1.0,
+               phi_weight: float = 1.0,
+               mac_weight: float = 20.0,
+               std_weight: float = 2.0,
+               direction_weight: float = 1.0) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+    omega_pred = outputs["omega"]
+    phi_pred = outputs["phi"]
+    omega_true = batch["modal_omega_phys"]
+    phi_true = batch["modal_phi"]
+    batch_idx = batch["batch"]
+
+    loss_f, fm = frequency_loss(omega_pred, omega_true)
+    phi_ref, orient = orient_target_per_graph(phi_pred, phi_true, batch_idx)
+    loss_p, pm = mode_loss(phi_pred, phi_ref, batch_idx, batch.get("node_weight"),
+                           mac_weight, std_weight, direction_weight)
+
+    total = freq_weight * loss_f + phi_weight * loss_p
+    metrics = {**fm, **pm}
+    metrics.update({
+        "loss": total.detach(),
+        "loss_freq": loss_f.detach(),
+        "loss_phi": loss_p.detach(),
+        "orient_mean": orient.float().mean().detach(),
+    })
+    return total, metrics
 
 
-def _ensure_phi3d(phi):
-    if phi.dim() == 4:  # [B,N,K,3]
-        return phi.reshape(-1, phi.shape[-2], phi.shape[-1])
-    if phi.dim() == 3:
-        return phi
-    if phi.dim() == 2:  # legacy Z-only [N,K]
-        out = phi.new_zeros(phi.shape[0], phi.shape[1], 3)
-        out[..., 2] = phi
-        return out
-    raise ValueError(f"Unsupported phi shape: {tuple(phi.shape)}")
+def frequency_loss(omega_pred: torch.Tensor, omega_true: torch.Tensor):
+    f_pred = omega_pred / (2.0 * torch.pi)
+    f_true = omega_true / (2.0 * torch.pi)
+    rel = (f_pred - f_true) / f_true.clamp_min(1e-6)
+
+    l_log = F.smooth_l1_loss(torch.log(f_pred.clamp_min(1e-6)), torch.log(f_true.clamp_min(1e-6)))
+    l_rel = F.smooth_l1_loss(rel * 100.0, torch.zeros_like(rel))
+    l_gap = F.smooth_l1_loss(f_pred[:, 1:] - f_pred[:, :-1], f_true[:, 1:] - f_true[:, :-1])
+    loss = 5.0 * l_log + 0.1 * l_rel + 0.001 * l_gap
+
+    return loss, {
+        "freq_mape_percent": (torch.abs(rel).mean() * 100.0).detach(),
+        "freq_mae_hz": torch.abs(f_pred - f_true).mean().detach(),
+        "loss_freq_log": l_log.detach(),
+        "loss_freq_rel": l_rel.detach(),
+        "loss_gap": l_gap.detach(),
+    }
 
 
-def modal_loss(omega_phys_pred, omega_phys_target,
-               log_zeta_pred, zeta_target,
-               phi_pred, phi_target, batch_idx=None,
-               omega_weight=1.0, zeta_weight=10.0, phi_weight=3.0):
-    """CNN-compatible physical modal loss for the MeshGraphNet branch.
+def orient_target_per_graph(phi_pred: torch.Tensor, phi_true: torch.Tensor, batch_idx: torch.Tensor):
+    out = torch.empty_like(phi_true)
+    orient_list = []
+    n_graphs = int(batch_idx.max().item()) + 1 if batch_idx.numel() else 0
+    for gid in range(n_graphs):
+        m = batch_idx == gid
+        dot = torch.sum(phi_pred[m] * phi_true[m], dim=(0, 2))
+        orient = torch.where(dot >= 0, torch.ones_like(dot), -torch.ones_like(dot))
+        out[m] = phi_true[m] * orient.view(1, -1, 1)
+        orient_list.append(orient)
+    return out, torch.stack(orient_list, dim=0) if orient_list else phi_true.new_zeros(0)
 
-    Args:
-        omega_phys_pred:   [B,K] rad/s
-        omega_phys_target: [B,K] rad/s
-        log_zeta_pred:     [B,K]
-        zeta_target:       [B,K]
-        phi_pred:          [total_N,K,3]
-        phi_target:        [total_N,K,3]
-        batch_idx:         [total_N]
-    """
-    # ====================================================
-    # 1. Frequency loss in Hz space.
-    # ====================================================
-    f_pred_hz = omega_phys_pred / (2.0 * torch.pi)
-    f_true_hz = omega_phys_target / (2.0 * torch.pi)
 
-    mode_w = f_pred_hz.new_tensor([1.0, 1.5, 2.2]).view(1, 3)
-
-    abs_err = F.smooth_l1_loss(f_pred_hz, f_true_hz, reduction='none')
-    loss_freq_abs = torch.mean(abs_err * mode_w)
-
-    rel_err = (f_pred_hz - f_true_hz) / (f_true_hz + 1e-8)
-    rel_loss = F.smooth_l1_loss(rel_err * 100.0, torch.zeros_like(rel_err), reduction='none')
-    loss_freq_rel = torch.mean(rel_loss * mode_w)
-
-    if f_pred_hz.shape[-1] >= 3:
-        gap_pred = f_pred_hz[:, 1:] - f_pred_hz[:, :-1]
-        gap_true = f_true_hz[:, 1:] - f_true_hz[:, :-1]
-        gap_err = F.smooth_l1_loss(gap_pred, gap_true, reduction='none')
-        gap_w = f_pred_hz.new_tensor([1.2, 1.8]).view(1, 2)
-        loss_gap = torch.mean(gap_err * gap_w)
+def mode_loss(phi_pred: torch.Tensor,
+              phi_target: torch.Tensor,
+              batch_idx: torch.Tensor,
+              node_weight: torch.Tensor | None,
+              mac_weight: float,
+              std_weight: float,
+              direction_weight: float):
+    if node_weight is None:
+        node_weight = torch.ones(phi_pred.shape[0], dtype=phi_pred.dtype, device=phi_pred.device)
     else:
-        loss_gap = f_pred_hz.new_tensor(0.0)
+        node_weight = node_weight.to(device=phi_pred.device, dtype=phi_pred.dtype)
 
-    rel_abs = torch.abs(rel_err)
-    peak_sensitive = torch.clamp(rel_abs / (zeta_target + 1e-8), max=100.0)
+    mse_terms, mac_terms, std_terms, dir_terms = [], [], [], []
+    n_graphs = int(batch_idx.max().item()) + 1 if batch_idx.numel() else 0
+    for gid in range(n_graphs):
+        m = batch_idx == gid
+        p = phi_pred[m]
+        t = phi_target[m]
+        w = node_weight[m].view(-1, 1, 1)
+        w = w / w.mean().clamp_min(1e-8)
 
-    loss_omega = (
-        0.5 * loss_freq_abs + 10.0 * loss_freq_rel + 0.5 * loss_gap + 0.05 * peak_sensitive.mean()
-    ) * omega_weight
+        p_std = torch.std(p.transpose(0, 1).reshape(p.shape[1], -1), dim=1).clamp_min(1e-8)
+        t_std = torch.std(t.transpose(0, 1).reshape(t.shape[1], -1), dim=1).clamp_min(1e-8)
 
-    # ====================================================
-    # 2. Damping loss in log domain.
-    # ====================================================
-    log_zeta_target = torch.log(zeta_target + 1e-8)
-    loss_zeta = F.smooth_l1_loss(log_zeta_pred, log_zeta_target) * zeta_weight
+        mse_terms.append(torch.mean(w * ((p / p_std.view(1, -1, 1)) - (t / t_std.view(1, -1, 1))) ** 2))
+        mac_terms.append(mac_per_mode(p, t))
+        std_terms.append(torch.mean(torch.abs(torch.log(p_std / t_std))))
 
-    # ====================================================
-    # 3. Full 3D mode-shape loss.
-    # ====================================================
-    phi_pred = _ensure_phi3d(phi_pred)
-    phi_target = _ensure_phi3d(phi_target)
+        p_dir = torch.sqrt(torch.sum(p ** 2, dim=0) + 1e-8)
+        t_dir = torch.sqrt(torch.sum(t ** 2, dim=0) + 1e-8)
+        dir_terms.append(torch.mean(torch.abs(torch.log((p_dir + 1e-8) / (t_dir + 1e-8)))))
 
-    if batch_idx is not None:
-        aligned_target = torch.empty_like(phi_target)
-        n_graphs_sign = int(batch_idx.max().item()) + 1
-        for b in range(n_graphs_sign):
-            m = batch_idx == b
-            dot_b = torch.sum(phi_pred[m] * phi_target[m], dim=(0, 2), keepdim=True)
-            aligned_target[m] = phi_target[m] * torch.sign(dot_b + 1e-8)
-    else:
-        dot = torch.sum(phi_pred * phi_target, dim=(0, 2), keepdim=True)
-        aligned_target = phi_target * torch.sign(dot + 1e-8)
+    mse = torch.stack(mse_terms).mean()
+    mac_values = torch.stack(mac_terms, dim=0)
+    mac_loss = (1.0 - mac_values).mean()
+    std_loss = torch.stack(std_terms).mean()
+    dir_loss = torch.stack(dir_terms).mean()
+    total = mse + mac_weight * mac_loss + std_weight * std_loss + direction_weight * dir_loss
 
-    if batch_idx is not None:
-        n_graphs = int(batch_idx.max().item()) + 1
-        p_std_list, t_std_list, direc_weight_list = [], [], []
-        for i in range(n_graphs):
-            mask = (batch_idx == i)
-            p_i = phi_pred[mask]
-            t_i = aligned_target[mask]
-
-            p_std_i = torch.std(p_i.transpose(0, 1).reshape(p_i.shape[1], -1), dim=1) + 1e-8
-            t_std_i = torch.std(t_i.transpose(0, 1).reshape(t_i.shape[1], -1), dim=1) + 1e-8
-            p_std_list.append(p_std_i)
-            t_std_list.append(t_std_i)
-
-            energy_i = torch.sum(t_i ** 2, dim=0)  # [K,3]
-            w_i = (energy_i / (energy_i.sum(dim=-1, keepdim=True) + 1e-8)) * 3.0
-            direc_weight_list.append(w_i.unsqueeze(0).expand(mask.sum(), -1, -1))
-
-        p_std = torch.stack(p_std_list, dim=0)
-        t_std = torch.stack(t_std_list, dim=0)
-        p_std_view = p_std[batch_idx].unsqueeze(-1)
-        t_std_view = t_std[batch_idx].unsqueeze(-1)
-        direc_weight = torch.cat(direc_weight_list, dim=0)
-    else:
-        p_std = torch.std(phi_pred.transpose(0, 1).reshape(phi_pred.shape[1], -1), dim=1) + 1e-8
-        t_std = torch.std(aligned_target.transpose(0, 1).reshape(aligned_target.shape[1], -1), dim=1) + 1e-8
-        p_std_view = p_std.view(1, -1, 1)
-        t_std_view = t_std.view(1, -1, 1)
-        energy = torch.sum(aligned_target ** 2, dim=0)
-        direc_weight = (energy / (energy.sum(dim=-1, keepdim=True) + 1e-8)) * 3.0
-
-    phi_pred_norm = phi_pred / p_std_view
-    phi_target_norm = aligned_target / t_std_view
-
-    mse_elements = F.mse_loss(phi_pred_norm, phi_target_norm, reduction='none')
-    if batch_idx is not None:
-        raw_phi_mse = torch.mean(mse_elements * direc_weight)
-    else:
-        raw_phi_mse = torch.mean(mse_elements * direc_weight.unsqueeze(0))
-
-    if batch_idx is not None:
-        n_graphs = int(batch_idx.max().item()) + 1
-        mac_loss_total = 0.0
-        mac_list = []
-        for i in range(n_graphs):
-            mask = (batch_idx == i)
-            mac = _mac_per_graph(phi_pred[mask], aligned_target[mask])
-            mac_loss_total += (1.0 - mac).mean()
-            mac_list.append(mac)
-        loss_mac = mac_loss_total / n_graphs
-        mac_per_mode = torch.stack(mac_list, dim=0).mean(dim=0)
-    else:
-        mac = _mac_per_graph(phi_pred, aligned_target)
-        loss_mac = (1.0 - mac).mean()
-        mac_per_mode = mac
-
-    loss_std = F.smooth_l1_loss(p_std, t_std)
-    loss_dir_norm = per_graph_direction_norm_loss(phi_pred, aligned_target, batch_idx)
-
-    loss_phi = (10.0 * raw_phi_mse + 40.0 * loss_mac + 20.0 * loss_std + 10.0 * loss_dir_norm) * phi_weight
-
-    return loss_omega + loss_zeta + loss_phi, loss_omega, loss_zeta, loss_phi, mac_per_mode.detach()
+    return total, {
+        "phi_nrmse": torch.sqrt(mse.detach().clamp_min(0.0)),
+        "phi_mac": mac_values.mean().detach(),
+        "phi_mac_mode1": mac_values[:, 0].mean().detach(),
+        "phi_mac_mode2": mac_values[:, 1].mean().detach(),
+        "phi_mac_mode3": mac_values[:, 2].mean().detach(),
+        "loss_phi_nrmse": mse.detach(),
+        "loss_phi_mac": mac_loss.detach(),
+        "loss_phi_std": std_loss.detach(),
+        "loss_phi_dir": dir_loss.detach(),
+    }
 
 
-def frf_loss(frf_pred, frf_target):
-    """dB + normalized-amplitude CDF loss used by the current CNN branch."""
-    if frf_pred.shape != frf_target.shape:
-        frf_target = frf_target.reshape(frf_pred.shape)
-
-    amp_pred = torch.norm(frf_pred, dim=-1) + 1e-12
-    amp_target = torch.norm(frf_target, dim=-1) + 1e-12
-
-    loss_db = F.mse_loss(20 * torch.log10(amp_pred), 20 * torch.log10(amp_target))
-
-    amp_pred_norm = amp_pred / amp_pred.sum(dim=-1, keepdim=True).clamp_min(1e-12)
-    amp_target_norm = amp_target / amp_target.sum(dim=-1, keepdim=True).clamp_min(1e-12)
-    cdf_pred = torch.cumsum(amp_pred_norm, dim=-1)
-    cdf_target = torch.cumsum(amp_target_norm, dim=-1)
-    loss_cdf = F.l1_loss(cdf_pred, cdf_target)
-
-    return loss_db + 10.0 * loss_cdf
+def mac_per_mode(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+    num = torch.sum(a * b, dim=(0, 2)) ** 2
+    den = torch.sum(a ** 2, dim=(0, 2)) * torch.sum(b ** 2, dim=(0, 2))
+    return num / den.clamp_min(1e-12)
 
 
-def per_graph_direction_norm_loss(phi_pred, phi_target, batch_idx, mode_weights=None):
-    """Per-graph XYZ norm consistency loss."""
-    phi_pred = _ensure_phi3d(phi_pred)
-    phi_target = _ensure_phi3d(phi_target)
-
-    if batch_idx is not None:
-        n_graphs = int(batch_idx.max().item()) + 1
-        losses = []
-        for b in range(n_graphs):
-            m = batch_idx == b
-            p = phi_pred[m]
-            t = phi_target[m]
-            p_norm = torch.sqrt(torch.sum(p ** 2, dim=0) + 1e-8)
-            t_norm = torch.sqrt(torch.sum(t ** 2, dim=0) + 1e-8)
-            losses.append(torch.abs(torch.log((p_norm + 1e-8) / (t_norm + 1e-8))))
-        loss = torch.stack(losses, dim=0)
-    else:
-        p_norm = torch.sqrt(torch.sum(phi_pred ** 2, dim=0) + 1e-8)
-        t_norm = torch.sqrt(torch.sum(phi_target ** 2, dim=0) + 1e-8)
-        loss = torch.abs(torch.log((p_norm + 1e-8) / (t_norm + 1e-8))).unsqueeze(0)
-
-    if mode_weights is None:
-        mode_weights = loss.new_tensor([0.5, 2.0, 4.0])
-
-    return torch.mean(loss * mode_weights.view(1, -1, 1))
-
-
-def branch_loss(branch_log_probs, phi_target, batch_idx, mode_weights=None):
-    """KL supervision for mode-wise XYZ energy ratio.
-
-    It mildly reweights minority mode-3 X/Y types according to the diagnostics
-    observed on the CNN baseline.
-    """
-    phi_target = _ensure_phi3d(phi_target)
-    n_graphs = int(batch_idx.max().item()) + 1
-    kl_per_list = []
-    class_weight_list = []
-
-    for i in range(n_graphs):
-        mask = batch_idx == i
-        phi_i = phi_target[mask]
-        energy = torch.sum(phi_i ** 2, dim=0)
-        target_probs = energy / (energy.sum(dim=-1, keepdim=True) + 1e-8)
-
-        kl_per = F.kl_div(
-            branch_log_probs[i:i + 1],
-            target_probs.unsqueeze(0),
-            reduction='none'
-        ).sum(dim=-1)  # [1,K]
-
-        sample_w = torch.ones_like(kl_per)
-
-        if target_probs.shape[0] >= 2:
-            mode2_dir = torch.argmax(target_probs[1]).item()
-            if mode2_dir != 2:
-                sample_w[:, 1] = 2.0
-
-        if target_probs.shape[0] >= 3:
-            mode3_dir = torch.argmax(target_probs[2]).item()
-            if mode3_dir == 0:
-                sample_w[:, 2] = 3.0
-            elif mode3_dir == 1:
-                sample_w[:, 2] = 3.5
-            else:
-                sample_w[:, 2] = 1.0
-
-        kl_per_list.append(kl_per)
-        class_weight_list.append(sample_w)
-
-    kl_all = torch.cat(kl_per_list, dim=0)
-    class_w = torch.cat(class_weight_list, dim=0)
-
-    if mode_weights is None:
-        mode_weights = kl_all.new_tensor([0.5, 2.0, 4.0])
-
-    return (kl_all * class_w * mode_weights.view(1, -1)).mean()
-
-
-def zeta_physics_loss(*args, **kwargs):
-    """Reserved compatibility hook."""
-    if len(args) > 0 and torch.is_tensor(args[0]):
-        return args[0].new_tensor(0.0)
-    return torch.tensor(0.0)
+@torch.no_grad()
+def evaluate_modal_metrics(outputs: Dict[str, torch.Tensor], batch: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+    _, fm = frequency_loss(outputs["omega"], batch["modal_omega_phys"])
+    phi_ref, _ = orient_target_per_graph(outputs["phi"], batch["modal_phi"], batch["batch"])
+    _, pm = mode_loss(outputs["phi"], phi_ref, batch["batch"], batch.get("node_weight"), 20.0, 2.0, 1.0)
+    return {**fm, **pm}
