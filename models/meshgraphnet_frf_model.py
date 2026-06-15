@@ -1,12 +1,10 @@
 """
 meshgraphnet_frf_model.py — FEM-aware MeshGraphNet modal surrogate.
 
-This branch is intentionally rebuilt from the current CNN physics pipeline:
-    mesh graph → omega / zeta / 3D phi → PhysicsDecoder → FRF
-
-The old Z-only GNN implementation is replaced.  The model now predicts full
-node-level 3D mode shapes [N, K, 3] and keeps the same modal bottleneck used by
-the CNN baseline.
+Mesh graph -> omega / zeta / full 3D phi -> PhysicsDecoder -> FRF.
+The model predicts full node-level 3D mode shapes [N, K, 3] and uses the same
+modal bottleneck as the CNN baseline, but with FEM graph connectivity and graph
+node features instead of image features.
 """
 from __future__ import annotations
 
@@ -19,7 +17,7 @@ import torch.nn.functional as F
 from .physics_decoder import PhysicsDecoder
 
 
-DEFAULT_NODE_FEATURE_DIM = 25
+DEFAULT_NODE_FEATURE_DIM = 26
 DEFAULT_EDGE_FEATURE_DIM = 4
 
 
@@ -50,14 +48,7 @@ class MLP(nn.Module):
 
 
 class MeshGraphBlock(nn.Module):
-    """MeshGraphNet-style residual message passing block.
-
-    Edge update:
-        e_ij <- e_ij + MLP(e_ij, h_i, h_j)
-
-    Node update:
-        h_j <- h_j + MLP(h_j, mean_i e_ij)
-    """
+    """MeshGraphNet-style residual message passing block."""
 
     def __init__(self, hidden_dim: int, dropout: float = 0.0):
         super().__init__()
@@ -88,10 +79,11 @@ class MeshGraphBlock(nn.Module):
 
 
 class PhysicsPriorOmegaHead(nn.Module):
-    """Frequency head copied from the current CNN idea: physics prior + graph residual.
+    """Physics-prior frequency head.
 
-    It predicts f1, gap21, gap32 and then reconstructs monotonically increasing
-    natural frequencies.  Output is physical rad/s.
+    Predicts f1, gap21, gap32 and reconstructs monotonically increasing natural
+    frequencies.  Output unit is rad/s.  The generated dataset filters f3-f2 >
+    200 Hz, so the model prior uses the same lower bound for gap32.
     """
 
     def __init__(self, hidden: int = 128, n_modes: int = 3, phys_dim: int = 14):
@@ -113,7 +105,7 @@ class PhysicsPriorOmegaHead(nn.Module):
 
         self.f1_min, self.f1_max = 700.0, 1250.0
         self.g21_min, self.g21_max = 700.0, 2600.0
-        self.g32_min, self.g32_max = 150.0, 1000.0
+        self.g32_min, self.g32_max = 200.0, 1000.0
 
         self.f1_span = self.f1_max - self.f1_min
         self.g21_span = self.g21_max - self.g21_min
@@ -123,7 +115,6 @@ class PhysicsPriorOmegaHead(nn.Module):
             p = torch.tensor(p).clamp(1e-4, 1 - 1e-4)
             return torch.log(p / (1.0 - p))
 
-        # Same initialization used by the current CNN branch.
         b1 = inv_sigmoid((949.7 - self.f1_min) / self.f1_span)
         b2 = inv_sigmoid((1390.8 - self.g21_min) / self.g21_span)
         b3 = inv_sigmoid((522.1 - self.g32_min) / self.g32_span)
@@ -186,7 +177,7 @@ class ZetaHead(nn.Module):
 
 
 class DirectionBranchHead(nn.Module):
-    """Predict each mode's XYZ energy ratio. Used for KL supervision and phi conditioning."""
+    """Predict each mode's XYZ squared-amplitude ratio."""
 
     def __init__(self, hidden: int = 128, n_modes: int = 3):
         super().__init__()
@@ -230,7 +221,6 @@ class ModeTokenPhiDecoder(nn.Module):
         super().__init__()
         self.n_modes = n_modes
         self.mode_tokens = nn.Parameter(torch.randn(n_modes, hidden) * 0.02)
-        # node h, graph g, mode token, branch prob for this mode
         in_dim = hidden * 3 + 3
         self.mlp = nn.Sequential(
             nn.Linear(in_dim, hidden), nn.LayerNorm(hidden), nn.GELU(), nn.Dropout(dropout),
@@ -247,7 +237,7 @@ class ModeTokenPhiDecoder(nn.Module):
         node_expand = node_latent.unsqueeze(1).expand(n, k, -1)
         graph_expand = g_node.unsqueeze(1).expand(n, k, -1)
         mode_expand = self.mode_tokens.unsqueeze(0).expand(n, k, -1)
-        branch_expand = branch_probs[batch]  # [N,K,3]
+        branch_expand = branch_probs[batch]
 
         x = torch.cat([node_expand, graph_expand, mode_expand, branch_expand], dim=-1)
         return self.mlp(x.reshape(n * k, -1)).view(n, k, 3)
@@ -384,14 +374,19 @@ def _safe_stats(x: torch.Tensor):
 
 
 def build_graph_physics_features(node_features: torch.Tensor, batch: torch.Tensor):
-    """Build graph-level physics descriptors from the 25D node features.
+    """Build graph-level physics descriptors from the 26D node features.
 
     Layout from data.dataset:
-        0:3 normalized xyz
-        3:10 point_features = [E_ratio, PRXY, rho_ratio, is_fixed, logK, logC, Z/H]
+        0:3   normalized xyz
+        3:10  point_features = [E_ratio, PRXY, rho_ratio, is_fixed, logK, logC, local_thickness]
         10:13 normalized spring_k_xyz
         13:16 normalized spring_c_xyz
         16:21 node_type one-hot: ordinary/bottom/cut/side/corner
+        21    pocket_bottom_mask
+        22    cut_region_mask
+        23    pocket_depth_ratio
+        24    excitation_flag
+        25    normalized distance to excitation point
     """
     n_graphs = int(batch.max().item()) + 1 if batch.numel() > 0 else 0
     omega_feats, zeta_feats = [], []
@@ -409,7 +404,7 @@ def build_graph_physics_features(node_features: torch.Tensor, batch: torch.Tenso
 
         E_ratio = nf[:, 3].mean()
         rho_ratio = nf[:, 5].mean()
-        z_h = nf[:, 9]
+        thickness = nf[:, 9]
         is_fixed = nf[:, 6]
         logK = nf[:, 7]
         logC = nf[:, 8]
@@ -427,15 +422,15 @@ def build_graph_physics_features(node_features: torch.Tensor, batch: torch.Tenso
         k_mean, k_std, k_min, k_max = _safe_stats(logK[spring_mask])
         c_mean, _, _, _ = _safe_stats(logC[spring_mask])
 
-        z_mean = z_h.mean()
-        z_std = z_h.std(unbiased=False)
-        z_min = z_h.min()
-        z_max = z_h.max()
-        f_theory = z_mean * torch.sqrt(torch.clamp(E_ratio / (rho_ratio + 1e-6), min=1e-6))
+        th_mean = thickness.mean()
+        th_std = thickness.std(unbiased=False)
+        th_min = thickness.min()
+        th_max = thickness.max()
+        f_theory = th_mean * torch.sqrt(torch.clamp(E_ratio / (rho_ratio + 1e-6), min=1e-6))
 
         omega_feats.append(torch.stack([
             E_ratio, rho_ratio,
-            z_mean, z_std, z_min, z_max,
+            th_mean, th_std, th_min, th_max,
             fixed_ratio, corner_ratio, side_ratio,
             k_mean, k_std, k_min, k_max,
             f_theory,
