@@ -4,7 +4,7 @@ Use the lightweight branch with the existing generated HDF5 files:
 
 ```bash
 git checkout mesh-modal-lite-clean
-python -u sample/run_validation.py
+python -u modal_run.py
 ```
 
 Current objective:
