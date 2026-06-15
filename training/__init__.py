@@ -1,21 +1,4 @@
-"""Training package exports for the FEM-aware MeshGraphNet branch."""
+from .modal_losses import modal_loss
+from .modal_trainer import evaluate_modal, train_modal
 
-from .trainer import train, evaluate, save_model
-from .losses import (
-    modal_loss,
-    frf_loss,
-    branch_loss,
-    per_graph_direction_norm_loss,
-    zeta_physics_loss,
-)
-
-__all__ = [
-    "train",
-    "evaluate",
-    "save_model",
-    "modal_loss",
-    "frf_loss",
-    "branch_loss",
-    "per_graph_direction_norm_loss",
-    "zeta_physics_loss",
-]
+__all__ = ["modal_loss", "train_modal", "evaluate_modal"]
