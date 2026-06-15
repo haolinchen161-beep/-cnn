@@ -1,7 +1,7 @@
 """
 trainer.py — FEM-aware MeshGraphNet training loop.
 
-Rebuilt from the current CNN physics schedule, but adapted to graph batches:
+Graph batch:
     node_features + edge_index + edge_attr + batch
         -> MeshGraphFRFModel
         -> omega(rad/s), zeta, phi[N,K,3]
@@ -9,10 +9,13 @@ Rebuilt from the current CNN physics schedule, but adapted to graph batches:
 
 Main phases:
     Phase0a: first omega_prior_only_epochs, train only omega prior MLP.
-    Phase0b: until omega_pretrain_epochs, train frequency only.
+    Phase0b: until omega_pretrain_epochs, frequency only.
     Phase1: modal joint training.
-    Phase2a: freeze phi/graph representation, tune omega/zeta with weak FRF.
-    Phase2b: weak FRF joint fine-tuning.
+    Phase2a: freeze phi/graph representation, tune omega/zeta with weak FRF using true phi_exc.
+    Phase2b: weak end-to-end FRF fine-tuning using predicted phi_exc at excitation_index.
+
+The validation FRF metric is self-phi-exc by default.  Teacher-phi-exc metrics are
+also reported for diagnosis but are not used as the primary score.
 """
 from __future__ import annotations
 
@@ -141,7 +144,9 @@ def train(args, config, model_cfg, net, dataloader, optimizer,
             "phiA1%", "phiA2%", "phiA3%",
             "MAC1", "MAC2", "MAC3",
             "w_share%", "z_share%", "phi_share%", "FRF_share%",
-            "val_MSE", "amp_MAE", "amp_MAPE%", "kl", "dir2%", "dir3%", "lr",
+            "val_self_MSE", "self_amp_MAE", "self_amp_MAPE%",
+            "val_teacher_MSE", "teacher_amp_MAE", "teacher_amp_MAPE%",
+            "kl", "dir2%", "dir3%", "lr",
         ] + val_header)
 
     phase2_unlocked = start_epoch >= phase2_min_epoch
@@ -152,7 +157,6 @@ def train(args, config, model_cfg, net, dataloader, optimizer,
             losses = []
             weighted_w_losses, weighted_z_losses, weighted_p_losses, weighted_frf_losses = [], [], [], []
             kl_losses = []
-
             train_w, train_z, train_mac, train_phi_n, train_phi_a, train_dir = [], [], [], [], [], []
 
             in_phase1 = not phase2_unlocked
@@ -190,7 +194,7 @@ def train(args, config, model_cfg, net, dataloader, optimizer,
 
             if in_phase2a:
                 if not getattr(net, "_phase2a_logged", False):
-                    _log("=== Phase2a: freeze phi-related modules; tune omega/zeta with FRF ===", logger)
+                    _log("=== Phase2a: freeze phi-related modules; tune omega/zeta with teacher phi_exc FRF ===", logger)
                     net._phase2a_logged = True
                 _set_phase2a_omega_tune(net)
                 phase2a_lr = float(config.get("phase2a_lr", 1e-4))
@@ -198,7 +202,7 @@ def train(args, config, model_cfg, net, dataloader, optimizer,
                     pg["lr"] = min(pg["lr"], phase2a_lr)
 
             if in_phase2 and (not in_phase2a) and not getattr(net, "_phase2b_logged", False):
-                _log("=== Phase2b: unfreeze all modules; weak FRF joint tuning ===", logger)
+                _log("=== Phase2b: unfreeze all; weak FRF uses predicted phi_exc at excitation_index ===", logger)
                 _set_all_trainable(net)
                 net._phase2b_logged = True
 
@@ -226,10 +230,13 @@ def train(args, config, model_cfg, net, dataloader, optimizer,
                         frequencies = _require_tensor_frequencies(batch)
                         teacher_epochs = int(config.get("frf_teacher_epochs", 0))
                         omega_true = batch["modal_omega_phys"] if phase2_epoch < teacher_epochs else None
+                        # Phase2a uses true excitation modal values to stabilize omega/zeta tuning.
+                        # Phase2b switches to predicted excitation phi for true end-to-end FRF training.
+                        frf_phi_exc = batch.get("modal_phi_exc") if in_phase2a else None
                         frf_pred, omega_pred, log_zeta_pred, zeta_pred, phi_pred = _forward_modal(
                             net, batch,
                             frequencies=frequencies,
-                            phi_exc=batch.get("modal_phi_exc"),
+                            phi_exc=frf_phi_exc,
                             omega_true=omega_true if not in_phase2a else None,
                             detach_modal_for_frf=not in_phase2a,
                             alpha=1.0,
@@ -324,7 +331,8 @@ def train(args, config, model_cfg, net, dataloader, optimizer,
                     f"z=[{val_results['val_z'][0]:.1f}/{val_results['val_z'][1]:.1f}/{val_results['val_z'][2]:.1f}]% "
                     f"MAC=[{val_results['val_mac'][0]:.3f}/{val_results['val_mac'][1]:.3f}/{val_results['val_mac'][2]:.3f}] "
                     f"phiN=[{val_results['val_phi_n'][0]:.1f}/{val_results['val_phi_n'][1]:.1f}/{val_results['val_phi_n'][2]:.1f}]% "
-                    f"dir2={val_results['val_dir'][1]:.0f}% dir3={val_results['val_dir'][2]:.0f}%",
+                    f"dir2={val_results['val_dir'][1]:.0f}% dir3={val_results['val_dir'][2]:.0f}% | "
+                    f"FRF_self={val_results.get('loss (MSE)', np.inf):.4g} teacher={val_results.get('Teacher loss (MSE)', np.inf):.4g}",
                     logger,
                 )
 
@@ -361,8 +369,10 @@ def train(args, config, model_cfg, net, dataloader, optimizer,
                 f"{_safe_share(wgt_w, mean_loss):.2f}", f"{_safe_share(wgt_z, mean_loss):.2f}",
                 f"{_safe_share(wgt_p, mean_loss):.2f}", f"{_safe_share(wgt_frf, mean_loss):.2f}",
                 f"{val_results.get('loss (MSE)', '')}", f"{val_results.get('Amplitude MAE', '')}",
-                f"{val_results.get('Amplitude MAPE (%)', '')}", f"{mean_kl:.6e}",
-                f"{tr_dir[1]:.2f}", f"{tr_dir[2]:.2f}", f"{lr:.6e}",
+                f"{val_results.get('Amplitude MAPE (%)', '')}",
+                f"{val_results.get('Teacher loss (MSE)', '')}", f"{val_results.get('Teacher Amplitude MAE', '')}",
+                f"{val_results.get('Teacher Amplitude MAPE (%)', '')}",
+                f"{mean_kl:.6e}", f"{tr_dir[1]:.2f}", f"{tr_dir[2]:.2f}", f"{lr:.6e}",
             ] + _format_val_results(val_results))
             log_file.flush()
     finally:
@@ -376,24 +386,38 @@ def evaluate(args, config, net, dataloader, logger=None, epoch=None, verbose=Tru
     net.eval()
     modal_metrics = []
     frf_mse, amp_mae, amp_mape = [], [], []
+    teacher_frf_mse, teacher_amp_mae, teacher_amp_mape = [], [], []
 
     with torch.no_grad():
         for raw_batch in dataloader:
             batch = _move_graph_batch(raw_batch, args.device)
 
             if torch.is_tensor(batch.get("frequencies")) and "point_frf" in batch:
+                # Primary validation: self excitation, i.e. use predicted phi at excitation_index.
                 frf_pred, omega_pred, log_zeta_pred, zeta_pred, phi_pred = _forward_modal(
                     net, batch,
                     frequencies=batch["frequencies"],
-                    phi_exc=batch.get("modal_phi_exc"),
+                    phi_exc=None,
                     detach_modal_for_frf=True,
                 )
                 target = batch["point_frf"]
-                frf_mse.append(float(torch.mean((frf_pred - target) ** 2).cpu()))
-                amp_p = torch.norm(frf_pred, dim=-1)
-                amp_t = torch.norm(target, dim=-1)
-                amp_mae.append(float(torch.mean(torch.abs(amp_p - amp_t)).cpu()))
-                amp_mape.append(float(torch.mean(torch.abs(amp_p - amp_t) / (amp_t.abs() + 1e-8)).cpu() * 100.0))
+                mse, mae, mape = _compute_frf_metrics(frf_pred, target)
+                frf_mse.append(mse)
+                amp_mae.append(mae)
+                amp_mape.append(mape)
+
+                # Diagnostic only: teacher phi_exc shows how much error comes from excitation-point phi.
+                if "modal_phi_exc" in batch:
+                    frf_teacher, _, _, _, _ = _forward_modal(
+                        net, batch,
+                        frequencies=batch["frequencies"],
+                        phi_exc=batch.get("modal_phi_exc"),
+                        detach_modal_for_frf=True,
+                    )
+                    tmse, tmae, tmape = _compute_frf_metrics(frf_teacher, target)
+                    teacher_frf_mse.append(tmse)
+                    teacher_amp_mae.append(tmae)
+                    teacher_amp_mape.append(tmape)
             else:
                 _, omega_pred, log_zeta_pred, zeta_pred, phi_pred = _forward_modal(net, batch)
 
@@ -419,6 +443,9 @@ def evaluate(args, config, net, dataloader, logger=None, epoch=None, verbose=Tru
         "loss (MSE)": float(np.mean(frf_mse)) if frf_mse else np.inf,
         "Amplitude MAE": float(np.mean(amp_mae)) if amp_mae else 0.0,
         "Amplitude MAPE (%)": float(np.mean(amp_mape)) if amp_mape else 0.0,
+        "Teacher loss (MSE)": float(np.mean(teacher_frf_mse)) if teacher_frf_mse else np.inf,
+        "Teacher Amplitude MAE": float(np.mean(teacher_amp_mae)) if teacher_amp_mae else 0.0,
+        "Teacher Amplitude MAPE (%)": float(np.mean(teacher_amp_mape)) if teacher_amp_mape else 0.0,
         "val_w": val_w,
         "val_z": val_z,
         "val_mac": val_mac,
@@ -427,6 +454,15 @@ def evaluate(args, config, net, dataloader, logger=None, epoch=None, verbose=Tru
         "val_dir": val_dir,
         "val_modal_score": val_modal_score,
     }
+
+
+def _compute_frf_metrics(frf_pred: torch.Tensor, target: torch.Tensor):
+    mse = float(torch.mean((frf_pred - target) ** 2).cpu())
+    amp_p = torch.norm(frf_pred, dim=-1)
+    amp_t = torch.norm(target, dim=-1)
+    mae = float(torch.mean(torch.abs(amp_p - amp_t)).cpu())
+    mape = float(torch.mean(torch.abs(amp_p - amp_t) / (amp_t.abs() + 1e-8)).cpu() * 100.0)
+    return mse, mae, mape
 
 
 def _compute_modal_metrics(omega_pred, omega_true, zeta_pred, zeta_true, phi_pred, phi_true, batch_idx):
