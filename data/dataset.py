@@ -1,43 +1,28 @@
 """
-dataset.py — MeshGraphNet/GNN 图数据集。
+dataset.py — FEM-aware MeshGraphNet graph dataset.
 
-GraphHDF5Dataset 读取 generate_3d_test.py 导出的 FE 拓扑与图学习字段，
-返回 disjoint graph batch 所需张量：
+This branch expects per-sample HDF5 groups generated from ANSYS/FEM data:
 
-    node_features, points, edge_index, edge_attr, batch
+    /sample_i/points              [N,3]
+    /sample_i/edge_index          [2,E] or [E,2]        optional but recommended
+    /sample_i/edge_attr           [E,4]                 optional
+    /sample_i/point_features      [N,7] or [7]
+        [E_ratio, PRXY, rho_ratio, is_fixed, logK, logC, Z/H]
+    /sample_i/spring_k_xyz        [N,3]                 optional
+    /sample_i/spring_c_xyz        [N,3]                 optional
+    /sample_i/node_type           [N]                   optional
+    /sample_i/pocket_bottom_mask  [N]                   optional
+    /sample_i/cut_region_mask     [N]                   optional
+    /sample_i/point_frf           [N,F,2]
+    /sample_i/frequencies         [F]
+    /sample_i/modal_omega         [K]       rad/s
+    /sample_i/modal_zeta          [K]
+    /sample_i/modal_phi_xyz       [N,K,3]   preferred
+    /sample_i/modal_phi           [N,K]     legacy Z-only fallback
 
-默认节点特征维度为 25：
-    0:3    normalized xyz
-    3:10   point_features = [E/E_base, PRXY, rho/rho_base, is_fixed, logK, logC, Z/H]
-    10:13  normalized log spring_k_xyz
-    13:16  normalized log spring_c_xyz
-    16:21  node_type one-hot: ordinary/bottom/cut/side/corner
-    21     pocket_bottom_mask
-    22     cut_region_mask
-    23     excitation_flag
-    24     normalized distance to excitation point
-
-HDF5 推荐格式：
-    /sample_i/points              (N, 3)
-    /sample_i/edge_index          (2, E)
-    /sample_i/edge_attr           (E, 4)
-    /sample_i/point_features      (N, 7)
-    /sample_i/spring_k_xyz        (N, 3)
-    /sample_i/spring_c_xyz        (N, 3)
-    /sample_i/node_type           (N,)
-    /sample_i/pocket_bottom_mask  (N,)
-    /sample_i/cut_region_mask     (N,)
-    /sample_i/excitation_index    scalar
-    /sample_i/excitation_coord    (3,)
-    /sample_i/point_frf           (N, F, 2)
-    /sample_i/frequencies         (F,)
-    /sample_i/modal_omega         (K,)
-    /sample_i/modal_zeta          (K,)
-    /sample_i/modal_phi           (N, K)
-    /sample_i/modal_phi_xyz       (N, K, 3)
-    /sample_i/modal_phi_exc       (K,)
+Returned batches are disjoint graphs with concatenated node tensors and
+edge indices shifted by node offsets.
 """
-
 from __future__ import annotations
 
 import os
@@ -45,6 +30,7 @@ from typing import Dict, Iterable, List
 
 import h5py
 import torch
+import torch.nn.functional as F
 from torch.utils.data import Dataset
 
 
@@ -53,15 +39,15 @@ W_BASE = 0.060
 H_BASE = 0.010
 OMEGA_MAX_DEFAULT = 32000.0
 NODE_FEATURE_DIM = 25
-DEFAULT_FORCE_VECTOR = [0.0, 0.0, 1.0]  # 默认 Z 向激励
+DEFAULT_FORCE_VECTOR = [0.0, 0.0, 1.0]
 
 
 class GraphHDF5Dataset(Dataset):
-    """per-sample-group HDF5 → variable-size mesh graph batch."""
+    """per-sample-group HDF5 -> variable-size FEM graph batch."""
 
     def __init__(self, data_paths: Iterable[str], config: Dict, data_dir: str = ".",
                  test: bool = False, normalization: bool = True,
-                 force_vector: List[float] = None):
+                 force_vector: List[float] | None = None):
         self.config = config
         self.normalization = normalization
         self.test = test
@@ -69,6 +55,9 @@ class GraphHDF5Dataset(Dataset):
         self.freq_max = float(config.get("freq_max", 5000.0))
         self.omega_max = float(config.get("omega_max", OMEGA_MAX_DEFAULT))
         self.knn_k = int(config.get("graph", {}).get("knn_k", 12))
+        self.filter_g32 = bool(config.get("filter_g32", False))
+        self.g32_min = float(config.get("g32_min", 200.0))
+        self.g32_max = float(config.get("g32_max", 900.0))
         self.force_vector = torch.tensor(force_vector or DEFAULT_FORCE_VECTOR, dtype=torch.float32)
         self._samples: List[tuple[str, str]] = []
 
@@ -83,6 +72,13 @@ class GraphHDF5Dataset(Dataset):
                 keys = [k for k in f.keys() if k.startswith("sample_")]
                 keys = sorted(keys, key=lambda k: int(k.split("_")[-1]))
                 for key in keys:
+                    if self.filter_g32 and "modal_omega" in f[key]:
+                        omega = f[key]["modal_omega"][:]
+                        fhz = omega / (2.0 * 3.141592653589793)
+                        if len(fhz) >= 3:
+                            g32 = float(fhz[2] - fhz[1])
+                            if g32 < self.g32_min or g32 > self.g32_max:
+                                continue
                     self._samples.append((fp, key))
         if not self._samples:
             raise RuntimeError(f"No per-sample-group data found in: {full_paths}")
@@ -98,14 +94,16 @@ class GraphHDF5Dataset(Dataset):
         with h5py.File(fp, "r") as f:
             grp = f[grp_name]
             points = torch.from_numpy(grp["points"][:]).float()
-            point_features = torch.from_numpy(grp["point_features"][:]).float()
+            point_features = _read_point_features(grp, points.shape[0])
             point_frf = torch.from_numpy(grp["point_frf"][:]).float()
             frequencies = torch.from_numpy(grp["frequencies"][:]).float()
 
             edge_index = None
             if "edge_index" in grp:
                 edge_index = torch.from_numpy(grp["edge_index"][:]).long()
-                if edge_index.ndim != 2 or edge_index.shape[0] != 2:
+                if edge_index.ndim != 2:
+                    raise ValueError(f"{grp_name}/edge_index must be 2D, got {tuple(edge_index.shape)}")
+                if edge_index.shape[0] != 2 and edge_index.shape[1] == 2:
                     edge_index = edge_index.t().contiguous()
 
             edge_attr = None
@@ -120,9 +118,34 @@ class GraphHDF5Dataset(Dataset):
             cut_region_mask = _read_optional_1d(grp, "cut_region_mask", n_nodes, dtype=torch.float32)
 
             out: Dict[str, torch.Tensor] = {}
-            for key in ["modal_omega", "modal_zeta", "modal_phi", "modal_phi_exc", "modal_phi_xyz"]:
-                if key in grp:
-                    out[key] = torch.from_numpy(grp[key][:]).float()
+            if "modal_omega" in grp:
+                modal_omega = torch.from_numpy(grp["modal_omega"][:]).float()
+                out["modal_omega_phys"] = modal_omega
+                out["modal_omega_norm"] = modal_omega / self.omega_max
+                out["modal_freq_hz"] = modal_omega / (2.0 * torch.pi)
+            if "modal_zeta" in grp:
+                out["modal_zeta"] = torch.from_numpy(grp["modal_zeta"][:]).float()
+                out["modal_log_zeta"] = torch.log(torch.clamp(out["modal_zeta"], min=1e-8))
+
+            phi_xyz = None
+            if "modal_phi_xyz" in grp:
+                phi_xyz = torch.from_numpy(grp["modal_phi_xyz"][:]).float()
+            elif "modal_phi" in grp:
+                phi_legacy = torch.from_numpy(grp["modal_phi"][:]).float()
+                if phi_legacy.ndim == 3 and phi_legacy.shape[-1] == 3:
+                    phi_xyz = phi_legacy
+                else:
+                    phi_xyz = torch.zeros(phi_legacy.shape[0], phi_legacy.shape[1], 3, dtype=torch.float32)
+                    phi_xyz[..., 2] = phi_legacy
+            if phi_xyz is not None:
+                out["modal_phi"] = phi_xyz
+                out["modal_phi_xyz"] = phi_xyz
+
+            if "modal_phi_exc" in grp:
+                phi_exc = torch.from_numpy(grp["modal_phi_exc"][:]).float()
+                if phi_exc.ndim == 2 and phi_exc.shape[-1] == 3:
+                    phi_exc = phi_exc[:, 2]
+                out["modal_phi_exc"] = phi_exc
 
             if "excitation_index" in grp:
                 excitation_index = torch.tensor(int(grp["excitation_index"][()]), dtype=torch.long)
@@ -136,6 +159,11 @@ class GraphHDF5Dataset(Dataset):
                 excitation_coord = points[excitation_index].clone()
             out["excitation_coord"] = excitation_coord
 
+        if "modal_phi_exc" not in out and "modal_phi" in out:
+            ei = int(out["excitation_index"].item())
+            if 0 <= ei < out["modal_phi"].shape[0]:
+                out["modal_phi_exc"] = out["modal_phi"][ei, :, 2].clone()
+
         if edge_index is None or edge_index.numel() == 0:
             edge_index = build_knn_edge_index(points, k=self.knn_k)
         if edge_attr is None or edge_attr.shape[0] != edge_index.shape[1]:
@@ -143,10 +171,6 @@ class GraphHDF5Dataset(Dataset):
 
         if self.normalization:
             frequencies = (frequencies - self.freq_min) / (self.freq_max - self.freq_min) * 2.0 - 1.0
-
-        if "modal_omega" in out:
-            out["modal_omega_phys"] = out["modal_omega"].clone()
-            out["modal_omega_norm"] = out.pop("modal_omega") / self.omega_max
 
         coords_norm = normalize_points(points)
         node_features = build_node_features(
@@ -185,9 +209,32 @@ class GraphHDF5Dataset(Dataset):
 GeometricHDF5Dataset = GraphHDF5Dataset
 
 
+def _read_point_features(grp, n_nodes: int) -> torch.Tensor:
+    if "point_features" in grp:
+        pf = torch.from_numpy(grp["point_features"][:]).float()
+        if pf.ndim == 1:
+            pf = pf.unsqueeze(0).expand(n_nodes, -1).clone()
+    else:
+        pf = torch.zeros(n_nodes, 7, dtype=torch.float32)
+        pf[:, 0] = 1.0
+        pf[:, 1] = 0.33
+        pf[:, 2] = 1.0
+        pf[:, 6] = torch.clamp(torch.zeros(n_nodes), min=0.0)
+
+    if pf.shape[1] < 7:
+        pad = torch.zeros(n_nodes, 7 - pf.shape[1], dtype=pf.dtype)
+        pf = torch.cat([pf, pad], dim=-1)
+    return pf[:, :7].float()
+
+
 def _read_optional_node_array(grp, key: str, n_nodes: int, width: int) -> torch.Tensor:
     if key in grp:
-        return torch.from_numpy(grp[key][:]).float()
+        arr = torch.from_numpy(grp[key][:]).float()
+        if arr.ndim == 1:
+            arr = arr.unsqueeze(-1)
+        if arr.shape[1] < width:
+            arr = torch.cat([arr, torch.zeros(n_nodes, width - arr.shape[1])], dim=-1)
+        return arr[:, :width]
     return torch.zeros(n_nodes, width, dtype=torch.float32)
 
 
@@ -204,12 +251,10 @@ def normalize_points(points: torch.Tensor) -> torch.Tensor:
 
 
 def sanitize_features(features: torch.Tensor) -> torch.Tensor:
-    features = torch.nan_to_num(features.float(), nan=0.0, posinf=0.0, neginf=0.0)
-    return features
+    return torch.nan_to_num(features.float(), nan=0.0, posinf=0.0, neginf=0.0)
 
 
 def normalize_log_positive(x: torch.Tensor, max_log: float = 8.0) -> torch.Tensor:
-    """log10(1+x)/max_log，零弹簧保持 0，避免无弹簧被 -1 混淆。"""
     x = torch.clamp(torch.nan_to_num(x.float(), nan=0.0, posinf=0.0, neginf=0.0), min=0.0)
     return torch.log10(1.0 + x) / max_log
 
@@ -229,20 +274,21 @@ def build_node_features(points: torch.Tensor,
     spring_c_norm = normalize_log_positive(spring_c_xyz, max_log=4.0)
 
     node_type = torch.clamp(node_type.long(), min=0, max=4)
-    node_type_onehot = torch.nn.functional.one_hot(node_type, num_classes=5).float()
+    node_type_onehot = F.one_hot(node_type, num_classes=5).float()
 
     bottom = pocket_bottom_mask.float().unsqueeze(-1)
     cut = cut_region_mask.float().unsqueeze(-1)
 
     excitation_flag = torch.zeros(points.shape[0], 1, dtype=points.dtype, device=points.device)
-    if 0 <= int(excitation_index.item()) < points.shape[0]:
-        excitation_flag[int(excitation_index.item()), 0] = 1.0
+    ei = int(excitation_index.item())
+    if 0 <= ei < points.shape[0]:
+        excitation_flag[ei, 0] = 1.0
 
     scale = torch.tensor([L_BASE, W_BASE, H_BASE], dtype=points.dtype, device=points.device)
     exc = excitation_coord.to(points.device, dtype=points.dtype)
     dist_to_exc = torch.linalg.norm((points - exc.unsqueeze(0)) / scale, dim=-1, keepdim=True)
 
-    return torch.cat([
+    node_features = torch.cat([
         coords_norm,
         point_features,
         spring_k_norm,
@@ -254,11 +300,16 @@ def build_node_features(points: torch.Tensor,
         dist_to_exc,
     ], dim=-1).float()
 
+    if node_features.shape[-1] != NODE_FEATURE_DIM:
+        raise RuntimeError(f"NODE_FEATURE_DIM mismatch: got {node_features.shape[-1]}, expected {NODE_FEATURE_DIM}")
+    return node_features
+
 
 def build_knn_edge_index(points: torch.Tensor, k: int = 12) -> torch.Tensor:
     n = int(points.shape[0])
     if n <= 1:
         return torch.zeros(2, 0, dtype=torch.long)
+
     k = max(1, min(k, n - 1))
     with torch.no_grad():
         scaled = points / torch.tensor([L_BASE, W_BASE, H_BASE], dtype=points.dtype, device=points.device)
@@ -310,8 +361,7 @@ def collate_geometry_batch(batch: List[Dict[str, torch.Tensor]]) -> Dict[str, to
         point_frf.append(item["point_frf"])
         batch_vec.append(torch.full((n_i,), i, dtype=torch.long))
 
-        ei = item["edge_index"].long() + node_offset
-        edge_indices.append(ei)
+        edge_indices.append(item["edge_index"].long() + node_offset)
         edge_attrs.append(item.get("edge_attr", build_edge_attr(item["points"], item["edge_index"])))
 
         for key in passthrough_cat:
@@ -366,16 +416,17 @@ def collate_geometry_batch(batch: List[Dict[str, torch.Tensor]]) -> Dict[str, to
 
 
 def _stack_modal(batch: List[Dict[str, torch.Tensor]]) -> Dict[str, torch.Tensor]:
-    required = ["modal_omega_norm", "modal_zeta", "modal_phi"]
+    required = ["modal_omega_phys", "modal_zeta", "modal_phi"]
     if any(key not in batch[0] for key in required):
         return {}
 
     result: Dict[str, torch.Tensor] = {
+        "modal_omega_phys": torch.stack([item["modal_omega_phys"] for item in batch]),
         "modal_omega_norm": torch.stack([item["modal_omega_norm"] for item in batch]),
         "modal_zeta": torch.stack([item["modal_zeta"] for item in batch]),
         "modal_phi": torch.cat([item["modal_phi"] for item in batch], dim=0),
     }
-    for key in ["modal_phi_exc", "modal_omega_phys"]:
+    for key in ["modal_phi_exc", "modal_freq_hz", "modal_log_zeta"]:
         if key in batch[0]:
             result[key] = torch.stack([item[key] for item in batch])
     if "modal_phi_xyz" in batch[0]:
