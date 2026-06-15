@@ -356,23 +356,30 @@ class DirectionBranchHead(nn.Module):
 
 
 class PhiScaleHead(nn.Module):
-    """模态幅值预测器。接收 latent + 方向概率 [B, 512+K*3]，预测物理 joint scale。
+    """模态方向幅值预测器。接收 latent + 方向概率，预测每阶每方向的 scale。
 
-    DirectionBranchHead 输出的方向比例作为"条件小抄"，让 scale 头知道每阶是 Z主导/XY主导。
+    输出:
+        scale: [B, K, 3]
     """
 
     def __init__(self, hidden=512, n_modes=3):
         super().__init__()
+        self.n_modes = n_modes
         self.mlp = nn.Sequential(
             nn.Linear(hidden + n_modes * 3, 256), nn.GELU(), nn.Dropout(0.15),
             nn.Linear(256, 128), nn.GELU(),
-            nn.Linear(128, n_modes),
+            nn.Linear(128, n_modes * 3),
         )
+
+        # 初始等价于 scale=1，不破坏原始 micro_decoder 输出
         with torch.no_grad():
-            self.mlp[-1].bias.copy_(torch.zeros(n_modes))
+            nn.init.zeros_(self.mlp[-1].weight)
+            self.mlp[-1].bias.copy_(torch.zeros(n_modes * 3))
 
     def forward(self, conditioned_latent):
-        return torch.exp(self.mlp(conditioned_latent))  # [B, K]
+        scale_raw = self.mlp(conditioned_latent).view(-1, self.n_modes, 3)
+        scale_raw = torch.clamp(scale_raw, -2.0, 2.0)
+        return torch.exp(scale_raw)  # [B, K, 3]
 
 
 class UNetPhysicsModel(nn.Module):
@@ -497,8 +504,8 @@ class UNetPhysicsModel(nn.Module):
         maps_flat = mode_maps_3d.reshape(B, self.n_modes, -1)       # [B, K, 3*H*W]
         maps_std = torch.std(maps_flat, dim=2) + 1e-8               # [B, K] 联合 std
         normalized_maps = mode_maps_3d / maps_std.view(B, self.n_modes, 1, 1, 1)
-        scale = self.phi_scale_head(conditioned_latent)              # [B, K]
-        mode_maps_3d = normalized_maps * scale.view(B, self.n_modes, 1, 1, 1)
+        scale = self.phi_scale_head(conditioned_latent)              # [B, K, 3]
+        mode_maps_3d = normalized_maps * scale.view(B, self.n_modes, 3, 1, 1)
 
         # 合并回 [B, K*3, H, W] 送入 grid_sample
         mode_maps = mode_maps_3d.reshape(B, self.n_modes * 3, mode_maps.shape[-2], mode_maps.shape[-1])
