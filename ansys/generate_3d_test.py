@@ -1,17 +1,15 @@
 """
 ANSYS 凹槽工件数据集生成 — MeshGraphNet 物理一致版本。
 
-本版本用于重新生成 GNN/MeshGraphNet 数据集，重点修正：
-1. 模态分析显式使用质量归一化振型：MODOPT(..., nrmkey='OFF')。
-2. 默认使用一致质量矩阵，不开启 LUMPM；若确实需要集中质量，可改 USE_LUMPED_MASS=True。
-3. FRF 与阻尼比公式按质量归一化模态使用，不再依赖任意振型尺度。
-4. 保存 MeshGraphNet 需要的 FEM 图字段和少量必要物理量：
-   edge_index, edge_attr, modal_phi_xyz, spring_k_xyz, spring_c_xyz,
-   node_type, pocket_bottom_mask, cut_region_mask, excitation_index,
-   excitation_coord, local_thickness_ratio, pocket_depth_ratio,
-   modal_mass, modal_stiffness, modal_effm, modal_pfact。
+本脚本用于重新生成 GNN / MeshGraphNet 数据集，核心约束：
+1. 使用质量归一化振型：MODOPT(..., nrmkey='OFF')。
+2. 默认使用一致质量矩阵，不开启 LUMPM。
+3. FRF 与阻尼公式按质量归一化模态使用。
+4. 保存 MeshGraphNet 需要的 FEM 图字段和必要物理量。
+5. 生成阶段剔除三阶与二阶固有频率间隔小于 MIN_GAP32_HZ 的样本。
+6. 频率网格在 float32 保存后仍保证严格递增，避免重复频率点。
 
-默认生成 300 个样本，保存到 ansys/data/train.h5、val.h5、test.h5。
+默认生成 300 个有效样本，保存到 ansys/data/train.h5、val.h5、test.h5。
 """
 from __future__ import annotations
 
@@ -42,6 +40,8 @@ assert N_TRAIN + N_VAL + N_TEST == N_SAMPLES, "N_TRAIN + N_VAL + N_TEST must equ
 N_MODES = 3
 N_FREQS = 60
 FREQ_MIN, FREQ_MAX = 1.0, 5000.0
+FREQ_GRID_MIN_STEP_HZ = float(os.getenv("FREQ_GRID_MIN_STEP_HZ", "0.01"))
+MIN_GAP32_HZ = float(os.getenv("MIN_GAP32_HZ", "200.0"))
 MESH_SIZE = 0.006
 ZETA_MATERIAL = 0.002
 AMPLITUDE_SCALE = 500000.0
@@ -214,60 +214,146 @@ def compute_local_thickness(points, pocket_records):
     return local_thickness, pocket_depth
 
 
+def _dedup_with_min_step(freqs, min_step):
+    freqs = np.asarray(freqs, dtype=np.float64)
+    freqs = freqs[np.isfinite(freqs)]
+    freqs = freqs[(freqs >= FREQ_MIN) & (freqs <= FREQ_MAX)]
+    if freqs.size == 0:
+        freqs = np.array([FREQ_MIN, FREQ_MAX], dtype=np.float64)
+    freqs = np.sort(freqs)
+
+    cleaned = [float(freqs[0])]
+    for f in freqs[1:]:
+        if f > cleaned[-1] + min_step:
+            cleaned.append(float(f))
+    return np.asarray(cleaned, dtype=np.float64)
+
+
+def _fill_frequency_grid(freqs, target_n, min_step):
+    freqs = _dedup_with_min_step(freqs, min_step)
+    if freqs[0] > FREQ_MIN + min_step:
+        freqs = np.insert(freqs, 0, FREQ_MIN)
+    if freqs[-1] < FREQ_MAX - min_step:
+        freqs = np.append(freqs, FREQ_MAX)
+
+    while len(freqs) < target_n:
+        gaps = np.diff(freqs)
+        if len(gaps) == 0:
+            new_f = min(FREQ_MAX, freqs[0] + min_step)
+            freqs = np.append(freqs, new_f)
+            continue
+        order = np.argsort(-gaps)
+        inserted = False
+        for j in order:
+            lo, hi = freqs[j], freqs[j + 1]
+            if hi - lo <= 2.2 * min_step:
+                continue
+            if lo > 0:
+                candidate = np.sqrt(lo * hi)
+            else:
+                candidate = 0.5 * (lo + hi)
+            if not (lo + min_step < candidate < hi - min_step):
+                candidate = 0.5 * (lo + hi)
+            freqs = np.insert(freqs, j + 1, candidate)
+            inserted = True
+            break
+        if not inserted:
+            raise RuntimeError("Cannot fill frequency grid with strict minimum spacing.")
+    return np.sort(freqs)
+
+
+def _trim_frequency_grid(freqs, target_n, protected_mask):
+    freqs = np.asarray(freqs, dtype=np.float64)
+    keep = np.ones(len(freqs), dtype=bool)
+    n_remove = len(freqs) - target_n
+    if n_remove <= 0:
+        return freqs
+
+    removable = np.where(~protected_mask)[0]
+    while n_remove > 0 and len(removable) > 0:
+        kept_idx = np.where(keep)[0]
+        removable = np.array([idx for idx in kept_idx if not protected_mask[idx]], dtype=np.int64)
+        if len(removable) == 0:
+            break
+        # 优先删除局部间距最小的非峰值保护点。
+        costs = []
+        for idx in removable:
+            pos = np.where(kept_idx == idx)[0][0]
+            left_gap = freqs[kept_idx[pos]] - freqs[kept_idx[pos - 1]] if pos > 0 else np.inf
+            right_gap = freqs[kept_idx[pos + 1]] - freqs[kept_idx[pos]] if pos < len(kept_idx) - 1 else np.inf
+            costs.append(min(left_gap, right_gap))
+        remove_idx = removable[int(np.argmin(costs))]
+        keep[remove_idx] = False
+        n_remove -= 1
+
+    if n_remove > 0:
+        kept_idx = np.where(keep)[0]
+        # 保护点不够删时，均匀删点，但保留首尾。
+        candidates = kept_idx[1:-1]
+        if len(candidates) < n_remove:
+            raise RuntimeError("Cannot trim frequency grid to target length.")
+        remove_pos = np.linspace(0, len(candidates) - 1, n_remove, dtype=int)
+        keep[candidates[remove_pos]] = False
+    return freqs[keep]
+
+
+def finalize_frequency_grid(freqs, omega_k, zeta_k):
+    """保证 N_FREQS 个 float32 频率点严格递增，且尽量保护模态峰附近频率点。"""
+    min_step = float(FREQ_GRID_MIN_STEP_HZ)
+    freqs = _dedup_with_min_step(freqs, min_step)
+
+    protected = np.zeros(len(freqs), dtype=bool)
+    for fk, zk in zip(omega_k / (2.0 * np.pi), zeta_k):
+        bw_half = max(2.0 * float(zk) * float(fk), min_step * 10.0)
+        protected |= (freqs >= fk - bw_half) & (freqs <= fk + bw_half)
+
+    if len(freqs) > N_FREQS:
+        freqs = _trim_frequency_grid(freqs, N_FREQS, protected)
+    if len(freqs) < N_FREQS:
+        freqs = _fill_frequency_grid(freqs, N_FREQS, min_step)
+
+    freqs = np.sort(np.asarray(freqs, dtype=np.float64))[:N_FREQS]
+
+    # 前向/后向安全处理：确保转 float32 后仍严格递增。
+    for i in range(1, len(freqs)):
+        if freqs[i] <= freqs[i - 1] + min_step:
+            freqs[i] = freqs[i - 1] + min_step
+    if freqs[-1] > FREQ_MAX:
+        freqs[-1] = FREQ_MAX
+        for i in range(len(freqs) - 2, -1, -1):
+            if freqs[i] >= freqs[i + 1] - min_step:
+                freqs[i] = freqs[i + 1] - min_step
+    if freqs[0] < FREQ_MIN:
+        freqs += (FREQ_MIN - freqs[0])
+
+    freqs32 = freqs.astype(np.float32)
+    if len(freqs32) != N_FREQS or not np.all(np.diff(freqs32.astype(np.float64)) > 0.0):
+        raise RuntimeError("frequency grid is not strictly increasing after float32 conversion")
+    if freqs32[0] < FREQ_MIN - 1e-6 or freqs32[-1] > FREQ_MAX + 1e-6:
+        raise RuntimeError("frequency grid is out of configured frequency range")
+    return freqs32
+
+
 def make_frequency_grid(omega_k, zeta_k):
     freqs_parts = []
     prev = FREQ_MIN
     for idx_k, f_k in enumerate(omega_k / (2.0 * np.pi)):
-        bw = 2.0 * zeta_k[idx_k] * f_k
+        bw = max(2.0 * float(zeta_k[idx_k]) * float(f_k), FREQ_GRID_MIN_STEP_HZ * 20.0)
         lo = max(FREQ_MIN, f_k - 3.0 * bw)
         hi = min(FREQ_MAX, f_k + 3.0 * bw)
         if prev < lo:
             freqs_parts.append(np.logspace(np.log10(max(prev, 0.1)), np.log10(lo),
                                            max(2, int(5 * (lo - prev) / FREQ_MAX)), endpoint=False))
-        freqs_parts.append(np.linspace(lo, hi, max(15, int(20 * (hi - lo) / FREQ_MAX)), endpoint=True))
-        prev = hi
+        # 峰附近多给候选点，后面再统一裁剪到 60。
+        freqs_parts.append(np.linspace(lo, hi, max(25, int(40 * (hi - lo) / FREQ_MAX)), endpoint=True))
+        freqs_parts.append(np.array([max(FREQ_MIN, f_k - bw), f_k, min(FREQ_MAX, f_k + bw)], dtype=np.float64))
+        prev = max(prev, hi)
     if prev < FREQ_MAX:
         freqs_parts.append(np.logspace(np.log10(max(prev, 0.1)), np.log10(FREQ_MAX),
                                        max(2, int(5 * (FREQ_MAX - prev) / FREQ_MAX)), endpoint=True))
 
-    freqs = np.unique(np.sort(np.concatenate(freqs_parts)))
-    if len(freqs) > N_FREQS:
-        protected = np.zeros(len(freqs), dtype=bool)
-        for fk, zk in zip(omega_k / (2.0 * np.pi), zeta_k):
-            bw_half = 2.0 * zk * fk
-            protected |= (freqs >= fk - bw_half) & (freqs <= fk + bw_half)
-        n_remove = len(freqs) - N_FREQS
-        keep = np.ones(len(freqs), dtype=bool)
-        gap_indices = np.where(~protected)[0]
-        if len(gap_indices) >= n_remove and len(gap_indices) > 1:
-            gap_edges = np.diff(freqs[gap_indices])
-            remove_order = gap_indices[:-1][np.argsort(gap_edges)][:n_remove]
-            keep[remove_order] = False
-        else:
-            keep[~protected] = False
-            peak_indices = np.where(protected)[0]
-            n_remove_peak = n_remove - len(gap_indices)
-            if n_remove_peak > 0 and len(peak_indices) > 0:
-                step = max(2, len(peak_indices) // max(1, n_remove_peak))
-                keep[peak_indices[::step][:n_remove_peak]] = False
-        freqs = freqs[keep]
-    elif len(freqs) < N_FREQS:
-        shortage = N_FREQS - len(freqs)
-        gaps = np.diff(freqs)
-        if len(gaps) > 0 and gaps.sum() > 0:
-            weights = gaps / gaps.sum()
-            extra_per_gap = np.round(weights * shortage).astype(int)
-            diff = shortage - extra_per_gap.sum()
-            order = np.argsort(-gaps)
-            for j in range(int(diff)):
-                extra_per_gap[order[j % len(order)]] += 1
-            filled = [freqs[0]]
-            for lo, hi, n_extra in zip(freqs[:-1], freqs[1:], extra_per_gap):
-                if n_extra > 0:
-                    filled.extend(np.logspace(np.log10(lo), np.log10(hi), n_extra + 2)[1:-1])
-                filled.append(hi)
-            freqs = np.unique(np.sort(filled))[:N_FREQS]
-    return freqs.astype(np.float32)
+    freqs = np.concatenate(freqs_parts)
+    return finalize_frequency_grid(freqs, omega_k, zeta_k)
 
 
 def save_h5(name, idx_slice, arrays):
@@ -278,6 +364,8 @@ def save_h5(name, idx_slice, arrays):
         f.attrs["mass_matrix"] = "lumped" if USE_LUMPED_MASS else "consistent"
         f.attrs["n_modes"] = N_MODES
         f.attrs["n_freqs"] = N_FREQS
+        f.attrs["min_gap32_hz"] = MIN_GAP32_HZ
+        f.attrs["freq_grid_min_step_hz"] = FREQ_GRID_MIN_STEP_HZ
         f.attrs["description"] = "MeshGraphNet dataset generated by mass-normalized modal analysis."
         for i, idx in enumerate(idxs):
             grp = f.create_group(f"sample_{i}")
@@ -295,13 +383,15 @@ def save_h5(name, idx_slice, arrays):
 
 # ===================== 主流程 =====================
 print(">>> 生成 Sobol 低偏差序列... ")
-SOBOL_BUFFER = 50
+SOBOL_BUFFER = 500
 sampler = qmc.Sobol(d=2, scramble=True, seed=SEED)
 sobol_samples = sampler.random(n=N_SAMPLES + SOBOL_BUFFER)
 scaled_sobol = qmc.scale(sobol_samples, [E_RANGE[0], RHO_RANGE[0]], [E_RANGE[1], RHO_RANGE[1]])
 
 print(f"配置: {N_SAMPLES}样本, train/val/test={N_TRAIN}/{N_VAL}/{N_TEST}, {N_MODES}阶模态")
 print(f"模态归一化: mass, 质量矩阵: {'lumped' if USE_LUMPED_MASS else 'consistent'}")
+print(f"样本过滤: f3 - f2 > {MIN_GAP32_HZ:.1f} Hz")
+print(f"频率网格: {N_FREQS}点, float32后严格递增, min_step={FREQ_GRID_MIN_STEP_HZ:.4f} Hz")
 print(f"网格: SOLID187, MESH_SIZE={MESH_SIZE*1000:.1f} mm")
 
 print("\n>>> 连接 ANSYS MAPDL...")
@@ -342,12 +432,13 @@ csv_writer.writerow([
     "sample", "n_nodes", "n_edges", "n_pockets_to_machine", "n_pocket_scheme",
     "depth_range_%", "cut_nodes/bottom_nodes", "exc_x_mm", "exc_y_mm", "exc_z_mm",
     "n_spring_areas", "n_spring_nodes", "modal_norm", "mass_matrix",
-    "zeta1", "zeta2", "zeta3", "f1_Hz", "f2_Hz", "f3_Hz",
+    "zeta1", "zeta2", "zeta3", "f1_Hz", "f2_Hz", "f3_Hz", "gap32_Hz",
     "E_ratio", "rho_ratio", "n_cols", "n_rows",
 ])
 
 valid_samples = 0
 attempt_count = 0
+skip_gap32_count = 0
 t0 = time.time()
 
 while valid_samples < N_SAMPLES:
@@ -486,7 +577,6 @@ while valid_samples < N_SAMPLES:
         point_features[:, 3] = 0.0
         point_features[:, 4] = -1.0
         point_features[:, 5] = -1.0
-        # 关键变化：第7维保存局部残余厚度比例，而不是节点 Z/H。
         point_features[:, 6] = local_thickness_ratio
 
         spring_k_xyz = np.zeros((n_nodes_total, 3), dtype=np.float32)
@@ -622,7 +712,6 @@ while valid_samples < N_SAMPLES:
         if USE_LUMPED_MASS:
             mapdl.lumpm("ON")
         else:
-            # 使用 ANSYS 默认一致质量矩阵。
             try:
                 mapdl.lumpm("OFF")
             except Exception:
@@ -658,6 +747,16 @@ while valid_samples < N_SAMPLES:
                 effm_k[k - 1, j] = try_get_mode_quantity(mapdl, k, "EFFM", dire)
                 pfact_k[k - 1, j] = try_get_mode_quantity(mapdl, k, "PFACT", dire)
 
+        freq_hz = omega_k / (2.0 * np.pi)
+        if not np.all(np.diff(freq_hz.astype(np.float64)) > 0.0):
+            print(f"  跳过: 模态频率未递增 f={freq_hz}")
+            continue
+        gap32_hz = float(freq_hz[2] - freq_hz[1])
+        if gap32_hz <= MIN_GAP32_HZ:
+            skip_gap32_count += 1
+            print(f"  跳过: f3-f2={gap32_hz:.2f} Hz <= {MIN_GAP32_HZ:.1f} Hz")
+            continue
+
         phi_xyz = np.stack([phi_x, phi_y, phi_z], axis=-1).astype(np.float32)
         modal_mass = np.ones(N_MODES, dtype=np.float32) if USE_MASS_NORMALIZATION else np.full(N_MODES, np.nan, dtype=np.float32)
         modal_stiffness = (omega_k ** 2 * modal_mass).astype(np.float32)
@@ -691,6 +790,8 @@ while valid_samples < N_SAMPLES:
             zeta_k[k] = ZETA_MATERIAL + zeta_boundary
 
         freqs = make_frequency_grid(omega_k, zeta_k)
+        if len(freqs) != N_FREQS or not np.all(np.diff(freqs.astype(np.float64)) > 0.0):
+            raise RuntimeError("make_frequency_grid returned invalid frequency grid")
         omega_q = 2.0 * np.pi * freqs
         frf = np.zeros((n_nodes_total, len(freqs), 2), dtype=np.float32)
         for k in range(N_MODES):
@@ -733,10 +834,12 @@ while valid_samples < N_SAMPLES:
         depth_max = max(pocket_depth_fracs) * 100 if pocket_depth_fracs else 0.0
         n_cut = len(pocket_cut_indices)
         n_bottom = len(pocket_bottom_any_indices)
+        min_df = float(np.min(np.diff(freqs.astype(np.float64))))
         print(
             f"N={n_nodes_total}, E={edge_index.shape[1]}, 加工{n_pockets_to_machine}/{num_machined}, "
             f"深度{depth_min:.0f}~{depth_max:.0f}%, cut/bottom={n_cut}/{n_bottom}, "
-            f"f=[{omega_k[0]/(2*np.pi):.1f}, {omega_k[1]/(2*np.pi):.1f}, {omega_k[2]/(2*np.pi):.1f}]Hz, "
+            f"f=[{freq_hz[0]:.1f}, {freq_hz[1]:.1f}, {freq_hz[2]:.1f}]Hz, "
+            f"gap32={gap32_hz:.1f}Hz, df_min={min_df:.4f}Hz, "
             f"zeta=[{zeta_k[0]:.4f}, {zeta_k[1]:.4f}, {zeta_k[2]:.4f}]"
         )
 
@@ -746,7 +849,7 @@ while valid_samples < N_SAMPLES:
             f"{exc_actual[0]*1000:.2f}", f"{exc_actual[1]*1000:.2f}", f"{exc_actual[2]*1000:.2f}",
             len(all_clamp_areas), len(spring_info), "mass", "lumped" if USE_LUMPED_MASS else "consistent",
             f"{zeta_k[0]:.6f}", f"{zeta_k[1]:.6f}", f"{zeta_k[2]:.6f}",
-            f"{omega_k[0]/(2*np.pi):.2f}", f"{omega_k[1]/(2*np.pi):.2f}", f"{omega_k[2]/(2*np.pi):.2f}",
+            f"{freq_hz[0]:.2f}", f"{freq_hz[1]:.2f}", f"{freq_hz[2]:.2f}", f"{gap32_hz:.2f}",
             f"{E/E_BASE:.4f}", f"{rho/RHO_BASE:.4f}", n_cols, n_rows,
         ])
         csv_file.flush()
@@ -767,7 +870,7 @@ while valid_samples < N_SAMPLES:
                 plotter.add_points(exc_actual.reshape(1, -1), color="green", point_size=15,
                                    render_points_as_spheres=True)
                 plotter.add_text(
-                    f"Sample {valid_samples + 1}: mass-normalized, {n_pockets_to_machine}/{num_machined} pockets",
+                    f"Sample {valid_samples + 1}: mass-normalized, gap32={gap32_hz:.1f}Hz",
                     font_size=10,
                 )
                 plotter.camera_position = "iso"
@@ -794,7 +897,7 @@ except Exception:
     pass
 
 elapsed = time.time() - t0
-print(f"\n生成完成, 有效样本={N_SAMPLES}, 总尝试={attempt_count}, 耗时={elapsed:.0f}s")
+print(f"\n生成完成, 有效样本={N_SAMPLES}, 总尝试={attempt_count}, gap32过滤={skip_gap32_count}, 耗时={elapsed:.0f}s")
 print(f"CSV日志: {csv_path}")
 
 print("\n保存 HDF5...")
