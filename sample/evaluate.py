@@ -1,11 +1,10 @@
-"""
-evaluate.py — MeshGraphNet 模态参数评估 + FRF 重建保存。
+"""MeshGraphNet modal parameter evaluation + FRF result export."""
+from __future__ import annotations
 
-输出 sample/output/final_results.npz，供 sample/对比图.py 使用。
-"""
 import os
 import sys
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
+
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 import numpy as np
 import torch
@@ -15,32 +14,32 @@ from models import build_geometric_model
 
 
 CONFIG = {
-    'freq_min': 1.0,
-    'freq_max': 5000.0,
-    'omega_max': 32000.0,
-    'graph': {'knn_k': 12},
+    "freq_min": 1.0,
+    "freq_max": 5000.0,
+    "omega_max": 32000.0,
+    "filter_g32": False,
+    "graph": {"knn_k": 12},
 }
 
 MODEL_CFG = {
-    'encoder_kwargs': {
-        'node_in_dim': NODE_FEATURE_DIM,
-        'edge_in_dim': 4,
-        'hidden': 256,
-        'n_layers': 8,
-        'n_modes': 3,
-        'omega_max': 32000.0,
-        'amp_scale': 500000.0,
-        'freq_min': 1.0,
-        'freq_max': 5000.0,
-        'dropout': 0.05,
+    "encoder_kwargs": {
+        "node_in_dim": NODE_FEATURE_DIM,
+        "edge_in_dim": 4,
+        "hidden": 128,
+        "n_layers": 4,
+        "n_modes": 3,
+        "amp_scale": 500000.0,
+        "freq_min": 1.0,
+        "freq_max": 5000.0,
+        "dropout": 0.05,
     },
-    'decoder_kwargs': {},
+    "decoder_kwargs": {},
 }
 
-device = 'cuda' if torch.cuda.is_available() else 'cpu'
-data_dir = os.path.join(os.path.dirname(__file__), '..', 'ansys', 'data')
-out_dir = os.path.join(os.path.dirname(__file__), 'output')
-ckpt_path = os.path.join(out_dir, 'checkpoint_best')
+device = "cuda" if torch.cuda.is_available() else "cpu"
+data_dir = os.path.join(os.path.dirname(__file__), "..", "ansys", "data")
+out_dir = os.path.join(os.path.dirname(__file__), "output_meshgraphnet")
+ckpt_path = os.path.join(out_dir, "checkpoint_best_modal")
 EPS = 1e-12
 
 
@@ -51,8 +50,7 @@ def to_obj(arr_list):
     return out
 
 
-def sign_align_phi(pred_phi, true_phi, eps=1e-8):
-    """符号对齐用于振型指标计算（MAC/NRMSE），不影响 FRF 重建。"""
+def sign_align_phi(pred_phi: torch.Tensor, true_phi: torch.Tensor, eps=1e-8):
     aligned = pred_phi.clone()
     signs = []
     for k in range(pred_phi.shape[1]):
@@ -63,18 +61,20 @@ def sign_align_phi(pred_phi, true_phi, eps=1e-8):
     return aligned, torch.stack(signs)
 
 
-def phi_metrics(pred_phi, true_phi, eps=1e-8):
-    """振型指标计算，使用符号对齐后的 phi 评估 MAC/NRMSE。"""
+def phi_metrics(pred_phi: torch.Tensor, true_phi: torch.Tensor, eps=1e-8):
     pred_phi_aligned, signs = sign_align_phi(pred_phi, true_phi, eps=eps)
-    macs, nrmse, std_ratio = [], [], []
+    macs, nrmse, phi_a = [], [], []
     for k in range(true_phi.shape[1]):
         p, t = pred_phi_aligned[:, k], true_phi[:, k]
         mac = (torch.sum(p * t) ** 2) / (torch.sum(p ** 2) * torch.sum(t ** 2) + eps)
         rmse = torch.sqrt(torch.mean((p - t) ** 2))
+        true_std = torch.std(t.reshape(-1)) + eps
+        norm_p = torch.sqrt(torch.sum(p ** 2) + eps)
+        norm_t = torch.sqrt(torch.sum(t ** 2) + eps)
         macs.append(mac)
-        nrmse.append(rmse / (torch.std(t) + eps))
-        std_ratio.append((torch.std(p) + eps) / (torch.std(t) + eps))
-    return torch.stack(macs), torch.stack(nrmse), torch.stack(std_ratio), pred_phi_aligned, signs
+        nrmse.append(rmse / true_std)
+        phi_a.append(torch.abs(norm_p - norm_t) / (norm_t + eps))
+    return torch.stack(macs), torch.stack(nrmse), torch.stack(phi_a), pred_phi_aligned, signs
 
 
 def compute_peak_metrics(freqs_hz, pred_amp, true_amp, true_freq_hz, true_zeta):
@@ -103,31 +103,23 @@ def compute_peak_metrics(freqs_hz, pred_amp, true_amp, true_freq_hz, true_zeta):
     return [np.asarray(x, dtype=np.float32) for x in (peak_shift, peak_amp_rel, pred_peak_freq, true_peak_freq)]
 
 
-def build_single_graph(sample):
-    return {
-        'node_features': sample['node_features'].to(device),
-        'edge_index': sample['edge_index'].to(device),
-        'edge_attr': sample['edge_attr'].to(device),
-        'batch': torch.zeros(sample['points'].shape[0], dtype=torch.long, device=device),
-        'frequencies': sample['frequencies'].unsqueeze(0).to(device),
-    }
-
-
 def main():
-    print('=' * 80)
-    print('MeshGraphNet 模型评估：25D 图特征 + 模态参数 + FRF')
-    print('=' * 80)
+    print("=" * 80)
+    print("MeshGraphNet evaluation")
+    print("=" * 80)
 
-    testset = GraphHDF5Dataset(['test.h5'], CONFIG, data_dir=data_dir, normalization=True, test=True)
-    testset_raw = GraphHDF5Dataset(['test.h5'], CONFIG, data_dir=data_dir, normalization=False, test=True)
-    print(f'测试集: {len(testset)} samples | node_in_dim={NODE_FEATURE_DIM} | device={device}')
+    testset = GraphHDF5Dataset(["test.h5"], CONFIG, data_dir=data_dir, normalization=True, test=True)
+    testset_raw = GraphHDF5Dataset(["test.h5"], CONFIG, data_dir=data_dir, normalization=False, test=True)
+    print(f"Test samples: {len(testset)} | node_dim={NODE_FEATURE_DIM} | device={device}")
 
-    model = build_geometric_model(MODEL_CFG['encoder_kwargs'], MODEL_CFG['decoder_kwargs']).to(device)
+    model = build_geometric_model(MODEL_CFG["encoder_kwargs"], MODEL_CFG["decoder_kwargs"]).to(device)
+    if not os.path.exists(ckpt_path):
+        raise FileNotFoundError(f"Checkpoint not found: {ckpt_path}")
     ckpt = torch.load(ckpt_path, map_location=device)
-    model.load_state_dict(ckpt['model_state_dict'])
+    model.load_state_dict(ckpt["model_state_dict"])
     model.eval()
     print(f"Checkpoint epoch={ckpt.get('epoch', 'NA')}, loss={ckpt.get('loss', -1):.6f}")
-    print(f"参数量: {sum(p.numel() for p in model.parameters()):,}")
+    print(f"Params: {sum(p.numel() for p in model.parameters()):,}")
 
     all_points, all_freqs = [], []
     all_pred_amp, all_true_amp = [], []
@@ -137,65 +129,65 @@ def main():
     all_pred_freq_hz, all_true_freq_hz, all_freq_rel = [], [], []
     all_pred_zeta, all_true_zeta, all_zeta_rel = [], [], []
     all_pred_phi, all_true_phi = [], []
-    all_phi_mac, all_phi_nrmse, all_phi_std_ratio = [], [], []
+    all_phi_mac, all_phi_nrmse, all_phi_a = [], [], []
     all_peak_shift_hz, all_peak_amp_rel = [], []
     all_pred_peak_freq, all_true_peak_freq = [], []
 
-    omega_max = float(CONFIG['omega_max'])
-
     for idx in range(len(testset)):
-        sn, sr = testset[idx], testset_raw[idx]
-        gb = build_single_graph(sn)
-        true_phi = sn['modal_phi'].to(device)
-        true_zeta = sn['modal_zeta'].to(device)
-        true_omega = sn['modal_omega_phys'].to(device)
+        sn = testset[idx]
+        sr = testset_raw[idx]
+
+        batch_vec = torch.zeros(sn["points"].shape[0], dtype=torch.long, device=device)
+        node_features = sn["node_features"].to(device)
+        edge_index = sn["edge_index"].to(device)
+        edge_attr = sn["edge_attr"].to(device)
+        frequencies = sn["frequencies"].unsqueeze(0).to(device)
+
+        true_phi = sn["modal_phi"].to(device)
+        true_zeta = sn["modal_zeta"].to(device)
+        true_omega = sn["modal_omega_phys"].to(device)
         true_freq_hz = true_omega / (2.0 * torch.pi)
-        # 单样本推理时，global 索引就是 excitation_index
-        exc_idx = sn.get('excitation_index')
+
+        phi_exc = sn.get("modal_phi_exc")
+        phi_exc = phi_exc.unsqueeze(0).to(device) if phi_exc is not None else None
+        exc_idx = sn.get("excitation_index")
         exc_idx_global = exc_idx.unsqueeze(0).to(device) if exc_idx is not None else None
-        # 获取力方向向量
-        force_vector = sn.get('force_vector')
-        if force_vector is not None:
-            force_vector = force_vector.unsqueeze(0).to(device)
 
         with torch.no_grad():
-            frf_pred, omega_norm, zeta_pred, phi_pred = model(
-                gb['node_features'], gb['edge_index'], gb['edge_attr'], gb['batch'],
-                frequencies=gb['frequencies'],
+            frf_pred, omega_pred, log_zeta, zeta_pred, phi_pred = model(
+                node_features, edge_index, edge_attr, batch_vec,
+                frequencies=frequencies,
+                phi_exc=phi_exc,
                 excitation_index_global=exc_idx_global,
-                force_vector=force_vector,
             )
-            omega_norm = omega_norm.squeeze(0)
+            omega_pred = omega_pred.squeeze(0)
             zeta_pred = zeta_pred.squeeze(0)
-            omega_norm_sorted, sort_idx = torch.sort(omega_norm)
-            zeta_sorted = zeta_pred[sort_idx]
-            phi_sorted = phi_pred[:, sort_idx]
-            mac, nrmse, std_ratio, phi_aligned, _ = phi_metrics(phi_sorted, true_phi)
-            omega_phys_pred = omega_norm_sorted * omega_max
-            freq_hz_pred = omega_phys_pred / (2.0 * torch.pi)
+            mac, nrmse, phi_a, phi_aligned, _ = phi_metrics(phi_pred, true_phi)
+            freq_hz_pred = omega_pred / (2.0 * torch.pi)
 
         p = frf_pred.detach().cpu()
-        t = sr['point_frf'].detach().cpu()
+        t = sr["point_frf"].detach().cpu()
         pred_amp = torch.sqrt(p[..., 0] ** 2 + p[..., 1] ** 2 + EPS).numpy()
         true_amp = torch.sqrt(t[..., 0] ** 2 + t[..., 1] ** 2 + EPS).numpy()
         pred_re, pred_im = p[..., 0].numpy(), p[..., 1].numpy()
         true_re, true_im = t[..., 0].numpy(), t[..., 1].numpy()
 
         true_omega_cpu = true_omega.detach().cpu()
-        pred_omega_cpu = omega_phys_pred.detach().cpu()
+        pred_omega_cpu = omega_pred.detach().cpu()
         true_freq_cpu = true_freq_hz.detach().cpu()
         pred_freq_cpu = freq_hz_pred.detach().cpu()
         true_zeta_cpu = true_zeta.detach().cpu()
-        pred_zeta_cpu = zeta_sorted.detach().cpu()
+        pred_zeta_cpu = zeta_pred.detach().cpu()
+
         freq_rel = torch.abs(pred_freq_cpu - true_freq_cpu) / (true_freq_cpu + 1e-8)
         zeta_rel = torch.abs(pred_zeta_cpu - true_zeta_cpu) / (true_zeta_cpu + 1e-8)
 
-        freqs_phys = sr['frequencies'].numpy()
+        freqs_phys = sr["frequencies"].numpy()
         peak_shift, peak_amp_rel, pred_peak_f, true_peak_f = compute_peak_metrics(
             freqs_phys, pred_amp, true_amp, true_freq_cpu.numpy(), true_zeta_cpu.numpy()
         )
 
-        all_points.append(sr['points'].numpy())
+        all_points.append(sr["points"].numpy())
         all_freqs.append(freqs_phys)
         all_pred_amp.append(pred_amp)
         all_true_amp.append(true_amp)
@@ -215,7 +207,7 @@ def main():
         all_true_phi.append(true_phi.detach().cpu().numpy())
         all_phi_mac.append(mac.detach().cpu().numpy())
         all_phi_nrmse.append(nrmse.detach().cpu().numpy())
-        all_phi_std_ratio.append(std_ratio.detach().cpu().numpy())
+        all_phi_a.append(phi_a.detach().cpu().numpy())
         all_peak_shift_hz.append(peak_shift)
         all_peak_amp_rel.append(peak_amp_rel)
         all_pred_peak_freq.append(pred_peak_f)
@@ -229,25 +221,27 @@ def main():
     zeta_rel_all = np.stack(all_zeta_rel, axis=0)
     phi_mac_all = np.stack(all_phi_mac, axis=0)
     phi_nrmse_all = np.stack(all_phi_nrmse, axis=0)
-    phi_std_ratio_all = np.stack(all_phi_std_ratio, axis=0)
+    phi_a_all = np.stack(all_phi_a, axis=0)
     peak_shift_all = np.stack(all_peak_shift_hz, axis=0)
     peak_amp_rel_all = np.stack(all_peak_amp_rel, axis=0)
     amp_mse_vals = [np.mean((all_pred_amp[i] - all_true_amp[i]) ** 2) for i in range(len(all_pred_amp))]
     amp_l1_vals = [np.mean(np.abs(all_pred_amp[i] - all_true_amp[i])) for i in range(len(all_pred_amp))]
 
-    print('\n' + '=' * 80)
-    print('测试集汇总')
-    print('=' * 80)
+    print("\n" + "=" * 80)
+    print("Test summary")
+    print("=" * 80)
     print(f"FRF amplitude MSE mean = {np.mean(amp_mse_vals):.6e}")
     print(f"FRF amplitude L1  mean = {np.mean(amp_l1_vals):.6e}")
-    print(f"频率相对误差 mean (%) = {np.mean(freq_rel_all) * 100.0:.4f}")
-    print(f"阻尼相对误差 mean (%) = {np.mean(zeta_rel_all) * 100.0:.4f}")
-    print(f"振型 MAC mean = {np.mean(phi_mac_all):.6f}")
-    print(f"FRF 峰值频率偏移 mean (Hz) = {np.mean(peak_shift_all):.4f}")
-    print(f"FRF 峰值幅值相对误差 mean (%) = {np.mean(peak_amp_rel_all) * 100.0:.4f}")
+    print(f"Frequency relative error mean (%) = {np.mean(freq_rel_all) * 100.0:.4f}")
+    print(f"Zeta relative error mean (%) = {np.mean(zeta_rel_all) * 100.0:.4f}")
+    print(f"Mode MAC mean = {np.mean(phi_mac_all):.6f}")
+    print(f"Mode phi_n mean (%) = {np.mean(phi_nrmse_all) * 100.0:.4f}")
+    print(f"Mode phi_a mean (%) = {np.mean(phi_a_all) * 100.0:.4f}")
+    print(f"FRF peak frequency shift mean (Hz) = {np.mean(peak_shift_all):.4f}")
+    print(f"FRF peak amplitude relative error mean (%) = {np.mean(peak_amp_rel_all) * 100.0:.4f}")
 
     os.makedirs(out_dir, exist_ok=True)
-    save_path = os.path.join(out_dir, 'final_results.npz')
+    save_path = os.path.join(out_dir, "final_results.npz")
     np.savez(
         save_path,
         points=to_obj(all_points),
@@ -270,14 +264,14 @@ def main():
         true_phi=to_obj(all_true_phi),
         phi_mac=to_obj(all_phi_mac),
         phi_nrmse=to_obj(all_phi_nrmse),
-        phi_std_ratio=to_obj(all_phi_std_ratio),
+        phi_a=to_obj(all_phi_a),
         peak_shift_hz=to_obj(all_peak_shift_hz),
         peak_amp_rel=to_obj(all_peak_amp_rel),
         pred_peak_freq=to_obj(all_pred_peak_freq),
         true_peak_freq=to_obj(all_true_peak_freq),
     )
-    print(f'\n数据保存: {save_path}')
+    print(f"\nSaved: {save_path}")
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()
