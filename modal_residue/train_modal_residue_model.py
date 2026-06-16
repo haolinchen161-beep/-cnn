@@ -102,9 +102,16 @@ class ModalResidueNet(nn.Module):
             nn.Linear(hidden, hidden), nn.LayerNorm(hidden), nn.SiLU(),
             nn.Linear(hidden, hidden), nn.LayerNorm(hidden), nn.SiLU(),
         )
-        self.glob = nn.Sequential(nn.Linear(2 * hidden, hidden), nn.SiLU(), nn.Linear(hidden, hidden), nn.SiLU())
+        self.glob = nn.Sequential(
+            nn.Linear(2 * hidden, hidden), nn.SiLU(),
+            nn.Linear(hidden, hidden), nn.SiLU(),
+        )
         self.omega = nn.Sequential(nn.Linear(hidden, hidden), nn.SiLU(), nn.Linear(hidden, n_modes))
-        self.residue = nn.Sequential(nn.Linear(2 * hidden, hidden), nn.SiLU(), nn.Linear(hidden, hidden), nn.SiLU(), nn.Linear(hidden, n_modes))
+        self.residue = nn.Sequential(
+            nn.Linear(2 * hidden, hidden), nn.SiLU(),
+            nn.Linear(hidden, hidden), nn.SiLU(),
+            nn.Linear(hidden, n_modes),
+        )
 
     def forward(self, x: torch.Tensor, q: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         h = self.node(x)
@@ -142,7 +149,10 @@ def norm_targets(t: Dict[str, torch.Tensor], stats: Dict[str, np.ndarray], q: to
 
 def denorm(om_n: torch.Tensor, rz_n: torch.Tensor, stats: Dict[str, np.ndarray]):
     dev = om_n.device
-    om = torch.exp(om_n * torch.as_tensor(stats["omega_log_std"], device=dev) + torch.as_tensor(stats["omega_log_mean"], device=dev))
+    om = torch.exp(
+        om_n * torch.as_tensor(stats["omega_log_std"], device=dev)
+        + torch.as_tensor(stats["omega_log_mean"], device=dev)
+    )
     rz = rz_n * torch.as_tensor(stats["residue_std"], device=dev) + torch.as_tensor(stats["residue_mean"], device=dev)
     return om, rz
 
@@ -160,11 +170,39 @@ def rand_query(n: int, k: int, device: torch.device) -> torch.Tensor:
     return torch.randperm(n, device=device)[:k]
 
 
+def triplet_percent(values: List[np.ndarray]) -> Tuple[float, float, float]:
+    """Return [mean, max, rms] in percent for compact logging."""
+    if not values:
+        return 0.0, 0.0, 0.0
+    v = np.concatenate([np.asarray(x, dtype=np.float64).reshape(-1) for x in values])
+    v = v[np.isfinite(v)]
+    if v.size == 0:
+        return 0.0, 0.0, 0.0
+    return float(v.mean()), float(v.max()), float(np.sqrt(np.mean(v * v)))
+
+
+def fmt_triplet(t: Tuple[float, float, float], ndigits: int = 1) -> str:
+    return "/".join(f"{x:.{ndigits}f}" for x in t)
+
+
+def fmt_loss(v: float) -> str:
+    return f"{v:.1f}" if abs(v) >= 0.1 else f"{v:.3e}"
+
+
+def row_add_triplet(row: Dict[str, float], prefix: str, t: Tuple[float, float, float]) -> None:
+    row[f"{prefix}_mean_pct"] = t[0]
+    row[f"{prefix}_max_pct"] = t[1]
+    row[f"{prefix}_rms_pct"] = t[2]
+
+
 def train_epoch(model, ds, opt, stats, args, device):
     model.train()
     order = list(range(len(ds)))
     random.shuffle(order)
     sums = np.zeros(4, dtype=np.float64)
+    omega_errs: List[np.ndarray] = []
+    phi_errs: List[np.ndarray] = []
+
     for i in order:
         t = to_tensors(ds[i], stats, device)
         q = rand_query(t["x"].shape[0], args.query_nodes, device)
@@ -180,39 +218,107 @@ def train_epoch(model, ds, opt, stats, args, device):
             true = torch.complex(t["frf"][q, :, 0], t["frf"][q, :, 1])
             loss_f = nn.functional.mse_loss(torch.log10(torch.abs(pred) + 1e-20), torch.log10(torch.abs(true) + 1e-20))
             loss = loss + args.frf_loss_weight * loss_f
+
+        with torch.no_grad():
+            om_phys, rz_phys = denorm(om_p.detach(), rz_p.detach(), stats)
+            w_rel = torch.abs(om_phys - t["omega"]) / torch.clamp(torch.abs(t["omega"]), min=1e-12) * 100.0
+            rz_true = t["residue"][q]
+            phi_rel = torch.linalg.norm(rz_phys - rz_true, dim=0) / torch.clamp(torch.linalg.norm(rz_true, dim=0), min=1e-20) * 100.0
+            omega_errs.append(w_rel.detach().cpu().numpy())
+            phi_errs.append(phi_rel.detach().cpu().numpy())
+
         opt.zero_grad(set_to_none=True)
         loss.backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+        torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip_norm)
         opt.step()
-        sums += np.array([float(loss.detach().cpu()), float(loss_om.detach().cpu()), float(loss_rz.detach().cpu()), float(loss_f.detach().cpu())])
-    return sums / max(len(order), 1)
+        sums += np.array([
+            float(loss.detach().cpu()),
+            float(loss_om.detach().cpu()),
+            float(loss_rz.detach().cpu()),
+            float(loss_f.detach().cpu()),
+        ])
+
+    metrics = {
+        "w_triplet": triplet_percent(omega_errs),
+        "phiN_triplet": triplet_percent(phi_errs),
+    }
+    return sums / max(len(order), 1), metrics
 
 
 @torch.no_grad()
 def evaluate(model, ds, stats, args, device):
     model.eval()
     rows: List[Dict[str, float]] = []
+    omega_errs: List[np.ndarray] = []
+    phi_errs: List[np.ndarray] = []
+    frf_errs: List[float] = []
+
     for i in range(len(ds)):
         t = to_tensors(ds[i], stats, device)
         q = rand_query(t["x"].shape[0], args.eval_query_nodes, device)
         om_n, rz_n = model(t["x"], q)
         om, rz = denorm(om_n, rz_n, stats)
-        om_err = torch.mean(torch.abs(om - t["omega"]) / torch.clamp(torch.abs(t["omega"]), min=1e-12))
-        rz_err = torch.linalg.norm(rz - t["residue"][q]) / torch.clamp(torch.linalg.norm(t["residue"][q]), min=1e-20)
+
+        w_rel = torch.abs(om - t["omega"]) / torch.clamp(torch.abs(t["omega"]), min=1e-12) * 100.0
+        rz_true = t["residue"][q]
+        phi_rel = torch.linalg.norm(rz - rz_true, dim=0) / torch.clamp(torch.linalg.norm(rz_true, dim=0), min=1e-20) * 100.0
+
         pred = frf_from_modal(om, t["zeta"], rz, t["freq"])
         true = torch.complex(t["frf"][q, :, 0], t["frf"][q, :, 1])
         frf_err = torch.linalg.norm(pred - true) / torch.clamp(torch.linalg.norm(true), min=1e-20)
-        rows.append({"sample": i, "omega_rel": float(om_err.cpu()), "residue_rel_l2": float(rz_err.cpu()), "frf_rel_l2": float(frf_err.cpu())})
-    mean = {k: float(np.mean([r[k] for r in rows])) for k in ["omega_rel", "residue_rel_l2", "frf_rel_l2"]} if rows else {}
+
+        w_np = w_rel.detach().cpu().numpy()
+        phi_np = phi_rel.detach().cpu().numpy()
+        omega_errs.append(w_np)
+        phi_errs.append(phi_np)
+        frf_errs.append(float(frf_err.cpu()))
+
+        row = {"sample": i, "frf_rel_l2": float(frf_err.cpu())}
+        row_add_triplet(row, "w", triplet_percent([w_np]))
+        row_add_triplet(row, "phiN", triplet_percent([phi_np]))
+        rows.append(row)
+
+    w_triplet = triplet_percent(omega_errs)
+    phi_triplet = triplet_percent(phi_errs)
+    mean = {
+        "w_triplet": w_triplet,
+        "phiN_triplet": phi_triplet,
+        "frf_rel_l2": float(np.mean(frf_errs)) if frf_errs else 0.0,
+        "omega_rel": w_triplet[0] / 100.0,
+        "residue_rel_l2": phi_triplet[0] / 100.0,
+    }
     return mean, rows
 
 
 def write_csv(path: Path, rows: List[Dict[str, float]]) -> None:
     if not rows:
         return
+    keys = list(rows[0].keys())
     with open(path, "w", newline="", encoding="utf-8-sig") as f:
-        w = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
-        w.writeheader(); w.writerows(rows)
+        w = csv.DictWriter(f, fieldnames=keys)
+        w.writeheader()
+        w.writerows(rows)
+
+
+def append_csv_row(path: Path, row: Dict[str, float]) -> None:
+    exists = path.exists()
+    with open(path, "a", newline="", encoding="utf-8-sig") as f:
+        w = csv.DictWriter(f, fieldnames=list(row.keys()))
+        if not exists:
+            w.writeheader()
+        w.writerow(row)
+
+
+def checkpoint_payload(model, stats, in_dim, n_modes, args, epoch, best_value):
+    return {
+        "model": model.state_dict(),
+        "stats": stats,
+        "in_dim": in_dim,
+        "n_modes": n_modes,
+        "epoch": epoch,
+        "best_val_frf_rel_l2": best_value,
+        "args": {k: str(v) if isinstance(v, Path) else v for k, v in vars(args).items()},
+    }
 
 
 def main():
@@ -226,13 +332,23 @@ def main():
     p.add_argument("--lr", type=float, default=1e-3)
     p.add_argument("--weight-decay", type=float, default=1e-5)
     p.add_argument("--frf-loss-weight", type=float, default=0.05)
+    p.add_argument("--grad-clip-norm", type=float, default=1.0)
+    p.add_argument("--log-every", type=int, default=10)
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     args = p.parse_args()
+
     seed_all(args.seed)
     args.out_dir.mkdir(parents=True, exist_ok=True)
+    log_csv = args.out_dir / "training_log.csv"
+    if log_csv.exists():
+        log_csv.unlink()
+
     device = torch.device(args.device)
-    train, val, test = H5Split(args.data_dir, "train"), H5Split(args.data_dir, "val"), H5Split(args.data_dir, "test")
+    train = H5Split(args.data_dir, "train")
+    val = H5Split(args.data_dir, "val")
+    test = H5Split(args.data_dir, "test")
+
     stats = compute_stats(train)
     np.savez(args.out_dir / "normalization_stats.npz", **stats)
     first = train[0]
@@ -241,27 +357,72 @@ def main():
     model = ModalResidueNet(in_dim, n_modes, args.hidden).to(device)
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=max(args.epochs, 1))
+
     best = float("inf")
-    hist = []
+    hist: List[Dict[str, float]] = []
     print(f">>> data={args.data_dir}, train/val/test={len(train)}/{len(val)}/{len(test)}, device={device}")
+
     for ep in range(1, args.epochs + 1):
-        tr = train_epoch(model, train, opt, stats, args, device)
+        tr_loss, tr_m = train_epoch(model, train, opt, stats, args, device)
         sched.step()
         va, _ = evaluate(model, val, stats, args, device)
-        hist.append({"epoch": ep, "train_loss": tr[0], "train_omega": tr[1], "train_residue": tr[2], "train_frf": tr[3], **{f"val_{k}": v for k, v in va.items()}})
+
         if va["frf_rel_l2"] < best:
             best = va["frf_rel_l2"]
-            torch.save({"model": model.state_dict(), "stats": stats, "in_dim": in_dim, "n_modes": n_modes, "args": vars(args)}, args.out_dir / "best_model.pt")
-        if ep == 1 or ep % 10 == 0 or ep == args.epochs:
-            print(f"ep {ep:04d} loss={tr[0]:.3e} om={tr[1]:.3e} rz={tr[2]:.3e} frf={tr[3]:.3e} | val om={va['omega_rel']:.3e} rz={va['residue_rel_l2']:.3e} frf={va['frf_rel_l2']:.3e}")
+            torch.save(checkpoint_payload(model, stats, in_dim, n_modes, args, ep, best), args.out_dir / "best_model.pt")
+        torch.save(checkpoint_payload(model, stats, in_dim, n_modes, args, ep, best), args.out_dir / "last_model.pt")
+
+        row: Dict[str, float] = {
+            "epoch": ep,
+            "lr": float(opt.param_groups[0]["lr"]),
+            "loss": float(tr_loss[0]),
+            "loss_omega": float(tr_loss[1]),
+            "loss_phiN": float(tr_loss[2]),
+            "loss_frf": float(tr_loss[3]),
+            "val_frf_rel_l2": float(va["frf_rel_l2"]),
+        }
+        row_add_triplet(row, "train_w", tr_m["w_triplet"])
+        row_add_triplet(row, "train_phiN", tr_m["phiN_triplet"])
+        row_add_triplet(row, "val_w", va["w_triplet"])
+        row_add_triplet(row, "val_phiN", va["phiN_triplet"])
+        hist.append(row)
+        append_csv_row(log_csv, row)
+
+        if ep == 1 or ep % max(args.log_every, 1) == 0 or ep == args.epochs:
+            print(
+                f"Epoch {ep:4d} | "
+                f"w=[{fmt_triplet(tr_m['w_triplet'], 1)}]%  "
+                f"phiN=[{fmt_triplet(tr_m['phiN_triplet'], 1)}]%"
+                f"loss={fmt_loss(float(tr_loss[0]))}"
+            )
+            print(
+                f"Val modal | "
+                f"w=[{fmt_triplet(va['w_triplet'], 3)}]%  "
+                f"phiN=[{fmt_triplet(va['phiN_triplet'], 1)}]%"
+            )
+
     write_csv(args.out_dir / "history.csv", hist)
+
     ckpt = torch.load(args.out_dir / "best_model.pt", map_location=device)
     model.load_state_dict(ckpt["model"])
     va, vr = evaluate(model, val, stats, args, device)
     te, tr = evaluate(model, test, stats, args, device)
     write_csv(args.out_dir / "val_metrics.csv", vr)
     write_csv(args.out_dir / "test_metrics.csv", tr)
-    summary = {"best_val_frf_rel_l2": best, "val": va, "test": te}
+
+    summary = {
+        "best_val_frf_rel_l2": best,
+        "val": {
+            "w_mean_max_rms_pct": list(va["w_triplet"]),
+            "phiN_mean_max_rms_pct": list(va["phiN_triplet"]),
+            "frf_rel_l2": va["frf_rel_l2"],
+        },
+        "test": {
+            "w_mean_max_rms_pct": list(te["w_triplet"]),
+            "phiN_mean_max_rms_pct": list(te["phiN_triplet"]),
+            "frf_rel_l2": te["frf_rel_l2"],
+        },
+    }
     with open(args.out_dir / "summary.json", "w", encoding="utf-8") as f:
         json.dump(summary, f, indent=2, ensure_ascii=False)
     print(json.dumps(summary, indent=2, ensure_ascii=False))
