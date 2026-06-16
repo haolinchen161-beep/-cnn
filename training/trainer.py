@@ -135,9 +135,25 @@ def train(args, config, model_cfg, net, dataloader, optimizer, valloader,
                 if progress_interval > 0 and (step == 1 or step % progress_interval == 0 or step == total_batches):
                     elapsed = time.time() - t0
                     avg = elapsed / max(step, 1)
+                    w_now = metrics["freq_percent"].detach().cpu().numpy()
+                    mac_now = metrics["mac"].detach().cpu().numpy()
+                    phi_amp_now = metrics["phi_amp_percent"].detach().cpu().numpy()
+                    if phase["compute_phi"]:
+                        metric_text = (
+                            f"w=[{_format_vec(w_now, 2)}]% mean={np.mean(w_now):.2f}% | "
+                            f"MAC=[{_format_vec(mac_now, 3)}] | "
+                            f"phiA=[{_format_vec(phi_amp_now, 1)}]% | "
+                            f"Lw={float(metrics['loss_omega'].cpu()):.4g} Lphi={float(metrics['loss_phi'].cpu()):.4g}"
+                        )
+                    else:
+                        metric_text = (
+                            f"w=[{_format_vec(w_now, 2)}]% mean={np.mean(w_now):.2f}% | "
+                            f"Lw={float(metrics['loss_omega'].cpu()):.4g}"
+                        )
                     _log(
                         f"Epoch {epoch:04d} | {phase['phase']} | batch {step}/{total_batches} | "
-                        f"loss={losses[-1]:.4g} | avg={avg:.2f}s/batch | elapsed={elapsed:.1f}s",
+                        f"loss={losses[-1]:.4g} | {metric_text} | "
+                        f"avg={avg:.2f}s/batch | elapsed={elapsed:.1f}s",
                         logger,
                     )
 
