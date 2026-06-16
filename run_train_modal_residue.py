@@ -13,6 +13,7 @@
 """
 from __future__ import annotations
 
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -46,9 +47,44 @@ FRF_LOSS_WEIGHT = 0.05
 LOG_EVERY = 10
 SEED = 42
 
-# DEVICE 可选："cuda"、"cpu"。
-# 如果写成 "auto"，会交给 train_modal_residue_model.py 自动选择。
-DEVICE = "cuda"
+# DEVICE 可选："auto"、"cuda"、"cpu"。
+# auto：由训练脚本自动选择；有 CUDA 就用 CUDA。
+# 如果出现 nvrtc-builtins64_121.dll 找不到，可先改成 "cpu" 验证训练流程。
+DEVICE = "auto"
+
+
+# ===================== CUDA DLL 路径修复 =====================
+def prepare_cuda_dll_path() -> None:
+    """把常见 PyTorch/CUDA DLL 目录加入 PATH，避免 Windows 下 nvrtc DLL 找不到。"""
+    py_root = Path(sys.executable).resolve().parent
+    candidates = [
+        py_root,
+        py_root / "Library" / "bin",
+        py_root / "Lib" / "site-packages" / "torch" / "lib",
+        py_root / "Lib" / "site-packages" / "nvidia" / "cuda_nvrtc" / "bin",
+        py_root / "Lib" / "site-packages" / "nvidia" / "cuda_runtime" / "bin",
+    ]
+
+    existing = [str(p) for p in candidates if p.exists()]
+    if existing:
+        old_path = os.environ.get("PATH", "")
+        os.environ["PATH"] = os.pathsep.join(existing + [old_path])
+        if hasattr(os, "add_dll_directory"):
+            for p in existing:
+                try:
+                    os.add_dll_directory(p)
+                except OSError:
+                    pass
+
+    dll_name = "nvrtc-builtins64_121.dll"
+    found = []
+    for root in candidates:
+        if root.exists():
+            found.extend(root.rglob(dll_name))
+    if found:
+        print(f">>> 找到 {dll_name}: {found[0]}")
+    else:
+        print(f">>> 警告: 未在当前 Python 环境中找到 {dll_name}。如果 CUDA 训练失败，请修复 PyTorch/CUDA 安装或把 DEVICE 改成 'cpu'。")
 
 
 # ===================== 辅助函数 =====================
@@ -59,6 +95,8 @@ def run_cmd(cmd: list[str]) -> None:
 
 
 def main() -> None:
+    prepare_cuda_dll_path()
+
     if not TRAIN_SCRIPT.exists():
         raise FileNotFoundError(f"找不到训练脚本: {TRAIN_SCRIPT}")
     if VALIDATE_BEFORE_TRAIN and not VALIDATE_SCRIPT.exists():
