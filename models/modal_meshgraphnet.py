@@ -10,6 +10,12 @@ DEFAULT_EDGE_FEATURE_DIM = 4
 
 
 class MLP(nn.Module):
+    """与旧 gnn-meshgraphnet-refactor 分支一致的轻量 MLP。
+
+    隐藏层只做 Linear + GELU + Dropout，不在每个隐藏层后做 LayerNorm。
+    对 10 万级边数的图来说，隐藏层 LayerNorm 会明显拖慢训练。
+    """
+
     def __init__(self,
                  in_dim: int,
                  hidden_dim: int,
@@ -17,25 +23,27 @@ class MLP(nn.Module):
                  n_layers: int = 2,
                  dropout: float = 0.0,
                  layer_norm: bool = True,
-                 final_layer_norm: bool = True):
+                 final_zero: bool = False):
         super().__init__()
         layers = []
         d = in_dim
         for _ in range(max(0, n_layers - 1)):
             layers.append(nn.Linear(d, hidden_dim))
-            if layer_norm:
-                layers.append(nn.LayerNorm(hidden_dim))
             layers.append(nn.GELU())
             if dropout > 0:
                 layers.append(nn.Dropout(dropout))
             d = hidden_dim
         layers.append(nn.Linear(d, out_dim))
-        if final_layer_norm:
-            layers.append(nn.LayerNorm(out_dim))
         self.net = nn.Sequential(*layers)
+        self.norm = nn.LayerNorm(out_dim) if layer_norm else nn.Identity()
+
+        if final_zero:
+            with torch.no_grad():
+                nn.init.zeros_(self.net[-1].weight)
+                nn.init.zeros_(self.net[-1].bias)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.net(x)
+        return self.norm(self.net(x))
 
 
 class MeshGraphBlock(nn.Module):
@@ -43,8 +51,8 @@ class MeshGraphBlock(nn.Module):
 
     def __init__(self, hidden_dim: int, dropout: float = 0.0):
         super().__init__()
-        self.edge_mlp = MLP(hidden_dim * 3, hidden_dim, hidden_dim, n_layers=2, dropout=dropout)
-        self.node_mlp = MLP(hidden_dim * 2, hidden_dim, hidden_dim, n_layers=2, dropout=dropout)
+        self.edge_mlp = MLP(hidden_dim * 3, hidden_dim, hidden_dim, n_layers=2, dropout=dropout, layer_norm=True)
+        self.node_mlp = MLP(hidden_dim * 2, hidden_dim, hidden_dim, n_layers=2, dropout=dropout, layer_norm=True)
 
     def forward(self, h: torch.Tensor, edge_index: torch.Tensor, e: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         if edge_index.numel() == 0:
@@ -153,10 +161,10 @@ class MeshModalNet(nn.Module):
         self.hidden = hidden
         self.n_modes = int(n_modes)
 
-        self.node_encoder = MLP(node_in_dim, hidden, hidden, n_layers=3, dropout=dropout)
-        self.edge_encoder = MLP(edge_in_dim, hidden, hidden, n_layers=3, dropout=dropout)
+        self.node_encoder = MLP(node_in_dim, hidden, hidden, n_layers=3, dropout=dropout, layer_norm=True)
+        self.edge_encoder = MLP(edge_in_dim, hidden, hidden, n_layers=3, dropout=dropout, layer_norm=True)
         self.blocks = nn.ModuleList([MeshGraphBlock(hidden, dropout=dropout) for _ in range(n_layers)])
-        self.global_proj = MLP(hidden * 2, hidden, hidden, n_layers=2, dropout=dropout)
+        self.global_proj = MLP(hidden * 2, hidden, hidden, n_layers=2, dropout=dropout, layer_norm=True)
         self.omega_head = OmegaHead(hidden, n_modes=self.n_modes)
         self.phi_decoder = ModeShapeZDecoder(hidden, n_modes=self.n_modes, dropout=dropout)
 
@@ -185,7 +193,6 @@ class MeshModalNet(nn.Module):
         return {
             "omega": omega,
             "phi_z": phi_z,
-            # 兼容旧代码：phi 现在也是 Z-only，形状为 [total_N,K]
             "phi": phi_z,
             "node_latent": h,
             "graph_latent": graph_latent,
