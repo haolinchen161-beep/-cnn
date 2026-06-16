@@ -30,11 +30,7 @@ def _log(msg: str, logger=None):
 
 
 def _move_graph_batch(batch: Dict, device: str, compute_phi: bool = False, keep_info: bool = False) -> Dict:
-    """Move only tensors required by the current phase.
-
-    Phase0 omega-only does not need phi_z, node_weight or phi_xyz on GPU.
-    This avoids unnecessary host-to-device copies for every batch.
-    """
+    """Move only tensors required by the current phase."""
     out = dict(batch)
     keys = list(BASE_TENSOR_KEYS)
     if compute_phi:
@@ -89,7 +85,8 @@ def train(args, config, model_cfg, net, dataloader, optimizer, valloader,
     total_epochs = int(config.get("epochs", 300))
     validation_frequency = int(config.get("validation_frequency", 5))
     progress_interval = int(config.get("progress_interval", 10))
-    best_score = np.inf
+    best_omega_score = np.inf
+    best_modal_score = np.inf
 
     log_path = os.path.join(args.dir, "loss_log.csv")
     log_file = open(log_path, "a", newline="", encoding="utf-8-sig")
@@ -100,7 +97,7 @@ def train(args, config, model_cfg, net, dataloader, optimizer, valloader,
             "w1%", "w2%", "w3%", "w_mean%",
             "MAC1", "MAC2", "MAC3", "phi_amp1%", "phi_amp2%", "phi_amp3%",
             "val_w1%", "val_w2%", "val_w3%", "val_w_mean%",
-            "val_MAC1", "val_MAC2", "val_MAC3", "lr", "time_s",
+            "val_MAC1", "val_MAC2", "val_MAC3", "val_omega_score", "val_modal_score", "lr", "time_s",
         ])
 
     try:
@@ -229,21 +226,33 @@ def train(args, config, model_cfg, net, dataloader, optimizer, valloader,
                     _log(
                         f"Val modal | w=[{_format_vec(val['val_w'], 2)}]% mean={val['val_w_mean']:.2f}% | "
                         f"MAC=[{_format_vec(val['val_mac'], 3)}] | phiA=[{_format_vec(val['val_phi_amp'], 1)}]% | "
-                        f"score={val['val_score']:.4g}",
+                        f"omega_score={val['val_omega_score']:.4g} modal_score={val['val_modal_score']:.4g}",
                         logger,
                     )
                 else:
                     _log(
                         f"Val omega | w=[{_format_vec(val['val_w'], 2)}]% mean={val['val_w_mean']:.2f}% | "
-                        f"score={val['val_score']:.4g}",
+                        f"omega_score={val['val_omega_score']:.4g}",
                         logger,
                     )
-                if val["val_score"] < best_score:
-                    best_score = val["val_score"]
-                    _save_model(args.dir, epoch, net, optimizer, best_score, "checkpoint_best", config, model_cfg)
+
+                if val["val_omega_score"] < best_omega_score:
+                    best_omega_score = val["val_omega_score"]
+                    _save_model(args.dir, epoch, net, optimizer, best_omega_score, "checkpoint_best_omega", config, model_cfg)
+                    if not phase["compute_phi"]:
+                        _save_model(args.dir, epoch, net, optimizer, best_omega_score, "checkpoint_best", config, model_cfg)
+                    _log(f"best omega model: val_freq_mean={best_omega_score:.4g}%", logger)
+
+                if phase["compute_phi"] and val["val_modal_score"] < best_modal_score:
+                    best_modal_score = val["val_modal_score"]
+                    _save_model(args.dir, epoch, net, optimizer, best_modal_score, "checkpoint_best_modal", config, model_cfg)
+                    _save_model(args.dir, epoch, net, optimizer, best_modal_score, "checkpoint_best", config, model_cfg)
+                    _log(f"best modal model: modal_score={best_modal_score:.4g}", logger)
+
                 if scheduler is not None:
                     try:
-                        scheduler.step(val["val_score"])
+                        scheduler_score = val["val_modal_score"] if phase["compute_phi"] else val["val_omega_score"]
+                        scheduler.step(scheduler_score)
                     except TypeError:
                         scheduler.step()
 
@@ -255,6 +264,8 @@ def train(args, config, model_cfg, net, dataloader, optimizer, valloader,
                 *[f"{x:.4f}" for x in val.get("val_w", np.zeros(3))],
                 f"{val.get('val_w_mean', 0.0):.4f}",
                 *[f"{x:.6f}" for x in val.get("val_mac", np.zeros(3))],
+                f"{val.get('val_omega_score', 0.0):.6f}",
+                f"{val.get('val_modal_score', 0.0):.6f}",
                 f"{lr:.6e}", f"{dt:.2f}",
             ])
             log_file.flush()
@@ -304,10 +315,9 @@ def evaluate(args, config, net, dataloader, logger=None, epoch=None, compute_phi
     val_w = (freq_sum / max(n_seen, 1)).detach().cpu().numpy()
     val_mac = (mac_sum / max(n_seen, 1)).detach().cpu().numpy()
     val_phi_amp = (phi_amp_sum / max(n_seen, 1)).detach().cpu().numpy()
-    if compute_phi:
-        val_score = float(val_w.mean() + (1.0 - val_mac.mean()) * 100.0 + 0.05 * val_phi_amp.mean())
-    else:
-        val_score = float(val_w.mean())
+    val_omega_score = float(val_w.mean())
+    val_modal_score = float(val_omega_score + (1.0 - val_mac.mean()) * 100.0 + 0.05 * val_phi_amp.mean()) if compute_phi else np.inf
+    val_score = val_modal_score if compute_phi else val_omega_score
 
     if was_training:
         net.train()
@@ -317,12 +327,15 @@ def evaluate(args, config, net, dataloader, logger=None, epoch=None, compute_phi
         "val_w_mean": float(val_w.mean()),
         "val_mac": val_mac,
         "val_phi_amp": val_phi_amp,
+        "val_omega_score": val_omega_score,
+        "val_modal_score": val_modal_score,
         "val_score": val_score,
     }
     if verbose:
         _log(
             f"Eval | w=[{_format_vec(val_w, 2)}]% mean={val_w.mean():.2f}% | "
-            f"MAC=[{_format_vec(val_mac, 3)}] | phiA=[{_format_vec(val_phi_amp, 1)}]% | score={val_score:.4g}",
+            f"MAC=[{_format_vec(val_mac, 3)}] | phiA=[{_format_vec(val_phi_amp, 1)}]% | "
+            f"omega_score={val_omega_score:.4g} modal_score={val_modal_score:.4g}",
             logger,
         )
     return res
