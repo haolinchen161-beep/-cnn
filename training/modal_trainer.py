@@ -23,6 +23,17 @@ def _loss_kwargs(cfg):
     }
 
 
+def _epoch_cfg(cfg, epoch: int):
+    ecfg = dict(cfg)
+    omega_pretrain_epochs = int(cfg.get("omega_pretrain_epochs", 20))
+    if epoch < omega_pretrain_epochs:
+        ecfg["phi_weight"] = 0.0
+        ecfg["phase_name"] = "omega-only"
+    else:
+        ecfg["phase_name"] = "omega+phi_z"
+    return ecfg
+
+
 def _use_amp(device, cfg):
     return str(device).startswith("cuda") and bool(cfg.get("fp16", True))
 
@@ -42,14 +53,16 @@ def train_modal(args, cfg, model, train_loader, val_loader=None):
     last_path = os.path.join(args.dir, "checkpoint_last.pt")
     best = float("inf")
     validation_frequency = int(cfg.get("validation_frequency", 5))
+    total_epochs = int(cfg.get("epochs", 200))
 
-    for epoch in range(int(cfg.get("epochs", 200))):
+    for epoch in range(total_epochs):
+        ecfg = _epoch_cfg(cfg, epoch)
         t0 = time.time()
-        tr = run_epoch(model, train_loader, device, cfg, opt, scaler=scaler, epoch=epoch)
+        tr = run_epoch(model, train_loader, device, ecfg, opt, scaler=scaler, epoch=epoch)
         train_time = time.time() - t0
 
         print(
-            f"Epoch {epoch:04d} 训练完成 | "
+            f"Epoch {epoch:04d} 训练完成 [{ecfg['phase_name']}] | "
             f"loss={tr['loss']:.4g} freq={tr['freq_mape_percent']:.3f}% "
             f"zMAC={tr['phi_z_mac']:.4f} scale={tr['phi_z_scale']:.4f} "
             f"zRatio={tr['dir_z_ratio_mean']:.3f} wMode={tr['mode_weight_mean']:.3f} "
@@ -57,14 +70,11 @@ def train_modal(args, cfg, model, train_loader, val_loader=None):
             flush=True,
         )
 
-        should_validate = (
-            val_loader is not None
-            and (epoch % validation_frequency == 0 or epoch == int(cfg.get("epochs", 200)) - 1)
-        )
+        should_validate = val_loader is not None and (epoch % validation_frequency == 0 or epoch == total_epochs - 1)
         if should_validate:
-            va = evaluate_modal(args, cfg, model, val_loader)
+            va = evaluate_modal(args, ecfg, model, val_loader)
             print(
-                f"Epoch {epoch:04d} 验证完成 | "
+                f"Epoch {epoch:04d} 验证完成 [{ecfg['phase_name']}] | "
                 f"val={va['loss']:.4g} freq={va['freq_mape_percent']:.3f}% "
                 f"zMAC={va['phi_z_mac']:.4f} scale={va['phi_z_scale']:.4f} "
                 f"zRatio={va['dir_z_ratio_mean']:.3f} wMode={va['mode_weight_mean']:.3f}",
@@ -103,6 +113,7 @@ def run_epoch(model, loader, device, cfg, opt=None, scaler=None, epoch: int | No
     total = len(loader)
     progress_interval = int(cfg.get("progress_interval", 10))
     amp_enabled = _use_amp(device, cfg)
+    compute_phi = float(cfg.get("phi_weight", 1.0)) > 0.0
     t0 = time.time()
 
     for batch_idx, batch in enumerate(loader, start=1):
@@ -111,7 +122,7 @@ def run_epoch(model, loader, device, cfg, opt=None, scaler=None, epoch: int | No
             opt.zero_grad(set_to_none=True)
 
         with torch.cuda.amp.autocast(enabled=amp_enabled):
-            out = model(batch["node_features"], batch["edge_index"], batch["edge_attr"], batch["batch"])
+            out = model(batch["node_features"], batch["edge_index"], batch["edge_attr"], batch["batch"], compute_phi=compute_phi)
             loss, metrics = modal_loss(out, batch, **_loss_kwargs(cfg))
 
         if opt is not None:
@@ -136,7 +147,7 @@ def run_epoch(model, loader, device, cfg, opt=None, scaler=None, epoch: int | No
                 avg = elapsed / max(batch_idx, 1)
                 prefix = f"Epoch {epoch:04d}" if epoch is not None else "训练"
                 print(
-                    f"{prefix} | batch {batch_idx}/{total} | "
+                    f"{prefix} | {cfg.get('phase_name', 'train')} | batch {batch_idx}/{total} | "
                     f"loss={float(loss.detach().cpu()):.4g} | "
                     f"avg={avg:.2f}s/batch | elapsed={elapsed:.1f}s",
                     flush=True,
@@ -152,10 +163,11 @@ def evaluate_modal(args, cfg, model, loader, verbose=False):
     sums = defaultdict(float)
     n = 0
     amp_enabled = _use_amp(device, cfg)
+    compute_phi = float(cfg.get("phi_weight", 1.0)) > 0.0
     for batch in loader:
         batch = to_device(batch, device)
         with torch.cuda.amp.autocast(enabled=amp_enabled):
-            out = model(batch["node_features"], batch["edge_index"], batch["edge_attr"], batch["batch"])
+            out = model(batch["node_features"], batch["edge_index"], batch["edge_attr"], batch["batch"], compute_phi=compute_phi)
             _, metrics = modal_loss(out, batch, **_loss_kwargs(cfg))
         for k, v in metrics.items():
             sums[k] += float(v.detach().cpu())
