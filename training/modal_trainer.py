@@ -23,6 +23,10 @@ def _loss_kwargs(cfg):
     }
 
 
+def _use_amp(device, cfg):
+    return str(device).startswith("cuda") and bool(cfg.get("fp16", True))
+
+
 def train_modal(args, cfg, model, train_loader, val_loader=None):
     device = torch.device(args.device)
     model.to(device)
@@ -31,6 +35,8 @@ def train_modal(args, cfg, model, train_loader, val_loader=None):
         lr=float(cfg.get("lr", 3e-4)),
         weight_decay=float(cfg.get("weight_decay", 1e-2)),
     )
+    scaler = torch.cuda.amp.GradScaler(enabled=_use_amp(device, cfg))
+
     os.makedirs(args.dir, exist_ok=True)
     best_path = os.path.join(args.dir, "checkpoint_best.pt")
     last_path = os.path.join(args.dir, "checkpoint_last.pt")
@@ -39,7 +45,7 @@ def train_modal(args, cfg, model, train_loader, val_loader=None):
 
     for epoch in range(int(cfg.get("epochs", 200))):
         t0 = time.time()
-        tr = run_epoch(model, train_loader, device, cfg, opt, epoch=epoch)
+        tr = run_epoch(model, train_loader, device, cfg, opt, scaler=scaler, epoch=epoch)
         train_time = time.time() - t0
 
         print(
@@ -90,24 +96,35 @@ def train_modal(args, cfg, model, train_loader, val_loader=None):
     return model
 
 
-def run_epoch(model, loader, device, cfg, opt=None, epoch: int | None = None):
+def run_epoch(model, loader, device, cfg, opt=None, scaler=None, epoch: int | None = None):
     model.train(opt is not None)
     sums = defaultdict(float)
     n = 0
     total = len(loader)
     progress_interval = int(cfg.get("progress_interval", 10))
+    amp_enabled = _use_amp(device, cfg)
     t0 = time.time()
 
     for batch_idx, batch in enumerate(loader, start=1):
         batch = to_device(batch, device)
         if opt is not None:
             opt.zero_grad(set_to_none=True)
-        out = model(batch["node_features"], batch["edge_index"], batch["edge_attr"], batch["batch"])
-        loss, metrics = modal_loss(out, batch, **_loss_kwargs(cfg))
+
+        with torch.cuda.amp.autocast(enabled=amp_enabled):
+            out = model(batch["node_features"], batch["edge_index"], batch["edge_attr"], batch["batch"])
+            loss, metrics = modal_loss(out, batch, **_loss_kwargs(cfg))
+
         if opt is not None:
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), float(cfg.get("gradient_clip", 2.0)))
-            opt.step()
+            if scaler is not None and scaler.is_enabled():
+                scaler.scale(loss).backward()
+                scaler.unscale_(opt)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), float(cfg.get("gradient_clip", 2.0)))
+                scaler.step(opt)
+                scaler.update()
+            else:
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(model.parameters(), float(cfg.get("gradient_clip", 2.0)))
+                opt.step()
 
         for k, v in metrics.items():
             sums[k] += float(v.detach().cpu())
@@ -134,10 +151,12 @@ def evaluate_modal(args, cfg, model, loader, verbose=False):
     model.eval()
     sums = defaultdict(float)
     n = 0
+    amp_enabled = _use_amp(device, cfg)
     for batch in loader:
         batch = to_device(batch, device)
-        out = model(batch["node_features"], batch["edge_index"], batch["edge_attr"], batch["batch"])
-        _, metrics = modal_loss(out, batch, **_loss_kwargs(cfg))
+        with torch.cuda.amp.autocast(enabled=amp_enabled):
+            out = model(batch["node_features"], batch["edge_index"], batch["edge_attr"], batch["batch"])
+            _, metrics = modal_loss(out, batch, **_loss_kwargs(cfg))
         for k, v in metrics.items():
             sums[k] += float(v.detach().cpu())
         n += 1
