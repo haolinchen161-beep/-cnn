@@ -26,7 +26,7 @@ from typing import Dict
 import numpy as np
 import torch
 
-from .losses import modal_loss, frf_loss, branch_loss
+from .losses import modal_loss, modal_loss_z_only, frf_loss, branch_loss
 
 
 GRAPH_TENSOR_KEYS = [
@@ -110,6 +110,22 @@ def _set_phase2a_omega_tune(net):
                 p.requires_grad = True
 
 
+def _freeze_zeta_head_if_requested(net, disable_zeta_training: bool):
+    if not disable_zeta_training:
+        return
+    if hasattr(net, "zeta_head"):
+        net.zeta_head.eval()
+        for p in net.zeta_head.parameters():
+            p.requires_grad = False
+
+
+def _phi_loss_mode(config: Dict) -> str:
+    mode = str(config.get("phi_loss_mode", "xyz")).lower()
+    if mode in {"z", "z_only", "phi_z", "zonly"}:
+        return "z_only"
+    return "xyz"
+
+
 def train(args, config, model_cfg, net, dataloader, optimizer,
           valloader, scheduler=None, logger=None, start_epoch=0):
     lowest = np.inf
@@ -121,6 +137,14 @@ def train(args, config, model_cfg, net, dataloader, optimizer,
     frf_weight = float(config.get("frf_loss_weight", 0.005))
     phase2_min_epoch = int(config.get("phase2_min_epoch", 160))
     validation_frequency = int(config.get("validation_frequency", 5))
+    phi_mode = _phi_loss_mode(config)
+    loss_fn = modal_loss_z_only if phi_mode == "z_only" else modal_loss
+    disable_zeta_training = bool(config.get("disable_zeta_training", False))
+
+    if phi_mode == "z_only":
+        _log("=== Z-only phi supervision enabled: loss/metrics use phi[...,2] only ===", logger)
+    if disable_zeta_training or float(config.get("zeta_loss_weight", 10.0)) <= 0.0:
+        _log("=== Zeta supervision disabled: zeta loss/score ignored ===", logger)
 
     os.makedirs(args.dir, exist_ok=True)
     log_path = os.path.join(args.dir, "loss_log.csv")
@@ -206,6 +230,8 @@ def train(args, config, model_cfg, net, dataloader, optimizer,
                 _set_all_trainable(net)
                 net._phase2b_logged = True
 
+            _freeze_zeta_head_if_requested(net, disable_zeta_training)
+
             if in_phase0:
                 current_phi_w = 0.0
                 current_zeta_w = 0.0
@@ -213,9 +239,9 @@ def train(args, config, model_cfg, net, dataloader, optimizer,
                 kl_weight = 0.0
             else:
                 current_phi_w = float(config.get("phi_loss_weight", 3.0))
-                current_zeta_w = float(config.get("zeta_loss_weight", 10.0))
+                current_zeta_w = 0.0 if disable_zeta_training else float(config.get("zeta_loss_weight", 10.0))
                 current_omega_w = float(config.get("omega_loss_weight", 1.0))
-                kl_weight = float(config.get("branch_loss_weight", 20.0))
+                kl_weight = 0.0 if phi_mode == "z_only" else float(config.get("branch_loss_weight", 20.0))
 
             if in_phase2a:
                 current_phi_w = 0.0
@@ -244,7 +270,7 @@ def train(args, config, model_cfg, net, dataloader, optimizer,
                     else:
                         frf_pred, omega_pred, log_zeta_pred, zeta_pred, phi_pred = _forward_modal(net, batch)
 
-                    loss_m, l_w, l_z, l_p, mac_val = modal_loss(
+                    loss_m, l_w, l_z, l_p, mac_val = loss_fn(
                         omega_pred, batch["modal_omega_phys"],
                         log_zeta_pred, batch["modal_zeta"],
                         phi_pred, batch["modal_phi"],
@@ -284,7 +310,8 @@ def train(args, config, model_cfg, net, dataloader, optimizer,
                     metrics = _compute_modal_metrics(
                         omega_pred.detach(), batch["modal_omega_phys"],
                         zeta_pred.detach(), batch["modal_zeta"],
-                        phi_pred.detach(), batch["modal_phi"], batch["batch"]
+                        phi_pred.detach(), batch["modal_phi"], batch["batch"],
+                        phi_mode=phi_mode,
                     )
                     train_w.append(metrics["w"])
                     train_z.append(metrics["z"])
@@ -387,12 +414,14 @@ def evaluate(args, config, net, dataloader, logger=None, epoch=None, verbose=Tru
     modal_metrics = []
     frf_mse, amp_mae, amp_mape = [], [], []
     teacher_frf_mse, teacher_amp_mae, teacher_amp_mape = [], [], []
+    phi_mode = _phi_loss_mode(config)
+    evaluate_frf = bool(config.get("evaluate_frf", True))
 
     with torch.no_grad():
         for raw_batch in dataloader:
             batch = _move_graph_batch(raw_batch, args.device)
 
-            if torch.is_tensor(batch.get("frequencies")) and "point_frf" in batch:
+            if evaluate_frf and torch.is_tensor(batch.get("frequencies")) and "point_frf" in batch:
                 # Primary validation: self excitation, i.e. use predicted phi at excitation_index.
                 frf_pred, omega_pred, log_zeta_pred, zeta_pred, phi_pred = _forward_modal(
                     net, batch,
@@ -424,7 +453,8 @@ def evaluate(args, config, net, dataloader, logger=None, epoch=None, verbose=Tru
             modal_metrics.append(_compute_modal_metrics(
                 omega_pred, batch["modal_omega_phys"],
                 zeta_pred, batch["modal_zeta"],
-                phi_pred, batch["modal_phi"], batch["batch"]
+                phi_pred, batch["modal_phi"], batch["batch"],
+                phi_mode=phi_mode,
             ))
 
     if net_was_training:
@@ -437,7 +467,11 @@ def evaluate(args, config, net, dataloader, logger=None, epoch=None, verbose=Tru
     val_phi_a = np.mean(np.stack([m["phi_a"] for m in modal_metrics]), axis=0)
     val_dir = np.mean(np.stack([m["dir"] for m in modal_metrics]), axis=0)
 
-    val_modal_score = float(np.mean(val_w) + 0.3 * np.mean(val_z) + (1.0 - np.mean(val_mac)) * 100.0 + 0.05 * np.mean(val_phi_a))
+    zeta_score_weight = float(config.get("modal_score_zeta_weight", 0.3))
+    val_modal_score = float(
+        np.mean(val_w) + zeta_score_weight * np.mean(val_z)
+        + (1.0 - np.mean(val_mac)) * 100.0 + 0.05 * np.mean(val_phi_a)
+    )
 
     return {
         "loss (MSE)": float(np.mean(frf_mse)) if frf_mse else np.inf,
@@ -465,7 +499,7 @@ def _compute_frf_metrics(frf_pred: torch.Tensor, target: torch.Tensor):
     return mse, mae, mape
 
 
-def _compute_modal_metrics(omega_pred, omega_true, zeta_pred, zeta_true, phi_pred, phi_true, batch_idx):
+def _compute_modal_metrics(omega_pred, omega_true, zeta_pred, zeta_true, phi_pred, phi_true, batch_idx, phi_mode="xyz"):
     f_pred = omega_pred / (2.0 * torch.pi)
     f_true = omega_true / (2.0 * torch.pi)
     w = torch.mean(torch.abs(f_pred - f_true) / (f_true.abs() + 1e-8) * 100.0, dim=0)
@@ -481,6 +515,7 @@ def _compute_modal_metrics(omega_pred, omega_true, zeta_pred, zeta_true, phi_pre
         tmp[..., 2] = phi_pred
         phi_pred = tmp
 
+    phi_mode = str(phi_mode).lower()
     n_graphs = int(batch_idx.max().item()) + 1
     mac_list, phi_n_list, phi_a_list, dir_list = [], [], [], []
     for g in range(n_graphs):
@@ -488,26 +523,47 @@ def _compute_modal_metrics(omega_pred, omega_true, zeta_pred, zeta_true, phi_pre
         p = phi_pred[m]
         t = phi_true[m]
 
-        dot = torch.sum(p * t, dim=(0, 2), keepdim=True)
-        p = p * torch.sign(dot + 1e-8)
+        if phi_mode in {"z_only", "z", "phi_z", "zonly"}:
+            pz = p[..., 2]
+            tz = t[..., 2]
+            dot = torch.sum(pz * tz, dim=0, keepdim=True)
+            pz = pz * torch.sign(dot + 1e-8)
 
-        num = torch.sum(p * t, dim=(0, 2)) ** 2
-        den = torch.sum(p ** 2, dim=(0, 2)) * torch.sum(t ** 2, dim=(0, 2)) + 1e-8
-        mac = num / den
+            num = torch.sum(pz * tz, dim=0) ** 2
+            den = torch.sum(pz ** 2, dim=0) * torch.sum(tz ** 2, dim=0) + 1e-8
+            mac = num / den
 
-        rmse = torch.sqrt(torch.mean((p - t) ** 2, dim=(0, 2)))
-        t_std = torch.std(t.transpose(0, 1).reshape(t.shape[1], -1), dim=1) + 1e-8
-        phi_n = rmse / t_std * 100.0
+            rmse = torch.sqrt(torch.mean((pz - tz) ** 2, dim=0))
+            t_std = torch.std(tz, dim=0) + 1e-8
+            phi_n = rmse / t_std * 100.0
 
-        norm_p = torch.sqrt(torch.sum(p ** 2, dim=(0, 2)) + 1e-8)
-        norm_t = torch.sqrt(torch.sum(t ** 2, dim=(0, 2)) + 1e-8)
-        phi_a = torch.abs(norm_p - norm_t) / (norm_t + 1e-8) * 100.0
+            norm_p = torch.sqrt(torch.sum(pz ** 2, dim=0) + 1e-8)
+            norm_t = torch.sqrt(torch.sum(tz ** 2, dim=0) + 1e-8)
+            phi_a = torch.abs(norm_p - norm_t) / (norm_t + 1e-8) * 100.0
 
-        e_p = torch.sum(p ** 2, dim=0)
-        e_t = torch.sum(t ** 2, dim=0)
-        dir_p = torch.argmax(e_p, dim=-1)
-        dir_t = torch.argmax(e_t, dim=-1)
-        dir_acc = (dir_p == dir_t).float() * 100.0
+            # Direction classification is intentionally not a target in Z-only mode.
+            dir_acc = torch.ones_like(mac) * 100.0
+        else:
+            dot = torch.sum(p * t, dim=(0, 2), keepdim=True)
+            p = p * torch.sign(dot + 1e-8)
+
+            num = torch.sum(p * t, dim=(0, 2)) ** 2
+            den = torch.sum(p ** 2, dim=(0, 2)) * torch.sum(t ** 2, dim=(0, 2)) + 1e-8
+            mac = num / den
+
+            rmse = torch.sqrt(torch.mean((p - t) ** 2, dim=(0, 2)))
+            t_std = torch.std(t.transpose(0, 1).reshape(t.shape[1], -1), dim=1) + 1e-8
+            phi_n = rmse / t_std * 100.0
+
+            norm_p = torch.sqrt(torch.sum(p ** 2, dim=(0, 2)) + 1e-8)
+            norm_t = torch.sqrt(torch.sum(t ** 2, dim=(0, 2)) + 1e-8)
+            phi_a = torch.abs(norm_p - norm_t) / (norm_t + 1e-8) * 100.0
+
+            e_p = torch.sum(p ** 2, dim=0)
+            e_t = torch.sum(t ** 2, dim=0)
+            dir_p = torch.argmax(e_p, dim=-1)
+            dir_t = torch.argmax(e_t, dim=-1)
+            dir_acc = (dir_p == dir_t).float() * 100.0
 
         mac_list.append(mac)
         phi_n_list.append(phi_n)
