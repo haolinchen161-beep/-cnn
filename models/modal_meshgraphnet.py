@@ -39,7 +39,7 @@ class MLP(nn.Module):
 
 
 class MeshGraphBlock(nn.Module):
-    """Residual MeshGraphNet block with edge and node updates."""
+    """MeshGraphNet 残差消息传递层：先更新边特征，再聚合到节点。"""
 
     def __init__(self, hidden_dim: int, dropout: float = 0.0):
         super().__init__()
@@ -66,11 +66,10 @@ class MeshGraphBlock(nn.Module):
 
 
 class OmegaHead(nn.Module):
-    """Monotonic modal frequency head.
+    """单调频率输出头。
 
-    The first-stage setting uses n_modes=3. The implementation also supports
-    larger K by predicting f1 and positive frequency gaps in Hz, then converts
-    to rad/s.
+    先预测第一阶频率，再预测正的频率间隔，保证输出频率按阶次递增。
+    默认训练前三阶，也支持后续扩展到 K 阶。
     """
 
     def __init__(self, hidden: int, n_modes: int = 3):
@@ -101,7 +100,7 @@ class OmegaHead(nn.Module):
 
 
 class ModeShapeZDecoder(nn.Module):
-    """Decode node latent + graph latent + mode token to z-direction mode shapes."""
+    """节点隐变量 + 全局隐变量 + 模态 token → Z 向振型。"""
 
     def __init__(self, hidden: int, n_modes: int = 3, dropout: float = 0.0):
         super().__init__()
@@ -130,15 +129,14 @@ class ModeShapeZDecoder(nn.Module):
 
 
 class MeshModalNet(nn.Module):
-    """Lightweight z-only modal MeshGraphNet.
+    """轻量 Z-only MeshGraphNet 模态预测模型。
 
-    Outputs:
-        omega: [B,K] rad/s
+    输出：
+        omega: [B,K]，单位 rad/s
         phi_z: [total_N,K]
 
-    The model intentionally predicts only the z-direction mode-shape component
-    for the first-stage Z-Z FRF task. Damping and FRF reconstruction stay outside
-    the training target.
+    本阶段只预测 Z 向振型，用于先验证 Z-Z FRF 需要的核心模态分量。
+    阻尼和 FRF 重建不放在网络训练目标中。
     """
 
     def __init__(self,
@@ -187,7 +185,7 @@ class MeshModalNet(nn.Module):
         return {
             "omega": omega,
             "phi_z": phi_z,
-            # Backward-compatible alias. It is now [total_N,K], not xyz.
+            # 兼容旧代码：phi 现在也是 Z-only，形状为 [total_N,K]
             "phi": phi_z,
             "node_latent": h,
             "graph_latent": graph_latent,
