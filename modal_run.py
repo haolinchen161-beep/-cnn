@@ -13,7 +13,7 @@ from training import evaluate_modal, train_modal
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Train z-only modal MeshGraphNet")
+    parser = argparse.ArgumentParser(description="训练 Z-only MeshGraphNet 模态模型")
     parser.add_argument("--data_dir", default=os.path.join("ansys", "data"))
     parser.add_argument("--out_dir", default=os.path.join("sample", "output_modal_zonly"))
     parser.add_argument("--epochs", type=int, default=200)
@@ -71,13 +71,13 @@ def main():
     run_args = SimpleNamespace(device=args.device, dir=args.out_dir)
 
     print("=" * 80)
-    print("Z-only modal MeshGraphNet training")
-    print("Target: omega + full-node phi_z")
-    print("Damping and FRF are not trained in this stage.")
+    print("Z 向模态 MeshGraphNet 训练")
+    print("训练目标：固有频率 omega + 全节点 Z 向振型 phi_z")
+    print("本阶段不训练阻尼和 FRF。")
     print("=" * 80)
-    print(f"Device: {args.device}")
-    print(f"Data dir: {args.data_dir}")
-    print(f"Output dir: {args.out_dir}")
+    print(f"设备: {args.device}")
+    print(f"数据目录: {args.data_dir}")
+    print(f"输出目录: {args.out_dir}")
 
     trainset = GraphHDF5Dataset(["train.h5"], cfg, data_dir=args.data_dir, normalization=True, test=False)
     valset = GraphHDF5Dataset(["val.h5"], cfg, data_dir=args.data_dir, normalization=True, test=True)
@@ -88,12 +88,12 @@ def main():
     testloader = make_loader(testset, 1, False, args.seed)
 
     batch0 = next(iter(trainloader))
-    print(f"Train/Val/Test: {len(trainset)} / {len(valset)} / {len(testset)}")
-    print(f"node_features={tuple(batch0['node_features'].shape)}")
-    print(f"edge_index={tuple(batch0['edge_index'].shape)}")
-    print(f"modal_omega={tuple(batch0['modal_omega_phys'].shape)}")
-    print(f"modal_phi_z={tuple(batch0['modal_phi_z'].shape)}")
-    print(f"modal_phi_xyz for weighting={tuple(batch0['modal_phi_xyz'].shape)}")
+    print(f"训练/验证/测试样本数: {len(trainset)} / {len(valset)} / {len(testset)}")
+    print(f"节点特征: {tuple(batch0['node_features'].shape)}")
+    print(f"图边索引: {tuple(batch0['edge_index'].shape)}")
+    print(f"频率标签: {tuple(batch0['modal_omega_phys'].shape)}")
+    print(f"Z 向振型标签: {tuple(batch0['modal_phi_z'].shape)}")
+    print(f"完整三向振型仅用于加权: {tuple(batch0['modal_phi_xyz'].shape)}")
 
     model = build_geometric_model(
         encoder_kwargs={
@@ -106,12 +106,12 @@ def main():
         },
         decoder_kwargs={},
     )
-    print(f"Params: {sum(p.numel() for p in model.parameters()):,}")
+    print(f"参数量: {sum(p.numel() for p in model.parameters()):,}")
 
     model = train_modal(run_args, cfg, model, trainloader, valloader)
     metrics = evaluate_modal(run_args, cfg, model, testloader, verbose=True)
 
-    print("Final test metrics:")
+    print("最终测试指标:")
     for key in sorted(metrics):
         print(f"  {key}: {metrics[key]:.6g}")
     return 0
