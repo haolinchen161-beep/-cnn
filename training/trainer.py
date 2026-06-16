@@ -72,6 +72,10 @@ def _save_model(out_dir, epoch, net, optimizer, metric, name, config=None, model
     }, path)
 
 
+def _zero_like_metric(metrics, key):
+    return torch.zeros_like(metrics[key].detach())
+
+
 def train(args, config, model_cfg, net, dataloader, optimizer, valloader,
           scheduler=None, logger=None, start_epoch=0):
     os.makedirs(args.dir, exist_ok=True)
@@ -98,9 +102,15 @@ def train(args, config, model_cfg, net, dataloader, optimizer, valloader,
             phase = _phase_weights(config, epoch)
             net.train()
             t0 = time.time()
-            losses, omega_losses, phi_losses = [], [], []
-            freq_list, mac_list, phi_amp_list = [], [], []
             total_batches = len(dataloader)
+
+            loss_sum = None
+            omega_loss_sum = None
+            phi_loss_sum = None
+            freq_sum = None
+            mac_sum = None
+            phi_amp_sum = None
+            n_seen = 0
 
             for step, raw_batch in enumerate(dataloader, start=1):
                 optimizer.zero_grad(set_to_none=True)
@@ -125,41 +135,65 @@ def train(args, config, model_cfg, net, dataloader, optimizer, valloader,
                 scaler.step(optimizer)
                 scaler.update()
 
-                losses.append(float(metrics["loss"].cpu()))
-                omega_losses.append(float(metrics["loss_omega"].cpu()))
-                phi_losses.append(float(metrics["loss_phi"].cpu()))
-                freq_list.append(metrics["freq_percent"].detach().cpu().numpy())
-                mac_list.append(metrics["mac"].detach().cpu().numpy())
-                phi_amp_list.append(metrics["phi_amp_percent"].detach().cpu().numpy())
+                # 不在每个 batch 转 CPU，避免强制 CUDA 同步；指标先留在 GPU 上累加。
+                loss_d = metrics["loss"].detach()
+                omega_d = metrics["loss_omega"].detach()
+                phi_d = metrics["loss_phi"].detach()
+                freq_d = metrics["freq_percent"].detach()
+                mac_d = metrics["mac"].detach()
+                phi_amp_d = metrics["phi_amp_percent"].detach()
+
+                if loss_sum is None:
+                    loss_sum = torch.zeros_like(loss_d)
+                    omega_loss_sum = torch.zeros_like(omega_d)
+                    phi_loss_sum = torch.zeros_like(phi_d)
+                    freq_sum = torch.zeros_like(freq_d)
+                    mac_sum = torch.zeros_like(mac_d)
+                    phi_amp_sum = torch.zeros_like(phi_amp_d)
+
+                loss_sum = loss_sum + loss_d
+                omega_loss_sum = omega_loss_sum + omega_d
+                phi_loss_sum = phi_loss_sum + phi_d
+                freq_sum = freq_sum + freq_d
+                mac_sum = mac_sum + mac_d
+                phi_amp_sum = phi_amp_sum + phi_amp_d
+                n_seen += 1
 
                 if progress_interval > 0 and (step == 1 or step % progress_interval == 0 or step == total_batches):
                     elapsed = time.time() - t0
                     avg = elapsed / max(step, 1)
-                    w_now = metrics["freq_percent"].detach().cpu().numpy()
-                    mac_now = metrics["mac"].detach().cpu().numpy()
-                    phi_amp_now = metrics["phi_amp_percent"].detach().cpu().numpy()
+                    # 只在真正打印时同步一次。
+                    w_now = freq_d.detach().cpu().numpy()
+                    loss_now = float(loss_d.detach().cpu())
+                    omega_now = float(omega_d.detach().cpu())
                     if phase["compute_phi"]:
+                        mac_now = mac_d.detach().cpu().numpy()
+                        phi_amp_now = phi_amp_d.detach().cpu().numpy()
+                        phi_now = float(phi_d.detach().cpu())
                         metric_text = (
                             f"w=[{_format_vec(w_now, 2)}]% mean={np.mean(w_now):.2f}% | "
                             f"MAC=[{_format_vec(mac_now, 3)}] | "
                             f"phiA=[{_format_vec(phi_amp_now, 1)}]% | "
-                            f"Lw={float(metrics['loss_omega'].cpu()):.4g} Lphi={float(metrics['loss_phi'].cpu()):.4g}"
+                            f"Lw={omega_now:.4g} Lphi={phi_now:.4g}"
                         )
                     else:
                         metric_text = (
                             f"w=[{_format_vec(w_now, 2)}]% mean={np.mean(w_now):.2f}% | "
-                            f"Lw={float(metrics['loss_omega'].cpu()):.4g}"
+                            f"Lw={omega_now:.4g}"
                         )
                     _log(
                         f"Epoch {epoch:04d} | {phase['phase']} | batch {step}/{total_batches} | "
-                        f"loss={losses[-1]:.4g} | {metric_text} | "
+                        f"loss={loss_now:.4g} | {metric_text} | "
                         f"avg={avg:.2f}s/batch | elapsed={elapsed:.1f}s",
                         logger,
                     )
 
-            tr_freq = np.mean(np.stack(freq_list), axis=0)
-            tr_mac = np.mean(np.stack(mac_list), axis=0)
-            tr_phi_amp = np.mean(np.stack(phi_amp_list), axis=0)
+            tr_loss = float((loss_sum / max(n_seen, 1)).detach().cpu())
+            tr_omega_loss = float((omega_loss_sum / max(n_seen, 1)).detach().cpu())
+            tr_phi_loss = float((phi_loss_sum / max(n_seen, 1)).detach().cpu())
+            tr_freq = (freq_sum / max(n_seen, 1)).detach().cpu().numpy()
+            tr_mac = (mac_sum / max(n_seen, 1)).detach().cpu().numpy()
+            tr_phi_amp = (phi_amp_sum / max(n_seen, 1)).detach().cpu().numpy()
             dt = time.time() - t0
             lr = optimizer.param_groups[0]["lr"]
 
@@ -169,20 +203,21 @@ def train(args, config, model_cfg, net, dataloader, optimizer, valloader,
                     f"w=[{_format_vec(tr_freq, 2)}]% mean={tr_freq.mean():.2f}% | "
                     f"MAC=[{_format_vec(tr_mac, 3)}] | "
                     f"phiA=[{_format_vec(tr_phi_amp, 1)}]% | "
-                    f"loss={np.mean(losses):.4g} time={dt:.1f}s lr={lr:.2e}",
+                    f"loss={tr_loss:.4g} Lw={tr_omega_loss:.4g} Lphi={tr_phi_loss:.4g} "
+                    f"time={dt:.1f}s lr={lr:.2e}",
                     logger,
                 )
             else:
                 _log(
                     f"Epoch {epoch:4d} | {phase['phase']} | "
                     f"w=[{_format_vec(tr_freq, 2)}]% mean={tr_freq.mean():.2f}% | "
-                    f"loss={np.mean(losses):.4g} time={dt:.1f}s lr={lr:.2e}",
+                    f"loss={tr_loss:.4g} Lw={tr_omega_loss:.4g} time={dt:.1f}s lr={lr:.2e}",
                     logger,
                 )
 
             val = {}
             if (epoch % validation_frequency == 0) or (epoch == total_epochs - 1):
-                _save_model(args.dir, epoch, net, optimizer, np.mean(losses), "checkpoint_last", config, model_cfg)
+                _save_model(args.dir, epoch, net, optimizer, tr_loss, "checkpoint_last", config, model_cfg)
                 val = evaluate(args, config, net, valloader, logger=logger, epoch=epoch,
                                compute_phi=bool(phase["compute_phi"]), verbose=False)
                 if phase["compute_phi"]:
@@ -208,8 +243,8 @@ def train(args, config, model_cfg, net, dataloader, optimizer, valloader,
                         scheduler.step()
 
             writer.writerow([
-                epoch, phase["phase"], f"{np.mean(losses):.6e}",
-                f"{np.mean(omega_losses):.6e}", f"{np.mean(phi_losses):.6e}",
+                epoch, phase["phase"], f"{tr_loss:.6e}",
+                f"{tr_omega_loss:.6e}", f"{tr_phi_loss:.6e}",
                 *[f"{x:.4f}" for x in tr_freq], f"{tr_freq.mean():.4f}",
                 *[f"{x:.6f}" for x in tr_mac], *[f"{x:.4f}" for x in tr_phi_amp],
                 *[f"{x:.4f}" for x in val.get("val_w", np.zeros(3))],
@@ -227,7 +262,12 @@ def train(args, config, model_cfg, net, dataloader, optimizer, valloader,
 def evaluate(args, config, net, dataloader, logger=None, epoch=None, compute_phi=True, verbose=True):
     was_training = net.training
     net.eval()
-    freq_list, mac_list, phi_amp_list, loss_list = [], [], [], []
+    loss_sum = None
+    freq_sum = None
+    mac_sum = None
+    phi_amp_sum = None
+    n_seen = 0
+
     for raw_batch in dataloader:
         batch = _move_graph_batch(raw_batch, args.device)
         with torch.cuda.amp.autocast(enabled=bool(args.fp16)):
@@ -239,14 +279,26 @@ def evaluate(args, config, net, dataloader, logger=None, epoch=None, compute_phi
                 mac_weight=float(config.get("mac_weight", 5.0)),
                 scale_weight=float(config.get("scale_weight", 1.0)),
             )
-        loss_list.append(float(loss.cpu()))
-        freq_list.append(metrics["freq_percent"].detach().cpu().numpy())
-        mac_list.append(metrics["mac"].detach().cpu().numpy())
-        phi_amp_list.append(metrics["phi_amp_percent"].detach().cpu().numpy())
 
-    val_w = np.mean(np.stack(freq_list), axis=0)
-    val_mac = np.mean(np.stack(mac_list), axis=0)
-    val_phi_amp = np.mean(np.stack(phi_amp_list), axis=0)
+        loss_d = loss.detach()
+        freq_d = metrics["freq_percent"].detach()
+        mac_d = metrics["mac"].detach()
+        phi_amp_d = metrics["phi_amp_percent"].detach()
+        if loss_sum is None:
+            loss_sum = torch.zeros_like(loss_d)
+            freq_sum = torch.zeros_like(freq_d)
+            mac_sum = torch.zeros_like(mac_d)
+            phi_amp_sum = torch.zeros_like(phi_amp_d)
+        loss_sum = loss_sum + loss_d
+        freq_sum = freq_sum + freq_d
+        mac_sum = mac_sum + mac_d
+        phi_amp_sum = phi_amp_sum + phi_amp_d
+        n_seen += 1
+
+    val_loss = float((loss_sum / max(n_seen, 1)).detach().cpu())
+    val_w = (freq_sum / max(n_seen, 1)).detach().cpu().numpy()
+    val_mac = (mac_sum / max(n_seen, 1)).detach().cpu().numpy()
+    val_phi_amp = (phi_amp_sum / max(n_seen, 1)).detach().cpu().numpy()
     if compute_phi:
         val_score = float(val_w.mean() + (1.0 - val_mac.mean()) * 100.0 + 0.05 * val_phi_amp.mean())
     else:
@@ -255,7 +307,7 @@ def evaluate(args, config, net, dataloader, logger=None, epoch=None, compute_phi
     if was_training:
         net.train()
     res = {
-        "loss": float(np.mean(loss_list)),
+        "loss": val_loss,
         "val_w": val_w,
         "val_w_mean": float(val_w.mean()),
         "val_mac": val_mac,
