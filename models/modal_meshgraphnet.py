@@ -66,45 +66,47 @@ class MeshGraphBlock(nn.Module):
 
 
 class OmegaHead(nn.Module):
-    """Monotonic three-mode frequency head.
+    """Monotonic modal frequency head.
 
-    The dataset is filtered to the first 3 modes.  We predict f1 and positive
-    gaps in Hz, then convert to rad/s.
+    The first-stage setting uses n_modes=3. The implementation also supports
+    larger K by predicting f1 and positive frequency gaps in Hz, then converts
+    to rad/s.
     """
 
     def __init__(self, hidden: int, n_modes: int = 3):
         super().__init__()
-        if n_modes != 3:
-            raise ValueError("OmegaHead currently expects n_modes=3.")
+        self.n_modes = int(n_modes)
+        if self.n_modes < 1:
+            raise ValueError("n_modes must be positive.")
         self.mlp = nn.Sequential(
             nn.Linear(hidden, hidden),
             nn.GELU(),
             nn.Linear(hidden, hidden // 2),
             nn.GELU(),
-            nn.Linear(hidden // 2, 3),
+            nn.Linear(hidden // 2, self.n_modes),
         )
         with torch.no_grad():
             nn.init.zeros_(self.mlp[-1].weight)
-            self.mlp[-1].bias.copy_(torch.tensor([0.0, 0.0, 0.0]))
+            nn.init.zeros_(self.mlp[-1].bias)
 
     def forward(self, graph_latent: torch.Tensor) -> torch.Tensor:
         raw = self.mlp(graph_latent)
         f1 = 200.0 + 1800.0 * torch.sigmoid(raw[:, 0:1])
-        gap21 = 100.0 + 2600.0 * torch.sigmoid(raw[:, 1:2])
-        gap32 = 50.0 + 1500.0 * torch.sigmoid(raw[:, 2:3])
-        f2 = f1 + gap21
-        f3 = f2 + gap32
-        freq_hz = torch.cat([f1, f2, f3], dim=-1)
+        if self.n_modes == 1:
+            freq_hz = f1
+        else:
+            gaps = 50.0 + 2600.0 * torch.sigmoid(raw[:, 1:])
+            freq_hz = torch.cat([f1, f1 + torch.cumsum(gaps, dim=-1)], dim=-1)
         return freq_hz * (2.0 * torch.pi)
 
 
-class ModeShapeDecoder(nn.Module):
-    """Decode node latent + graph latent + mode token to full xyz mode shapes."""
+class ModeShapeZDecoder(nn.Module):
+    """Decode node latent + graph latent + mode token to z-direction mode shapes."""
 
     def __init__(self, hidden: int, n_modes: int = 3, dropout: float = 0.0):
         super().__init__()
-        self.n_modes = n_modes
-        self.mode_tokens = nn.Parameter(torch.randn(n_modes, hidden) * 0.02)
+        self.n_modes = int(n_modes)
+        self.mode_tokens = nn.Parameter(torch.randn(self.n_modes, hidden) * 0.02)
         self.decoder = nn.Sequential(
             nn.Linear(hidden * 3, hidden),
             nn.LayerNorm(hidden),
@@ -112,7 +114,7 @@ class ModeShapeDecoder(nn.Module):
             nn.Dropout(dropout),
             nn.Linear(hidden, hidden),
             nn.GELU(),
-            nn.Linear(hidden, 3),
+            nn.Linear(hidden, 1),
         )
 
     def forward(self, node_latent: torch.Tensor, graph_latent: torch.Tensor, batch: torch.Tensor) -> torch.Tensor:
@@ -124,15 +126,19 @@ class ModeShapeDecoder(nn.Module):
         mode_expand = self.mode_tokens.unsqueeze(0).expand(n, k, -1)
 
         x = torch.cat([node_expand, graph_expand, mode_expand], dim=-1)
-        return self.decoder(x.reshape(n * k, -1)).view(n, k, 3)
+        return self.decoder(x.reshape(n * k, -1)).view(n, k)
 
 
 class MeshModalNet(nn.Module):
-    """Lightweight modal-only MeshGraphNet.
+    """Lightweight z-only modal MeshGraphNet.
 
     Outputs:
-        omega: [B,3] rad/s
-        phi:   [total_N,3,3]
+        omega: [B,K] rad/s
+        phi_z: [total_N,K]
+
+    The model intentionally predicts only the z-direction mode-shape component
+    for the first-stage Z-Z FRF task. Damping and FRF reconstruction stay outside
+    the training target.
     """
 
     def __init__(self,
@@ -141,19 +147,20 @@ class MeshModalNet(nn.Module):
                  hidden: int = 128,
                  n_layers: int = 6,
                  n_modes: int = 3,
-                 dropout: float = 0.05):
+                 dropout: float = 0.05,
+                 **unused_kwargs):
         super().__init__()
         self.node_in_dim = node_in_dim
         self.edge_in_dim = edge_in_dim
         self.hidden = hidden
-        self.n_modes = n_modes
+        self.n_modes = int(n_modes)
 
         self.node_encoder = MLP(node_in_dim, hidden, hidden, n_layers=3, dropout=dropout)
         self.edge_encoder = MLP(edge_in_dim, hidden, hidden, n_layers=3, dropout=dropout)
         self.blocks = nn.ModuleList([MeshGraphBlock(hidden, dropout=dropout) for _ in range(n_layers)])
         self.global_proj = MLP(hidden * 2, hidden, hidden, n_layers=2, dropout=dropout)
-        self.omega_head = OmegaHead(hidden, n_modes=n_modes)
-        self.phi_decoder = ModeShapeDecoder(hidden, n_modes=n_modes, dropout=dropout)
+        self.omega_head = OmegaHead(hidden, n_modes=self.n_modes)
+        self.phi_decoder = ModeShapeZDecoder(hidden, n_modes=self.n_modes, dropout=dropout)
 
     def forward(self,
                 node_features: torch.Tensor,
@@ -175,11 +182,13 @@ class MeshModalNet(nn.Module):
         graph_latent = self.global_proj(torch.cat([g_mean, g_max], dim=-1))
 
         omega = self.omega_head(graph_latent)
-        phi = self.phi_decoder(h, graph_latent, batch)
+        phi_z = self.phi_decoder(h, graph_latent, batch)
 
         return {
             "omega": omega,
-            "phi": phi,
+            "phi_z": phi_z,
+            # Backward-compatible alias. It is now [total_N,K], not xyz.
+            "phi": phi_z,
             "node_latent": h,
             "graph_latent": graph_latent,
         }
