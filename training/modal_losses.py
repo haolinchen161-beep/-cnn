@@ -1,5 +1,3 @@
-from __future__ import annotations
-
 import torch
 import torch.nn.functional as F
 
@@ -26,7 +24,7 @@ def _as_phi_z(phi: torch.Tensor) -> torch.Tensor:
     raise ValueError(f"Expected phi as [N,K] or [N,K,3], got {tuple(phi.shape)}")
 
 
-def align_phi_z(pred_z: torch.Tensor, target_z: torch.Tensor, batch: torch.Tensor, node_weight: torch.Tensor | None = None) -> torch.Tensor:
+def align_phi_z(pred_z: torch.Tensor, target_z: torch.Tensor, batch: torch.Tensor, node_weight=None) -> torch.Tensor:
     """逐样本、逐模态符号对齐。模态振型整体正负号任意，因此训练前需要对齐。"""
     out = torch.empty_like(target_z)
     n_graphs = int(batch.max().item()) + 1 if batch.numel() else 0
@@ -51,7 +49,7 @@ def weighted_phi_z_terms(
     target_z: torch.Tensor,
     target_xyz: torch.Tensor,
     batch: torch.Tensor,
-    node_weight: torch.Tensor | None = None,
+    node_weight=None,
     min_mode_weight: float = 0.2,
     scale_floor_ratio: float = 0.1,
 ):
@@ -89,7 +87,6 @@ def weighted_phi_z_terms(
         true_rms = torch.sqrt(torch.sum(w_node * t ** 2, dim=0) / denom_node + EPS)
         pred_rms = torch.sqrt(torch.sum(w_node * p ** 2, dim=0) / denom_node + EPS)
 
-        # 给尺度归一化设置下限，避免非 Z 主导模态的极小 phi_z 使 loss 被过度放大。
         median_rms = torch.median(true_rms.detach()).clamp_min(EPS)
         scale_floor = scale_floor_ratio * median_rms + EPS
         scale = torch.clamp(true_rms.detach(), min=scale_floor)
