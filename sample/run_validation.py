@@ -105,11 +105,6 @@ def main():
     net = build_geometric_model(MODEL_CFG["encoder_kwargs"], MODEL_CFG["decoder_kwargs"]).to(args.device)
     print(f"Params: {sum(p.numel() for p in net.parameters()):,}", flush=True)
 
-    with torch.no_grad():
-        batch_dev = {k: (v.to(args.device) if torch.is_tensor(v) else v) for k, v in batch.items()}
-        out = net(batch_dev["node_features"], batch_dev["edge_index"], batch_dev["edge_attr"], batch_dev["batch"], compute_phi=True)
-    print(f"Init forward: omega={tuple(out['omega'].shape)}, phi_z={tuple(out['phi_z'].shape)}", flush=True)
-
     optimizer = torch.optim.AdamW(net.parameters(), **CONFIG["optimizer"]["kwargs"])
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode="min", factor=0.5, patience=6)
 
