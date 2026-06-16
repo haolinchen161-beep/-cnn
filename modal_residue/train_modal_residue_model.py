@@ -3,7 +3,6 @@ from __future__ import annotations
 import argparse
 import csv
 import json
-import math
 import random
 from pathlib import Path
 from typing import Dict, List, Tuple
@@ -45,10 +44,7 @@ class H5Split:
                 "spring_c_xyz": g["spring_c_xyz"][:].astype(np.float32),
                 "node_type": g["node_type"][:].astype(np.int64),
                 "modal_omega": g["modal_omega"][:].astype(np.float32),
-                "modal_zeta": g["modal_zeta"][:].astype(np.float32),
                 "modal_residue_z": g["modal_residue_z"][:].astype(np.float32),
-                "frequencies": g["frequencies"][:].astype(np.float32),
-                "point_frf": g["point_frf"][:].astype(np.float32),
                 "excitation_coord": g["excitation_coord"][:].astype(np.float32),
             }
 
@@ -80,6 +76,7 @@ def compute_stats(ds: H5Split) -> Dict[str, np.ndarray]:
         n += x.shape[0]
         logs.append(np.log(np.maximum(s["modal_omega"], 1e-12)))
         residues.append(s["modal_residue_z"].reshape(-1, s["modal_residue_z"].shape[-1]))
+
     xm = sx / max(n, 1)
     xs = np.sqrt(np.maximum(sx2 / max(n, 1) - xm * xm, 1e-12))
     lo = np.stack(logs, axis=0).astype(np.float32)
@@ -106,7 +103,10 @@ class ModalResidueNet(nn.Module):
             nn.Linear(2 * hidden, hidden), nn.SiLU(),
             nn.Linear(hidden, hidden), nn.SiLU(),
         )
-        self.omega = nn.Sequential(nn.Linear(hidden, hidden), nn.SiLU(), nn.Linear(hidden, n_modes))
+        self.omega = nn.Sequential(
+            nn.Linear(hidden, hidden), nn.SiLU(),
+            nn.Linear(hidden, n_modes),
+        )
         self.residue = nn.Sequential(
             nn.Linear(2 * hidden, hidden), nn.SiLU(),
             nn.Linear(hidden, hidden), nn.SiLU(),
@@ -116,11 +116,11 @@ class ModalResidueNet(nn.Module):
     def forward(self, x: torch.Tensor, q: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         h = self.node(x)
         g = self.glob(torch.cat([h.mean(dim=0), h.max(dim=0).values], dim=0))
-        om = self.omega(g)
+        omega_norm = self.omega(g)
         qh = h[q]
         gg = g.unsqueeze(0).expand(qh.shape[0], -1)
-        rz = self.residue(torch.cat([qh, gg], dim=1))
-        return om, rz
+        residue_norm = self.residue(torch.cat([qh, gg], dim=1))
+        return omega_norm, residue_norm
 
 
 def to_tensors(s: Dict[str, np.ndarray], stats: Dict[str, np.ndarray], device: torch.device) -> Dict[str, torch.Tensor]:
@@ -129,10 +129,7 @@ def to_tensors(s: Dict[str, np.ndarray], stats: Dict[str, np.ndarray], device: t
     return {
         "x": torch.from_numpy(x).to(device, non_blocking=True),
         "omega": torch.from_numpy(s["modal_omega"]).to(device, non_blocking=True),
-        "zeta": torch.from_numpy(s["modal_zeta"]).to(device, non_blocking=True),
         "residue": torch.from_numpy(s["modal_residue_z"]).to(device, non_blocking=True),
-        "freq": torch.from_numpy(s["frequencies"]).to(device, non_blocking=True),
-        "frf": torch.from_numpy(s["point_frf"]).to(device, non_blocking=True),
     }
 
 
@@ -142,41 +139,19 @@ def norm_targets(t: Dict[str, torch.Tensor], stats: Dict[str, np.ndarray], q: to
     om_s = torch.as_tensor(stats["omega_log_std"], device=dev)
     rz_m = torch.as_tensor(stats["residue_mean"], device=dev)
     rz_s = torch.as_tensor(stats["residue_std"], device=dev)
-    om = (torch.log(torch.clamp(t["omega"], min=1e-12)) - om_m) / om_s
-    rz = (t["residue"][q] - rz_m) / rz_s
-    return om, rz
+    omega_norm = (torch.log(torch.clamp(t["omega"], min=1e-12)) - om_m) / om_s
+    residue_norm = (t["residue"][q] - rz_m) / rz_s
+    return omega_norm, residue_norm
 
 
-def denorm(om_n: torch.Tensor, rz_n: torch.Tensor, stats: Dict[str, np.ndarray]):
-    dev = om_n.device
-    om = torch.exp(
-        om_n.float() * torch.as_tensor(stats["omega_log_std"], device=dev)
+def denorm(omega_norm: torch.Tensor, residue_norm: torch.Tensor, stats: Dict[str, np.ndarray]):
+    dev = omega_norm.device
+    omega = torch.exp(
+        omega_norm.float() * torch.as_tensor(stats["omega_log_std"], device=dev)
         + torch.as_tensor(stats["omega_log_mean"], device=dev)
     )
-    rz = rz_n.float() * torch.as_tensor(stats["residue_std"], device=dev) + torch.as_tensor(stats["residue_mean"], device=dev)
-    return om, rz
-
-
-def frf_from_modal_ri(omega: torch.Tensor, zeta: torch.Tensor, residue: torch.Tensor, freq_hz: torch.Tensor) -> torch.Tensor:
-    """Return real-imag FRF tensor [n_query, n_freq, 2]. No torch.complex is used.
-
-    H = sum_r A_r / (wk^2 - w^2 + j*2*zeta*wk*w)
-      = sum_r A_r * (dw - j*gm) / (dw^2 + gm^2)
-    """
-    w = (2.0 * math.pi * freq_hz.float()).view(1, -1, 1)
-    wk = omega.float().view(1, 1, -1)
-    zk = zeta.float().view(1, 1, -1)
-    a = residue.float().unsqueeze(1)
-    dw = wk.pow(2) - w.pow(2)
-    gm = 2.0 * zk * wk * w
-    denom = dw.pow(2) + gm.pow(2) + 1e-30
-    real = (a * dw / denom).sum(dim=-1)
-    imag = (-a * gm / denom).sum(dim=-1)
-    return torch.stack([real, imag], dim=-1)
-
-
-def frf_amp(frf_ri: torch.Tensor) -> torch.Tensor:
-    return torch.sqrt(torch.sum(frf_ri.float().pow(2), dim=-1) + 1e-30)
+    residue = residue_norm.float() * torch.as_tensor(stats["residue_std"], device=dev) + torch.as_tensor(stats["residue_mean"], device=dev)
+    return omega, residue
 
 
 def rand_query(n: int, k: int, device: torch.device) -> torch.Tensor:
@@ -208,11 +183,16 @@ def row_add_triplet(row: Dict[str, float], prefix: str, t: Tuple[float, float, f
     row[f"{prefix}_rms_pct"] = t[2]
 
 
+def modal_score(metrics: Dict[str, Tuple[float, float, float]]) -> float:
+    # 用验证集 modal_omega 与 modal_residue_z 的 RMS 误差作为保存最优模型的指标。
+    return float(metrics["w_triplet"][2] + metrics["phiN_triplet"][2])
+
+
 def train_epoch(model, ds, opt, scaler, stats, args, device):
     model.train()
     order = list(range(len(ds)))
     random.shuffle(order)
-    sums = np.zeros(4, dtype=np.float64)
+    sums = np.zeros(3, dtype=np.float64)
     omega_errs: List[np.ndarray] = []
     phi_errs: List[np.ndarray] = []
     amp_enabled = bool(args.fp16 and device.type == "cuda")
@@ -223,20 +203,11 @@ def train_epoch(model, ds, opt, scaler, stats, args, device):
 
         opt.zero_grad(set_to_none=True)
         with torch.cuda.amp.autocast(enabled=amp_enabled):
-            om_p, rz_p = model(t["x"], q)
-            om_t, rz_t = norm_targets(t, stats, q)
-            loss_om = nn.functional.mse_loss(om_p.float(), om_t.float())
-            loss_rz = nn.functional.mse_loss(rz_p.float(), rz_t.float())
-            loss = loss_om + loss_rz
-
-        loss_f = torch.zeros((), device=device)
-        if args.frf_loss_weight > 0:
-            # FRF loss is kept in float32 and real-imag form to avoid CUDA complex/NVRTC kernels.
-            om, rz = denorm(om_p, rz_p, stats)
-            pred = frf_from_modal_ri(om, t["zeta"], rz, t["freq"])
-            true = t["frf"][q].float()
-            loss_f = nn.functional.mse_loss(torch.log10(frf_amp(pred) + 1e-20), torch.log10(frf_amp(true) + 1e-20))
-            loss = loss + args.frf_loss_weight * loss_f
+            omega_p, residue_p = model(t["x"], q)
+            omega_t, residue_t = norm_targets(t, stats, q)
+            loss_omega = nn.functional.mse_loss(omega_p.float(), omega_t.float())
+            loss_phi = nn.functional.mse_loss(residue_p.float(), residue_t.float())
+            loss = args.omega_loss_weight * loss_omega + args.phi_loss_weight * loss_phi
 
         scaler.scale(loss).backward()
         scaler.unscale_(opt)
@@ -245,14 +216,18 @@ def train_epoch(model, ds, opt, scaler, stats, args, device):
         scaler.update()
 
         with torch.no_grad():
-            om_phys, rz_phys = denorm(om_p.detach(), rz_p.detach(), stats)
-            w_rel = torch.abs(om_phys - t["omega"]) / torch.clamp(torch.abs(t["omega"]), min=1e-12) * 100.0
-            rz_true = t["residue"][q]
-            phi_rel = torch.linalg.norm(rz_phys - rz_true, dim=0) / torch.clamp(torch.linalg.norm(rz_true, dim=0), min=1e-20) * 100.0
+            omega_phys, residue_phys = denorm(omega_p.detach(), residue_p.detach(), stats)
+            w_rel = torch.abs(omega_phys - t["omega"]) / torch.clamp(torch.abs(t["omega"]), min=1e-12) * 100.0
+            residue_true = t["residue"][q]
+            phi_rel = torch.linalg.norm(residue_phys - residue_true, dim=0) / torch.clamp(torch.linalg.norm(residue_true, dim=0), min=1e-20) * 100.0
             omega_errs.append(w_rel.detach().cpu().numpy())
             phi_errs.append(phi_rel.detach().cpu().numpy())
 
-        sums += np.array([float(loss.detach().cpu()), float(loss_om.detach().cpu()), float(loss_rz.detach().cpu()), float(loss_f.detach().cpu())])
+        sums += np.array([
+            float(loss.detach().cpu()),
+            float(loss_omega.detach().cpu()),
+            float(loss_phi.detach().cpu()),
+        ])
 
     metrics = {"w_triplet": triplet_percent(omega_errs), "phiN_triplet": triplet_percent(phi_errs)}
     return sums / max(len(order), 1), metrics
@@ -264,44 +239,34 @@ def evaluate(model, ds, stats, args, device):
     rows: List[Dict[str, float]] = []
     omega_errs: List[np.ndarray] = []
     phi_errs: List[np.ndarray] = []
-    frf_errs: List[float] = []
     amp_enabled = bool(args.fp16 and device.type == "cuda")
 
     for i in range(len(ds)):
         t = to_tensors(ds[i], stats, device)
         q = rand_query(t["x"].shape[0], args.eval_query_nodes, device)
         with torch.cuda.amp.autocast(enabled=amp_enabled):
-            om_n, rz_n = model(t["x"], q)
-        om, rz = denorm(om_n, rz_n, stats)
+            omega_n, residue_n = model(t["x"], q)
+        omega, residue = denorm(omega_n, residue_n, stats)
 
-        w_rel = torch.abs(om - t["omega"]) / torch.clamp(torch.abs(t["omega"]), min=1e-12) * 100.0
-        rz_true = t["residue"][q]
-        phi_rel = torch.linalg.norm(rz - rz_true, dim=0) / torch.clamp(torch.linalg.norm(rz_true, dim=0), min=1e-20) * 100.0
-
-        pred = frf_from_modal_ri(om, t["zeta"], rz, t["freq"])
-        true = t["frf"][q].float()
-        frf_err = torch.linalg.norm(pred - true) / torch.clamp(torch.linalg.norm(true), min=1e-20)
+        w_rel = torch.abs(omega - t["omega"]) / torch.clamp(torch.abs(t["omega"]), min=1e-12) * 100.0
+        residue_true = t["residue"][q]
+        phi_rel = torch.linalg.norm(residue - residue_true, dim=0) / torch.clamp(torch.linalg.norm(residue_true, dim=0), min=1e-20) * 100.0
 
         w_np = w_rel.detach().cpu().numpy()
         phi_np = phi_rel.detach().cpu().numpy()
         omega_errs.append(w_np)
         phi_errs.append(phi_np)
-        frf_errs.append(float(frf_err.cpu()))
 
-        row = {"sample": i, "frf_rel_l2": float(frf_err.cpu())}
+        row = {"sample": i}
         row_add_triplet(row, "w", triplet_percent([w_np]))
         row_add_triplet(row, "phiN", triplet_percent([phi_np]))
         rows.append(row)
 
-    w_triplet = triplet_percent(omega_errs)
-    phi_triplet = triplet_percent(phi_errs)
     mean = {
-        "w_triplet": w_triplet,
-        "phiN_triplet": phi_triplet,
-        "frf_rel_l2": float(np.mean(frf_errs)) if frf_errs else 0.0,
-        "omega_rel": w_triplet[0] / 100.0,
-        "residue_rel_l2": phi_triplet[0] / 100.0,
+        "w_triplet": triplet_percent(omega_errs),
+        "phiN_triplet": triplet_percent(phi_errs),
     }
+    mean["modal_score"] = modal_score(mean)
     return mean, rows
 
 
@@ -330,7 +295,7 @@ def checkpoint_payload(model, stats, in_dim, n_modes, args, epoch, best_value):
         "in_dim": in_dim,
         "n_modes": n_modes,
         "epoch": epoch,
-        "best_val_frf_rel_l2": best_value,
+        "best_modal_score": best_value,
         "args": {k: str(v) if isinstance(v, Path) else v for k, v in vars(args).items()},
     }
 
@@ -345,7 +310,8 @@ def main():
     p.add_argument("--hidden", type=int, default=192)
     p.add_argument("--lr", type=float, default=1e-3)
     p.add_argument("--weight-decay", type=float, default=1e-5)
-    p.add_argument("--frf-loss-weight", type=float, default=0.05)
+    p.add_argument("--omega-loss-weight", type=float, default=1.0)
+    p.add_argument("--phi-loss-weight", type=float, default=1.0)
     p.add_argument("--grad-clip-norm", type=float, default=1.0)
     p.add_argument("--log-every", type=int, default=10)
     p.add_argument("--fp16", action="store_true")
@@ -377,14 +343,16 @@ def main():
     best = float("inf")
     hist: List[Dict[str, float]] = []
     print(f">>> data={args.data_dir}, train/val/test={len(train)}/{len(val)}/{len(test)}, device={device}, fp16={args.fp16}")
+    print(">>> targets: modal_omega + modal_residue_z only; no point_frf is required for training.")
 
     for ep in range(1, args.epochs + 1):
         tr_loss, tr_m = train_epoch(model, train, opt, scaler, stats, args, device)
         sched.step()
         va, _ = evaluate(model, val, stats, args, device)
 
-        if va["frf_rel_l2"] < best:
-            best = va["frf_rel_l2"]
+        score = float(va["modal_score"])
+        if score < best:
+            best = score
             torch.save(checkpoint_payload(model, stats, in_dim, n_modes, args, ep, best), args.out_dir / "best_model.pt")
         torch.save(checkpoint_payload(model, stats, in_dim, n_modes, args, ep, best), args.out_dir / "last_model.pt")
 
@@ -394,8 +362,7 @@ def main():
             "loss": float(tr_loss[0]),
             "loss_omega": float(tr_loss[1]),
             "loss_phiN": float(tr_loss[2]),
-            "loss_frf": float(tr_loss[3]),
-            "val_frf_rel_l2": float(va["frf_rel_l2"]),
+            "val_modal_score": score,
         }
         row_add_triplet(row, "train_w", tr_m["w_triplet"])
         row_add_triplet(row, "train_phiN", tr_m["phiN_triplet"])
@@ -427,16 +394,16 @@ def main():
     write_csv(args.out_dir / "test_metrics.csv", tr)
 
     summary = {
-        "best_val_frf_rel_l2": best,
+        "best_modal_score": best,
         "val": {
             "w_mean_max_rms_pct": list(va["w_triplet"]),
             "phiN_mean_max_rms_pct": list(va["phiN_triplet"]),
-            "frf_rel_l2": va["frf_rel_l2"],
+            "modal_score": va["modal_score"],
         },
         "test": {
             "w_mean_max_rms_pct": list(te["w_triplet"]),
             "phiN_mean_max_rms_pct": list(te["phiN_triplet"]),
-            "frf_rel_l2": te["frf_rel_l2"],
+            "modal_score": te["modal_score"],
         },
     }
     with open(args.out_dir / "summary.json", "w", encoding="utf-8") as f:
