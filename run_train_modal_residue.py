@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-模态留数 FRF 训练入口。
+模态留数训练入口。
 
 用法：
     F:/pytorch_cuda12/python.exe -B run_train_modal_residue.py
@@ -9,7 +9,7 @@
 1. 所有常用训练参数集中放在本文件顶部；
 2. 不使用 config.yaml / json 配置文件；
 3. 先执行数据集检查，再启动训练；
-4. 真正的模型、损失、训练循环仍在 modal_residue/train_modal_residue_model.py 中。
+4. 训练目标只有 modal_omega 与 modal_residue_z，不依赖 point_frf。
 """
 from __future__ import annotations
 
@@ -43,12 +43,13 @@ LEARNING_RATE = 1e-3
 WEIGHT_DECAY = 1e-5
 GRAD_CLIP_NORM = 1.0
 
-FRF_LOSS_WEIGHT = 0.05
+OMEGA_LOSS_WEIGHT = 1.0
+PHI_LOSS_WEIGHT = 1.0
+
 LOG_EVERY = 10
 SEED = 42
 
 # DEVICE 可选："cuda"、"auto"、"cpu"。
-# 本入口默认走 CUDA。不要用 CPU 跑正式训练。
 DEVICE = "cuda"
 
 # 与 gnn-meshgraphnet-refactor 分支一致，默认开启 CUDA AMP。
@@ -57,7 +58,6 @@ FP16 = True
 
 # ===================== CUDA DLL 路径修复 =====================
 def prepare_cuda_dll_path() -> None:
-    """把常见 PyTorch/CUDA DLL 目录加入 PATH，避免 Windows 下部分 DLL 找不到。"""
     py_root = Path(sys.executable).resolve().parent
     candidates = [
         py_root,
@@ -77,16 +77,6 @@ def prepare_cuda_dll_path() -> None:
                     os.add_dll_directory(p)
                 except OSError:
                     pass
-
-    dll_name = "nvrtc-builtins64_121.dll"
-    found = []
-    for root in candidates:
-        if root.exists():
-            found.extend(root.rglob(dll_name))
-    if found:
-        print(f">>> 找到 {dll_name}: {found[0]}")
-    else:
-        print(f">>> 未找到 {dll_name}，但当前训练脚本已避免 torch.complex FRF 计算，通常不再触发 NVRTC。")
 
 
 # ===================== 辅助函数 =====================
@@ -138,8 +128,10 @@ def main() -> None:
         str(LEARNING_RATE),
         "--weight-decay",
         str(WEIGHT_DECAY),
-        "--frf-loss-weight",
-        str(FRF_LOSS_WEIGHT),
+        "--omega-loss-weight",
+        str(OMEGA_LOSS_WEIGHT),
+        "--phi-loss-weight",
+        str(PHI_LOSS_WEIGHT),
         "--grad-clip-norm",
         str(GRAD_CLIP_NORM),
         "--log-every",
