@@ -1,8 +1,3 @@
-from .modal_meshgraphnet import MeshModalNet
+from .meshgraphnet_zonly_model import MeshGraphZOnlyModel, build_geometric_model
 
-
-def build_geometric_model(encoder_kwargs=None, decoder_kwargs=None):
-    kwargs = {}
-    kwargs.update(encoder_kwargs or {})
-    kwargs.update(decoder_kwargs or {})
-    return MeshModalNet(**kwargs)
+__all__ = ["MeshGraphZOnlyModel", "build_geometric_model"]
