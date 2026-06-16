@@ -52,8 +52,8 @@ class H5Split:
             if "excitation_index" in g:
                 out["excitation_index"] = np.array(int(g["excitation_index"][()]), dtype=np.int64)
             else:
-                d = np.linalg.norm(out["points"] - out["excitation_coord"].reshape(1, 3), axis=1)
-                out["excitation_index"] = np.array(int(np.argmin(d)), dtype=np.int64)
+                dist = np.linalg.norm(out["points"] - out["excitation_coord"].reshape(1, 3), axis=1)
+                out["excitation_index"] = np.array(int(np.argmin(dist)), dtype=np.int64)
             if "local_thickness_ratio" in g:
                 out["local_thickness_ratio"] = g["local_thickness_ratio"][:].astype(np.float32)
             if "pocket_depth_ratio" in g:
@@ -62,7 +62,7 @@ class H5Split:
 
 
 def node_input(s: Dict[str, np.ndarray]) -> np.ndarray:
-    """频率模型输入不使用 excitation_coord；激励点只给 residue_head。"""
+    # omega_head 不使用 excitation_coord；激励点信息只给 residue_head。
     xyz = s["points"] / GEOM_SCALE.reshape(1, 3)
     k = np.log10(1.0 + np.maximum(s["spring_k_xyz"], 0.0)) / 8.0
     c = np.log10(1.0 + np.maximum(s["spring_c_xyz"], 0.0)) / 4.0
@@ -80,7 +80,7 @@ def compute_stats(ds: H5Split) -> Dict[str, np.ndarray]:
     se = se2 = None
     n_node = 0
     n_edge = 0
-    logs = []
+    omega_logs = []
     residues = []
 
     for i in range(len(ds)):
@@ -98,24 +98,24 @@ def compute_stats(ds: H5Split) -> Dict[str, np.ndarray]:
         se2 += (e * e).sum(axis=0)
         n_node += x.shape[0]
         n_edge += e.shape[0]
-        logs.append(np.log(np.maximum(s["modal_omega"], 1e-12)))
+        omega_logs.append(np.log(np.maximum(s["modal_omega"], 1e-12)))
         residues.append(s["modal_residue_z"].reshape(-1, s["modal_residue_z"].shape[-1]))
 
-    xm = sx / max(n_node, 1)
-    xs = np.sqrt(np.maximum(sx2 / max(n_node, 1) - xm * xm, 1e-12))
-    em = se / max(n_edge, 1)
-    es = np.sqrt(np.maximum(se2 / max(n_edge, 1) - em * em, 1e-12))
-    lo = np.stack(logs, axis=0).astype(np.float32)
-    rr = np.concatenate(residues, axis=0).astype(np.float32)
+    x_mean = sx / max(n_node, 1)
+    x_std = np.sqrt(np.maximum(sx2 / max(n_node, 1) - x_mean * x_mean, 1e-12))
+    e_mean = se / max(n_edge, 1)
+    e_std = np.sqrt(np.maximum(se2 / max(n_edge, 1) - e_mean * e_mean, 1e-12))
+    omega_log = np.stack(omega_logs, axis=0).astype(np.float32)
+    residue_all = np.concatenate(residues, axis=0).astype(np.float32)
     return {
-        "x_mean": xm.astype(np.float32),
-        "x_std": xs.astype(np.float32),
-        "edge_mean": em.astype(np.float32),
-        "edge_std": es.astype(np.float32),
-        "omega_log_mean": lo.mean(axis=0).astype(np.float32),
-        "omega_log_std": (lo.std(axis=0) + 1e-6).astype(np.float32),
-        "residue_mean": rr.mean(axis=0).astype(np.float32),
-        "residue_std": (rr.std(axis=0) + 1e-12).astype(np.float32),
+        "x_mean": x_mean.astype(np.float32),
+        "x_std": x_std.astype(np.float32),
+        "edge_mean": e_mean.astype(np.float32),
+        "edge_std": e_std.astype(np.float32),
+        "omega_log_mean": omega_log.mean(axis=0).astype(np.float32),
+        "omega_log_std": (omega_log.std(axis=0) + 1e-6).astype(np.float32),
+        "residue_mean": residue_all.mean(axis=0).astype(np.float32),
+        "residue_std": (residue_all.std(axis=0) + 1e-12).astype(np.float32),
     }
 
 
@@ -141,18 +141,25 @@ class MeshGraphBlock(nn.Module):
     def forward(self, h: torch.Tensor, e: torch.Tensor, edge_index: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         src = edge_index[0].long()
         dst = edge_index[1].long()
+
+        # autocast 下 Linear 可能输出 half，而 index_add_ 要求 self/source dtype 一致。
+        # 因此每一步显式 cast 到 residual 张量 dtype，保留 CUDA+AMP 但避免 Float/Half 冲突。
+        e = e.to(dtype=h.dtype)
         edge_in = torch.cat([h[src], h[dst], e], dim=-1)
-        e = self.edge_norm(e + self.edge_mlp(edge_in))
+        e_delta = self.edge_mlp(edge_in).to(dtype=e.dtype)
+        e = self.edge_norm(e + e_delta).to(dtype=h.dtype)
 
         msg_in = torch.cat([h[src], h[dst], e], dim=-1)
-        m = self.msg_mlp(msg_in)
-        agg = torch.zeros_like(h)
-        agg.index_add_(0, dst, m)
+        msg = self.msg_mlp(msg_in).to(dtype=h.dtype)
+        agg = torch.zeros((h.shape[0], msg.shape[1]), dtype=h.dtype, device=h.device)
+        agg.index_add_(0, dst, msg)
         deg = torch.zeros((h.shape[0], 1), dtype=h.dtype, device=h.device)
         deg.index_add_(0, dst, torch.ones((dst.shape[0], 1), dtype=h.dtype, device=h.device))
         agg = agg / torch.clamp(deg, min=1.0)
 
-        h = self.node_norm(h + self.node_mlp(torch.cat([h, agg], dim=-1)))
+        node_in = torch.cat([h, agg], dim=-1)
+        h_delta = self.node_mlp(node_in).to(dtype=h.dtype)
+        h = self.node_norm(h + h_delta).to(dtype=h.dtype)
         return h, e
 
 
@@ -166,28 +173,17 @@ class MeshGraphModalResidueNet(nn.Module):
             nn.Linear(2 * hidden, hidden), nn.LayerNorm(hidden), nn.SiLU(),
             nn.Linear(hidden, hidden), nn.LayerNorm(hidden), nn.SiLU(),
         )
-        self.omega_head = nn.Sequential(
-            nn.Linear(hidden, hidden), nn.SiLU(),
-            nn.Linear(hidden, n_modes),
-        )
-        # query h + global g + excitation h + query xyz + relative xyz
+        self.omega_head = nn.Sequential(nn.Linear(hidden, hidden), nn.SiLU(), nn.Linear(hidden, n_modes))
         self.residue_head = nn.Sequential(
             nn.Linear(3 * hidden + 6, hidden), nn.LayerNorm(hidden), nn.SiLU(),
             nn.Linear(hidden, hidden), nn.LayerNorm(hidden), nn.SiLU(),
             nn.Linear(hidden, n_modes),
         )
 
-    def forward(
-        self,
-        x: torch.Tensor,
-        edge_index: torch.Tensor,
-        edge_attr: torch.Tensor,
-        coords_norm: torch.Tensor,
-        q: torch.Tensor,
-        exc_idx: torch.Tensor,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+    def forward(self, x: torch.Tensor, edge_index: torch.Tensor, edge_attr: torch.Tensor,
+                coords_norm: torch.Tensor, q: torch.Tensor, exc_idx: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         h = self.node_encoder(x)
-        e = self.edge_encoder(edge_attr)
+        e = self.edge_encoder(edge_attr).to(dtype=h.dtype)
         for block in self.blocks:
             h, e = block(h, e, edge_index)
 
@@ -199,8 +195,8 @@ class MeshGraphModalResidueNet(nn.Module):
         hq = h[q]
         he = h[exc_i].view(1, -1).expand(hq.shape[0], -1)
         gg = g.view(1, -1).expand(hq.shape[0], -1)
-        q_xyz = coords_norm[q]
-        rel_xyz = q_xyz - coords_norm[exc_i].view(1, 3)
+        q_xyz = coords_norm[q].to(dtype=h.dtype)
+        rel_xyz = q_xyz - coords_norm[exc_i].view(1, 3).to(dtype=h.dtype)
         residue_norm = self.residue_head(torch.cat([hq, gg, he, q_xyz, rel_xyz], dim=-1))
         return omega_norm, residue_norm
 
@@ -211,7 +207,7 @@ def to_tensors(s: Dict[str, np.ndarray], stats: Dict[str, np.ndarray], device: t
     edge_attr = (s["edge_attr"] - stats["edge_mean"][None, :]) / stats["edge_std"][None, :]
     coords = s["points"] / GEOM_SCALE.reshape(1, 3)
     return {
-        "x": torch.from_numpy(x).to(device, non_blocking=True),
+        "x": torch.from_numpy(x.astype(np.float32)).to(device, non_blocking=True),
         "edge_index": torch.from_numpy(s["edge_index"]).long().to(device, non_blocking=True),
         "edge_attr": torch.from_numpy(edge_attr.astype(np.float32)).to(device, non_blocking=True),
         "coords": torch.from_numpy(coords.astype(np.float32)).to(device, non_blocking=True),
@@ -234,17 +230,14 @@ def norm_targets(t: Dict[str, torch.Tensor], stats: Dict[str, np.ndarray], q: to
 
 def denorm(omega_norm: torch.Tensor, residue_norm: torch.Tensor, stats: Dict[str, np.ndarray]):
     dev = omega_norm.device
-    omega = torch.exp(
-        omega_norm.float() * torch.as_tensor(stats["omega_log_std"], device=dev)
-        + torch.as_tensor(stats["omega_log_mean"], device=dev)
-    )
+    omega = torch.exp(omega_norm.float() * torch.as_tensor(stats["omega_log_std"], device=dev)
+                      + torch.as_tensor(stats["omega_log_mean"], device=dev))
     residue = residue_norm.float() * torch.as_tensor(stats["residue_std"], device=dev) + torch.as_tensor(stats["residue_mean"], device=dev)
     return omega, residue
 
 
 def rand_query(n: int, k: int, device: torch.device) -> torch.Tensor:
-    k = min(k, n)
-    return torch.randperm(n, device=device)[:k]
+    return torch.randperm(n, device=device)[:min(k, n)]
 
 
 def triplet_percent(values: List[np.ndarray]) -> Tuple[float, float, float]:
@@ -336,7 +329,6 @@ def evaluate(model, ds, stats, args, device):
         w_rel = torch.abs(omega - t["omega"]) / torch.clamp(torch.abs(t["omega"]), min=1e-12) * 100.0
         residue_true = t["residue"][q]
         phi_rel = torch.linalg.norm(residue - residue_true, dim=0) / torch.clamp(torch.linalg.norm(residue_true, dim=0), min=1e-20) * 100.0
-
         w_np = w_rel.detach().cpu().numpy()
         phi_np = phi_rel.detach().cpu().numpy()
         omega_errs.append(w_np)
@@ -435,8 +427,8 @@ def main():
         tr_loss, tr_m = train_epoch(model, train, opt, scaler, stats, args, device)
         sched.step()
         va, _ = evaluate(model, val, stats, args, device)
-
         score = float(va["modal_score"])
+
         if score < best:
             best = score
             torch.save(checkpoint_payload(model, stats, in_dim, edge_dim, n_modes, args, ep, best), args.out_dir / "best_model.pt")
