@@ -24,6 +24,31 @@ def _as_phi_z(phi: torch.Tensor) -> torch.Tensor:
     raise ValueError(f"Expected phi as [N,K] or [N,K,3], got {tuple(phi.shape)}")
 
 
+def _zero_phi_metrics(loss_freq: torch.Tensor, fm: dict):
+    zero = loss_freq.detach().new_tensor(0.0)
+    metrics = {
+        "loss": loss_freq.detach(),
+        "loss_freq": loss_freq.detach(),
+        "loss_phi": zero,
+        "phi_z_mse": zero,
+        "phi_z_scale": zero,
+        "phi_z_mac": zero,
+        "phi_z_mac_gated": zero,
+        "mode_weight_mean": zero,
+        "dir_z_ratio_mean": zero,
+        "phi_mse": zero,
+        "phi_scale": zero,
+        "phi_mac": zero,
+        **fm,
+    }
+    for k in range(3):
+        metrics[f"phi_z_mac_mode{k + 1}"] = zero
+        metrics[f"dir_z_ratio_mode{k + 1}"] = zero
+        metrics[f"mode_weight_mode{k + 1}"] = zero
+        metrics[f"phi_mac_mode{k + 1}"] = zero
+    return metrics
+
+
 def align_phi_z(pred_z: torch.Tensor, target_z: torch.Tensor, batch: torch.Tensor, node_weight=None) -> torch.Tensor:
     """逐样本、逐模态符号对齐。模态振型整体正负号任意，因此训练前需要对齐。"""
     out = torch.empty_like(target_z)
@@ -99,7 +124,6 @@ def weighted_phi_z_terms(
         tt = torch.sum(w_node * t ** 2, dim=0)
         mac_k = dot ** 2 / (pp * tt + EPS)
 
-        # 真实 phi_z 极小时，MAC 不稳定，因此降低 MAC 项影响。
         mac_gate = (true_rms.detach() / (true_rms.detach() + scale_floor)).clamp(0.0, 1.0)
 
         mse_all.append(mse_k)
@@ -128,6 +152,13 @@ def modal_loss(
     min_mode_weight: float = 0.2,
 ):
     lf, fm = frequency_loss(out["omega"], batch["modal_omega_phys"])
+
+    if phi_weight <= 0.0 or ("phi_z" not in out and "phi" not in out):
+        loss = freq_weight * lf
+        metrics = _zero_phi_metrics(loss, fm)
+        metrics["loss_freq"] = lf.detach()
+        metrics["loss"] = loss.detach()
+        return loss, metrics
 
     pred_z = out.get("phi_z", out.get("phi"))
     target_z = batch.get("modal_phi_z", batch["modal_phi"])
