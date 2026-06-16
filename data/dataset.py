@@ -16,14 +16,14 @@ DEFAULT_N_MODES = 3
 
 
 class GraphHDF5Dataset(Dataset):
-    """HDF5 graph dataset for z-only modal MeshGraphNet training.
+    """Z-only 模态训练数据集。
 
-    The first-stage target is only:
-        geometry + stiffness boundary -> omega + full-node z mode shapes.
+    第一阶段训练目标为：
+        几何/材料/装夹刚度边界 -> 固有频率 omega + 全节点 Z 向振型 phi_z。
 
-    Full xyz mode shapes are still loaded as modal_phi_xyz because the loss uses
-    them to compute the per-mode z-dominance ratio. Damping/FRF fields may exist
-    in the HDF5 files, but are ignored by this training dataset.
+    数据集中仍读取完整 modal_phi_xyz，但它只用于计算每阶模态的
+    Z 向能量比例 dir_z_ratio，以便在损失函数中对非 Z 主导模态降权。
+    阻尼和 FRF 字段即使存在，本数据集也不会作为训练目标使用。
     """
 
     def __init__(self,
@@ -150,9 +150,9 @@ class GraphHDF5Dataset(Dataset):
             "modal_omega_norm": omega / self.omega_scale,
             "modal_freq_hz": omega / (2.0 * torch.pi),
             "modal_phi_z": phi_z,
-            # Backward-compatible alias: modal_phi is now z-only [N,K].
+            # 兼容旧代码：modal_phi 现在表示 Z-only 标签 [N,K]
             "modal_phi": phi_z,
-            # Keep full xyz only for computing z-dominance weights/diagnostics.
+            # 完整三向振型只用于计算 Z 向主导程度和诊断
             "modal_phi_xyz": phi_xyz,
             "excitation_index": excitation_index,
             "excitation_coord": excitation_coord,
@@ -284,6 +284,7 @@ def build_node_weights(node_type: torch.Tensor,
                        cut_region_mask: torch.Tensor,
                        excitation_index: torch.Tensor,
                        n_nodes: int) -> torch.Tensor:
+    # 关键区域加权：槽底、切削区、装夹区、激励点附近更重要
     w = torch.ones(n_nodes, dtype=torch.float32)
     w = w + 1.0 * pocket_bottom_mask.float()
     w = w + 1.0 * cut_region_mask.float()
@@ -368,7 +369,6 @@ def collate_geometry_batch(batch: List[Dict[str, torch.Tensor]]) -> Dict[str, to
         "batch": torch.cat(batch_vec, dim=0),
         "node_weight": torch.cat(node_weight, dim=0),
         "modal_phi_z": phi_z_cat,
-        # Backward-compatible alias: modal_phi is now z-only [total_N,K].
         "modal_phi": phi_z_cat,
         "modal_phi_xyz": phi_xyz_cat,
         "modal_omega_phys": torch.stack([item["modal_omega_phys"] for item in batch]),
