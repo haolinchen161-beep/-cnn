@@ -6,10 +6,10 @@
 git checkout mesh-modal-lite-clean
 ```
 
-直接训练：
+唯一训练入口：
 
 ```bash
-python -u modal_run.py
+python -u sample/run_validation.py
 ```
 
 ## 当前训练目标
@@ -70,13 +70,13 @@ min_mode_weight = 0.2
 ## 训练命令
 
 ```bash
-python -u modal_run.py --data_dir ansys/data --out_dir sample/output_modal_zonly
+python -u sample/run_validation.py --data_dir ansys/data --out_dir sample/output_modal_zonly
 ```
 
 快速测试 3 个 epoch：
 
 ```bash
-python -u modal_run.py --epochs 3 --batch_size 1
+python -u sample/run_validation.py --epochs 3 --batch_size 1
 ```
 
 ## 评估命令
@@ -90,7 +90,7 @@ python -u sample/evaluate.py --data_dir ansys/data --out_dir sample/output_modal
 如果 HDF5 中已经包含 6 阶或更多模态，可以直接改参数：
 
 ```bash
-python -u modal_run.py --n_modes 6 --data_dir ansys/data_20modes
+python -u sample/run_validation.py --n_modes 6 --data_dir ansys/data_20modes
 ```
 
 ## 当前不做的事情
