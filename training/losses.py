@@ -1,1 +1,1 @@
-from .modal_losses import *
+from .modal_losses_scaled import *
