@@ -8,6 +8,8 @@ Rebuilt to match the current CNN physics branch:
   3D MAC, and XYZ direction norm consistency.
 - branch_loss supervises each mode's XYZ energy ratio and mildly reweights
   mode-3 X/Y minority types.
+- modal_loss_z_only is a simplified channel for Z-FRF studies: it supervises
+  only omega and the Z projection of phi, and may disable zeta supervision.
 """
 from __future__ import annotations
 
@@ -19,6 +21,13 @@ def _mac_per_graph(phi_pred, phi_target):
     """3D single-graph MAC: phi [N,K,3] -> [K]."""
     num = torch.sum(phi_pred * phi_target, dim=(0, 2)) ** 2
     den = torch.sum(phi_pred ** 2, dim=(0, 2)) * torch.sum(phi_target ** 2, dim=(0, 2)) + 1e-8
+    return num / den
+
+
+def _mac_z_per_graph(phi_z_pred, phi_z_target):
+    """Z-projection single-graph MAC: phi_z [N,K] -> [K]."""
+    num = torch.sum(phi_z_pred * phi_z_target, dim=0) ** 2
+    den = torch.sum(phi_z_pred ** 2, dim=0) * torch.sum(phi_z_target ** 2, dim=0) + 1e-8
     return num / den
 
 
@@ -34,24 +43,8 @@ def _ensure_phi3d(phi):
     raise ValueError(f"Unsupported phi shape: {tuple(phi.shape)}")
 
 
-def modal_loss(omega_phys_pred, omega_phys_target,
-               log_zeta_pred, zeta_target,
-               phi_pred, phi_target, batch_idx=None,
-               omega_weight=1.0, zeta_weight=10.0, phi_weight=3.0):
-    """CNN-compatible physical modal loss for the MeshGraphNet branch.
-
-    Args:
-        omega_phys_pred:   [B,K] rad/s
-        omega_phys_target: [B,K] rad/s
-        log_zeta_pred:     [B,K]
-        zeta_target:       [B,K]
-        phi_pred:          [total_N,K,3]
-        phi_target:        [total_N,K,3]
-        batch_idx:         [total_N]
-    """
-    # ====================================================
-    # 1. Frequency loss in Hz space.
-    # ====================================================
+def _frequency_loss(omega_phys_pred, omega_phys_target, zeta_target, omega_weight=1.0):
+    """Frequency loss in Hz space, shared by full-XYZ and Z-only channels."""
     f_pred_hz = omega_phys_pred / (2.0 * torch.pi)
     f_true_hz = omega_phys_target / (2.0 * torch.pi)
 
@@ -76,19 +69,36 @@ def modal_loss(omega_phys_pred, omega_phys_target,
     rel_abs = torch.abs(rel_err)
     peak_sensitive = torch.clamp(rel_abs / (zeta_target + 1e-8), max=100.0)
 
-    loss_omega = (
+    return (
         0.5 * loss_freq_abs + 10.0 * loss_freq_rel + 0.5 * loss_gap + 0.05 * peak_sensitive.mean()
     ) * omega_weight
 
-    # ====================================================
-    # 2. Damping loss in log domain.
-    # ====================================================
-    log_zeta_target = torch.log(zeta_target + 1e-8)
-    loss_zeta = F.smooth_l1_loss(log_zeta_pred, log_zeta_target) * zeta_weight
 
-    # ====================================================
-    # 3. Full 3D mode-shape loss.
-    # ====================================================
+def modal_loss(omega_phys_pred, omega_phys_target,
+               log_zeta_pred, zeta_target,
+               phi_pred, phi_target, batch_idx=None,
+               omega_weight=1.0, zeta_weight=10.0, phi_weight=3.0):
+    """CNN-compatible physical modal loss for the MeshGraphNet branch.
+
+    Args:
+        omega_phys_pred:   [B,K] rad/s
+        omega_phys_target: [B,K] rad/s
+        log_zeta_pred:     [B,K]
+        zeta_target:       [B,K]
+        phi_pred:          [total_N,K,3]
+        phi_target:        [total_N,K,3]
+        batch_idx:         [total_N]
+    """
+    loss_omega = _frequency_loss(omega_phys_pred, omega_phys_target, zeta_target, omega_weight)
+
+    # Damping loss in log domain. It becomes exactly zero when zeta_weight=0.
+    if zeta_weight > 0:
+        log_zeta_target = torch.log(zeta_target + 1e-8)
+        loss_zeta = F.smooth_l1_loss(log_zeta_pred, log_zeta_target) * zeta_weight
+    else:
+        loss_zeta = loss_omega.new_tensor(0.0)
+
+    # Full 3D mode-shape loss.
     phi_pred = _ensure_phi3d(phi_pred)
     phi_target = _ensure_phi3d(phi_target)
 
@@ -127,7 +137,7 @@ def modal_loss(omega_phys_pred, omega_phys_target,
         direc_weight = torch.cat(direc_weight_list, dim=0)
     else:
         p_std = torch.std(phi_pred.transpose(0, 1).reshape(phi_pred.shape[1], -1), dim=1) + 1e-8
-        t_std = torch.std(aligned_target.transpose(0, 1).reshape(aligned_target.shape[1], -1), dim=1) + 1e-8
+        t_std = torch.std(aligned_target.transpose(0, 1).reshape(phi_pred.shape[1], -1), dim=1) + 1e-8
         p_std_view = p_std.view(1, -1, 1)
         t_std_view = t_std.view(1, -1, 1)
         energy = torch.sum(aligned_target ** 2, dim=0)
@@ -163,6 +173,86 @@ def modal_loss(omega_phys_pred, omega_phys_target,
 
     loss_phi = (10.0 * raw_phi_mse + 40.0 * loss_mac + 20.0 * loss_std + 10.0 * loss_dir_norm) * phi_weight
 
+    return loss_omega + loss_zeta + loss_phi, loss_omega, loss_zeta, loss_phi, mac_per_mode.detach()
+
+
+def modal_loss_z_only(omega_phys_pred, omega_phys_target,
+                      log_zeta_pred, zeta_target,
+                      phi_pred, phi_target, batch_idx=None,
+                      omega_weight=1.0, zeta_weight=0.0, phi_weight=3.0):
+    """Z-projection modal loss for Z-FRF-focused experiments.
+
+    The network may still output full phi[N,K,3], but this loss supervises only
+    phi[..., 2]. This removes the X/Y direction-classification burden while
+    preserving the physically relevant Z projection for Z-direction FRF.
+    """
+    loss_omega = _frequency_loss(omega_phys_pred, omega_phys_target, zeta_target, omega_weight)
+
+    if zeta_weight > 0:
+        log_zeta_target = torch.log(zeta_target + 1e-8)
+        loss_zeta = F.smooth_l1_loss(log_zeta_pred, log_zeta_target) * zeta_weight
+    else:
+        loss_zeta = loss_omega.new_tensor(0.0)
+
+    phi_pred = _ensure_phi3d(phi_pred)[..., 2]
+    phi_target = _ensure_phi3d(phi_target)[..., 2]
+
+    if batch_idx is not None:
+        aligned_target = torch.empty_like(phi_target)
+        n_graphs_sign = int(batch_idx.max().item()) + 1
+        for b in range(n_graphs_sign):
+            m = batch_idx == b
+            dot_b = torch.sum(phi_pred[m] * phi_target[m], dim=0, keepdim=True)
+            aligned_target[m] = phi_target[m] * torch.sign(dot_b + 1e-8)
+    else:
+        dot = torch.sum(phi_pred * phi_target, dim=0, keepdim=True)
+        aligned_target = phi_target * torch.sign(dot + 1e-8)
+
+    if batch_idx is not None:
+        n_graphs = int(batch_idx.max().item()) + 1
+        p_std_list, t_std_list = [], []
+        for i in range(n_graphs):
+            mask = batch_idx == i
+            p_i = phi_pred[mask]
+            t_i = aligned_target[mask]
+            p_std_list.append(torch.std(p_i, dim=0) + 1e-8)
+            t_std_list.append(torch.std(t_i, dim=0) + 1e-8)
+        p_std = torch.stack(p_std_list, dim=0)
+        t_std = torch.stack(t_std_list, dim=0)
+        p_std_view = p_std[batch_idx]
+        t_std_view = t_std[batch_idx]
+    else:
+        p_std = torch.std(phi_pred, dim=0).unsqueeze(0) + 1e-8
+        t_std = torch.std(aligned_target, dim=0).unsqueeze(0) + 1e-8
+        p_std_view = p_std
+        t_std_view = t_std
+
+    phi_pred_norm = phi_pred / p_std_view
+    phi_target_norm = aligned_target / t_std_view
+    raw_phi_mse = F.mse_loss(phi_pred_norm, phi_target_norm)
+
+    if batch_idx is not None:
+        n_graphs = int(batch_idx.max().item()) + 1
+        mac_loss_total = 0.0
+        mac_list = []
+        for i in range(n_graphs):
+            mask = batch_idx == i
+            mac = _mac_z_per_graph(phi_pred[mask], aligned_target[mask])
+            mac_loss_total += (1.0 - mac).mean()
+            mac_list.append(mac)
+        loss_mac = mac_loss_total / n_graphs
+        mac_per_mode = torch.stack(mac_list, dim=0).mean(dim=0)
+    else:
+        mac = _mac_z_per_graph(phi_pred, aligned_target)
+        loss_mac = (1.0 - mac).mean()
+        mac_per_mode = mac
+
+    loss_std = F.smooth_l1_loss(p_std, t_std)
+    norm_p = torch.sqrt(torch.sum(phi_pred ** 2, dim=0) + 1e-8)
+    norm_t = torch.sqrt(torch.sum(aligned_target ** 2, dim=0) + 1e-8)
+    loss_amp = torch.mean(torch.abs(torch.log((norm_p + 1e-8) / (norm_t + 1e-8))))
+
+    loss_phi = (10.0 * raw_phi_mse + 40.0 * loss_mac + 20.0 * loss_std + 10.0 * loss_amp) * phi_weight
     return loss_omega + loss_zeta + loss_phi, loss_omega, loss_zeta, loss_phi, mac_per_mode.detach()
 
 
