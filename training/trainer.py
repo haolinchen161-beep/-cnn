@@ -11,13 +11,13 @@ import torch
 from .losses import modal_loss
 
 
-GRAPH_TENSOR_KEYS = [
-    "node_features", "edge_index", "edge_attr", "batch",
+BASE_TENSOR_KEYS = ["node_features", "edge_index", "edge_attr", "batch", "modal_omega_phys"]
+PHI_TENSOR_KEYS = ["modal_phi_z", "node_weight"]
+INFO_TENSOR_KEYS = [
     "points", "query_coords", "spring_k_xyz", "node_type",
     "pocket_bottom_mask", "cut_region_mask", "local_thickness_ratio",
-    "pocket_depth_ratio", "node_weight", "excitation_index",
-    "excitation_index_global", "excitation_coord", "modal_omega_phys",
-    "modal_omega_norm", "modal_freq_hz", "modal_phi_z", "modal_phi",
+    "pocket_depth_ratio", "excitation_index", "excitation_index_global",
+    "excitation_coord", "modal_omega_norm", "modal_freq_hz", "modal_phi",
     "modal_phi_xyz",
 ]
 
@@ -29,9 +29,19 @@ def _log(msg: str, logger=None):
         print(msg, flush=True)
 
 
-def _move_graph_batch(batch: Dict, device: str) -> Dict:
+def _move_graph_batch(batch: Dict, device: str, compute_phi: bool = False, keep_info: bool = False) -> Dict:
+    """Move only tensors required by the current phase.
+
+    Phase0 omega-only does not need phi_z, node_weight or phi_xyz on GPU.
+    This avoids unnecessary host-to-device copies for every batch.
+    """
     out = dict(batch)
-    for key in GRAPH_TENSOR_KEYS:
+    keys = list(BASE_TENSOR_KEYS)
+    if compute_phi:
+        keys += PHI_TENSOR_KEYS
+    if keep_info:
+        keys += INFO_TENSOR_KEYS
+    for key in keys:
         if key in out and torch.is_tensor(out[key]):
             out[key] = out[key].to(device, non_blocking=True)
     return out
@@ -72,10 +82,6 @@ def _save_model(out_dir, epoch, net, optimizer, metric, name, config=None, model
     }, path)
 
 
-def _zero_like_metric(metrics, key):
-    return torch.zeros_like(metrics[key].detach())
-
-
 def train(args, config, model_cfg, net, dataloader, optimizer, valloader,
           scheduler=None, logger=None, start_epoch=0):
     os.makedirs(args.dir, exist_ok=True)
@@ -114,12 +120,13 @@ def train(args, config, model_cfg, net, dataloader, optimizer, valloader,
 
             for step, raw_batch in enumerate(dataloader, start=1):
                 optimizer.zero_grad(set_to_none=True)
-                batch = _move_graph_batch(raw_batch, args.device)
+                compute_phi = bool(phase["compute_phi"])
+                batch = _move_graph_batch(raw_batch, args.device, compute_phi=compute_phi)
 
                 with torch.cuda.amp.autocast(enabled=bool(args.fp16)):
                     out = net(
                         batch["node_features"], batch["edge_index"], batch["edge_attr"], batch["batch"],
-                        compute_phi=bool(phase["compute_phi"]),
+                        compute_phi=compute_phi,
                     )
                     loss, metrics = modal_loss(
                         out, batch,
@@ -135,7 +142,6 @@ def train(args, config, model_cfg, net, dataloader, optimizer, valloader,
                 scaler.step(optimizer)
                 scaler.update()
 
-                # 不在每个 batch 转 CPU，避免强制 CUDA 同步；指标先留在 GPU 上累加。
                 loss_d = metrics["loss"].detach()
                 omega_d = metrics["loss_omega"].detach()
                 phi_d = metrics["loss_phi"].detach()
@@ -162,11 +168,10 @@ def train(args, config, model_cfg, net, dataloader, optimizer, valloader,
                 if progress_interval > 0 and (step == 1 or step % progress_interval == 0 or step == total_batches):
                     elapsed = time.time() - t0
                     avg = elapsed / max(step, 1)
-                    # 只在真正打印时同步一次。
                     w_now = freq_d.detach().cpu().numpy()
                     loss_now = float(loss_d.detach().cpu())
                     omega_now = float(omega_d.detach().cpu())
-                    if phase["compute_phi"]:
+                    if compute_phi:
                         mac_now = mac_d.detach().cpu().numpy()
                         phi_amp_now = phi_amp_d.detach().cpu().numpy()
                         phi_now = float(phi_d.detach().cpu())
@@ -269,7 +274,7 @@ def evaluate(args, config, net, dataloader, logger=None, epoch=None, compute_phi
     n_seen = 0
 
     for raw_batch in dataloader:
-        batch = _move_graph_batch(raw_batch, args.device)
+        batch = _move_graph_batch(raw_batch, args.device, compute_phi=compute_phi)
         with torch.cuda.amp.autocast(enabled=bool(args.fp16)):
             out = net(batch["node_features"], batch["edge_index"], batch["edge_attr"], batch["batch"], compute_phi=compute_phi)
             loss, metrics = modal_loss(
