@@ -1,11 +1,12 @@
-from .modal_losses import frequency_loss, modal_loss, weighted_phi_z_terms
-from .modal_trainer import evaluate_modal, run_epoch, train_modal
+from .losses import frequency_loss, modal_loss, phi_z_loss
+from .trainer import evaluate, evaluate_modal, train, train_modal
 
 __all__ = [
     "frequency_loss",
+    "phi_z_loss",
     "modal_loss",
-    "weighted_phi_z_terms",
+    "train",
+    "evaluate",
     "train_modal",
     "evaluate_modal",
-    "run_epoch",
 ]
