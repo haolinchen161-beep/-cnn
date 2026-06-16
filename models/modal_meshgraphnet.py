@@ -10,11 +10,7 @@ DEFAULT_EDGE_FEATURE_DIM = 4
 
 
 class MLP(nn.Module):
-    """与旧 gnn-meshgraphnet-refactor 分支一致的轻量 MLP。
-
-    隐藏层只做 Linear + GELU + Dropout，不在每个隐藏层后做 LayerNorm。
-    对 10 万级边数的图来说，隐藏层 LayerNorm 会明显拖慢训练。
-    """
+    """与旧 gnn-meshgraphnet-refactor 分支一致的轻量 MLP。"""
 
     def __init__(self,
                  in_dim: int,
@@ -73,38 +69,65 @@ class MeshGraphBlock(nn.Module):
         return h, e
 
 
-class OmegaHead(nn.Module):
-    """单调频率输出头。
+class PhysicsPriorOmegaHead(nn.Module):
+    """采用旧分支思路的物理先验频率头。
 
-    先预测第一阶频率，再预测正的频率间隔，保证输出频率按阶次递增。
-    默认训练前三阶，也支持后续扩展到 K 阶。
+    用图级物理统计量先给出频率先验，再让图隐变量预测小残差。
+    输出单位为 rad/s。
     """
 
-    def __init__(self, hidden: int, n_modes: int = 3):
+    def __init__(self, hidden: int = 128, n_modes: int = 3, phys_dim: int = 14):
         super().__init__()
-        self.n_modes = int(n_modes)
-        if self.n_modes < 1:
-            raise ValueError("n_modes must be positive.")
-        self.mlp = nn.Sequential(
-            nn.Linear(hidden, hidden),
-            nn.GELU(),
-            nn.Linear(hidden, hidden // 2),
-            nn.GELU(),
-            nn.Linear(hidden // 2, self.n_modes),
-        )
-        with torch.no_grad():
-            nn.init.zeros_(self.mlp[-1].weight)
-            nn.init.zeros_(self.mlp[-1].bias)
+        if n_modes != 3:
+            raise ValueError("PhysicsPriorOmegaHead 当前只支持前三阶。若训练更多阶，需要扩展该频率头。")
+        self.n_modes = n_modes
 
-    def forward(self, graph_latent: torch.Tensor) -> torch.Tensor:
-        raw = self.mlp(graph_latent)
-        f1 = 200.0 + 1800.0 * torch.sigmoid(raw[:, 0:1])
-        if self.n_modes == 1:
-            freq_hz = f1
-        else:
-            gaps = 50.0 + 2600.0 * torch.sigmoid(raw[:, 1:])
-            freq_hz = torch.cat([f1, f1 + torch.cumsum(gaps, dim=-1)], dim=-1)
-        return freq_hz * (2.0 * torch.pi)
+        self.prior_mlp = nn.Sequential(
+            nn.Linear(phys_dim, 128), nn.GELU(),
+            nn.Linear(128, 64), nn.GELU(),
+            nn.Linear(64, n_modes),
+        )
+        self.delta_mlp = nn.Sequential(
+            nn.Linear(hidden + phys_dim, 256), nn.GELU(), nn.Dropout(0.20),
+            nn.Linear(256, 128), nn.GELU(), nn.Dropout(0.10),
+            nn.Linear(128, n_modes),
+        )
+
+        self.f1_min, self.f1_max = 700.0, 1250.0
+        self.g21_min, self.g21_max = 700.0, 2600.0
+        self.g32_min, self.g32_max = 200.0, 1000.0
+
+        self.f1_span = self.f1_max - self.f1_min
+        self.g21_span = self.g21_max - self.g21_min
+        self.g32_span = self.g32_max - self.g32_min
+
+        def inv_sigmoid(p):
+            p = torch.tensor(p).clamp(1e-4, 1 - 1e-4)
+            return torch.log(p / (1.0 - p))
+
+        b1 = inv_sigmoid((949.7 - self.f1_min) / self.f1_span)
+        b2 = inv_sigmoid((1390.8 - self.g21_min) / self.g21_span)
+        b3 = inv_sigmoid((522.1 - self.g32_min) / self.g32_span)
+
+        with torch.no_grad():
+            nn.init.zeros_(self.prior_mlp[-1].weight)
+            self.prior_mlp[-1].bias.copy_(torch.tensor([b1, b2, b3]))
+            nn.init.zeros_(self.delta_mlp[-1].weight)
+            nn.init.zeros_(self.delta_mlp[-1].bias)
+
+    def forward(self, graph_latent: torch.Tensor, phys_features: torch.Tensor) -> torch.Tensor:
+        prior_raw = self.prior_mlp(phys_features)
+        delta_raw = 0.35 * torch.tanh(self.delta_mlp(torch.cat([graph_latent, phys_features], dim=-1)))
+        raw = prior_raw + delta_raw
+        s = torch.sigmoid(raw)
+
+        f1 = self.f1_min + self.f1_span * s[:, 0:1]
+        g21 = self.g21_min + self.g21_span * s[:, 1:2]
+        g32 = self.g32_min + self.g32_span * s[:, 2:3]
+        f2 = f1 + g21
+        f3 = f2 + g32
+        f_hz = torch.cat([f1, f2, f3], dim=-1)
+        return f_hz * (2.0 * torch.pi)
 
 
 class ModeShapeZDecoder(nn.Module):
@@ -137,21 +160,13 @@ class ModeShapeZDecoder(nn.Module):
 
 
 class MeshModalNet(nn.Module):
-    """轻量 Z-only MeshGraphNet 模态预测模型。
-
-    输出：
-        omega: [B,K]，单位 rad/s
-        phi_z: [total_N,K]
-
-    本阶段只预测 Z 向振型，用于先验证 Z-Z FRF 需要的核心模态分量。
-    阻尼和 FRF 重建不放在网络训练目标中。
-    """
+    """轻量 Z-only MeshGraphNet 模态预测模型。"""
 
     def __init__(self,
                  node_in_dim: int = DEFAULT_NODE_FEATURE_DIM,
                  edge_in_dim: int = DEFAULT_EDGE_FEATURE_DIM,
                  hidden: int = 128,
-                 n_layers: int = 6,
+                 n_layers: int = 4,
                  n_modes: int = 3,
                  dropout: float = 0.05,
                  **unused_kwargs):
@@ -165,14 +180,15 @@ class MeshModalNet(nn.Module):
         self.edge_encoder = MLP(edge_in_dim, hidden, hidden, n_layers=3, dropout=dropout, layer_norm=True)
         self.blocks = nn.ModuleList([MeshGraphBlock(hidden, dropout=dropout) for _ in range(n_layers)])
         self.global_proj = MLP(hidden * 2, hidden, hidden, n_layers=2, dropout=dropout, layer_norm=True)
-        self.omega_head = OmegaHead(hidden, n_modes=self.n_modes)
+        self.omega_head = PhysicsPriorOmegaHead(hidden, n_modes=self.n_modes, phys_dim=14)
         self.phi_decoder = ModeShapeZDecoder(hidden, n_modes=self.n_modes, dropout=dropout)
 
     def forward(self,
                 node_features: torch.Tensor,
                 edge_index: torch.Tensor,
                 edge_attr: torch.Tensor,
-                batch: torch.Tensor) -> Dict[str, torch.Tensor]:
+                batch: torch.Tensor,
+                compute_phi: bool = True) -> Dict[str, torch.Tensor]:
         if node_features.shape[-1] != self.node_in_dim:
             raise ValueError(f"node_features dim={node_features.shape[-1]}, expected {self.node_in_dim}")
         if edge_attr.shape[-1] != self.edge_in_dim:
@@ -187,16 +203,19 @@ class MeshModalNet(nn.Module):
         g_max = global_max_pool(h, batch)
         graph_latent = self.global_proj(torch.cat([g_mean, g_max], dim=-1))
 
-        omega = self.omega_head(graph_latent)
-        phi_z = self.phi_decoder(h, graph_latent, batch)
+        omega_phys_features = build_graph_physics_features(node_features, batch)
+        omega = self.omega_head(graph_latent, omega_phys_features)
 
-        return {
+        out = {
             "omega": omega,
-            "phi_z": phi_z,
-            "phi": phi_z,
             "node_latent": h,
             "graph_latent": graph_latent,
         }
+        if compute_phi:
+            phi_z = self.phi_decoder(h, graph_latent, batch)
+            out["phi_z"] = phi_z
+            out["phi"] = phi_z
+        return out
 
 
 def global_mean_pool(x: torch.Tensor, batch: torch.Tensor) -> torch.Tensor:
@@ -215,6 +234,54 @@ def global_max_pool(x: torch.Tensor, batch: torch.Tensor) -> torch.Tensor:
         mask = batch == graph_id
         outs.append(x[mask].max(dim=0).values if torch.any(mask) else x.new_zeros(x.shape[-1]))
     return torch.stack(outs, dim=0) if outs else x.new_zeros(0, x.shape[-1])
+
+
+def _safe_stats(x: torch.Tensor):
+    if x.numel() == 0:
+        z = x.new_tensor(0.0)
+        return z, z, z, z
+    return x.mean(), x.std(unbiased=False), x.min(), x.max()
+
+
+def build_graph_physics_features(node_features: torch.Tensor, batch: torch.Tensor) -> torch.Tensor:
+    """由当前 21 维节点特征构建图级物理统计量。"""
+    n_graphs = int(batch.max().item()) + 1 if batch.numel() else 0
+    feats = []
+    for graph_id in range(n_graphs):
+        mask = batch == graph_id
+        nf = node_features[mask]
+        dtype = nf.dtype
+        device = nf.device
+        if nf.numel() == 0:
+            feats.append(torch.zeros(14, dtype=dtype, device=device))
+            continue
+
+        e_ratio = nf[:, 3].mean()
+        rho_ratio = nf[:, 4].mean()
+        thickness = nf[:, 6]
+        spring_flag = nf[:, 10]
+        spring_mask = spring_flag > 0
+        corner_ratio = nf[:, 15].mean()
+        side_ratio = nf[:, 14].mean()
+        fixed_ratio = spring_flag.mean()
+
+        k_node = nf[:, 7:10].mean(dim=-1)
+        k_mean, k_std, k_min, k_max = _safe_stats(k_node[spring_mask])
+
+        th_mean = thickness.mean()
+        th_std = thickness.std(unbiased=False)
+        th_min = thickness.min()
+        th_max = thickness.max()
+        f_theory = th_mean * torch.sqrt(torch.clamp(e_ratio / (rho_ratio + 1e-6), min=1e-6))
+
+        feats.append(torch.stack([
+            e_ratio, rho_ratio,
+            th_mean, th_std, th_min, th_max,
+            fixed_ratio, corner_ratio, side_ratio,
+            k_mean, k_std, k_min, k_max,
+            f_theory,
+        ]))
+    return torch.stack(feats, dim=0)
 
 
 def build_geometric_model(encoder_kwargs=None, decoder_kwargs=None) -> MeshModalNet:
