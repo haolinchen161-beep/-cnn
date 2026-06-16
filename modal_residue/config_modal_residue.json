@@ -1,0 +1,28 @@
+{
+  "data_dir": "data_modal_residue_filtered",
+  "out_dir": "runs/modal_residue_baseline",
+  "seed": 42,
+  "device": "auto",
+  "n_modes": 10,
+  "geometry_scale_m": [0.160, 0.060, 0.010],
+  "train": {
+    "epochs": 300,
+    "query_nodes": 512,
+    "eval_query_nodes": 1024,
+    "learning_rate": 0.001,
+    "weight_decay": 0.00001,
+    "grad_clip_norm": 1.0
+  },
+  "model": {
+    "hidden_dim": 192,
+    "num_layers": 3,
+    "dropout": 0.0
+  },
+  "loss": {
+    "omega_weight": 1.0,
+    "residue_weight": 1.0,
+    "frf_logmag_weight": 0.05,
+    "frf_complex_weight": 0.0,
+    "frf_eps": 1e-20
+  }
+}
