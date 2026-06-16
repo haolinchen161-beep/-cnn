@@ -7,7 +7,7 @@
 ```text
 README.md
 modal_residue/
-├── train_modal_residue_model.py   # 训练模态频率与模态留数预测模型
+├── train_modal_residue_model.py   # 唯一训练入口：参数、数据读取、模型、损失、训练、验证、测试都在这里
 └── validate_dataset.py            # 检查本地 HDF5 数据集质量
 ```
 
@@ -42,6 +42,30 @@ F:/pytorch_cuda12/python.exe -B modal_residue/validate_dataset.py --data-dir dat
 7. modal_residue_z 是否满足 A_r(x)=phi_r,z(x)*phi_r,z(x_f)；
 8. point_frf 是否满足模态叠加公式。
 ```
+
+## 训练入口
+
+训练只使用一个入口文件：
+
+```text
+modal_residue/train_modal_residue_model.py
+```
+
+该文件内部包含：
+
+```text
+1. argparse 参数设置；
+2. HDF5 数据读取；
+3. 节点输入特征构造；
+4. 归一化统计；
+5. ModalResidueNet 模型；
+6. modal_omega 损失；
+7. modal_residue_z 损失；
+8. FRF 物理重建损失；
+9. 训练、验证、测试与结果保存。
+```
+
+不使用 `config.yaml`，也不单独拆 `losses.py`。
 
 ## 训练基线模型
 
