@@ -18,7 +18,7 @@ from training import evaluate, train
 CONFIG = {
     "epochs": 300,
     "validation_frequency": 5,
-    "progress_interval": 10,
+    "progress_interval": 0,
     "omega_pretrain_epochs": 30,
     "omega_loss_weight": 1.0,
     "phi_loss_weight": 3.0,
@@ -86,6 +86,7 @@ def main():
     print(f"Output dir: {args.dir}", flush=True)
     print(f"Config: hidden={MODEL_CFG['encoder_kwargs']['hidden']}, layers={MODEL_CFG['encoder_kwargs']['n_layers']}, knn_k={CONFIG['graph']['knn_k']}", flush=True)
     print(f"Schedule: first {CONFIG['omega_pretrain_epochs']} epochs omega-only, then omega+phi_z", flush=True)
+    print("Progress: epoch-only logging; batch progress logs disabled", flush=True)
 
     trainset = GraphHDF5Dataset(["train.h5"], CONFIG, data_dir=data_dir, normalization=True, test=False)
     valset = GraphHDF5Dataset(["val.h5"], CONFIG, data_dir=data_dir, normalization=True, test=True)
