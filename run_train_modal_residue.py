@@ -47,15 +47,17 @@ FRF_LOSS_WEIGHT = 0.05
 LOG_EVERY = 10
 SEED = 42
 
-# DEVICE 可选："auto"、"cuda"、"cpu"。
-# auto：由训练脚本自动选择；有 CUDA 就用 CUDA。
-# 如果出现 nvrtc-builtins64_121.dll 找不到，可先改成 "cpu" 验证训练流程。
-DEVICE = "auto"
+# DEVICE 可选："cuda"、"auto"、"cpu"。
+# 本入口默认走 CUDA。不要用 CPU 跑正式训练。
+DEVICE = "cuda"
+
+# 与 gnn-meshgraphnet-refactor 分支一致，默认开启 CUDA AMP。
+FP16 = True
 
 
 # ===================== CUDA DLL 路径修复 =====================
 def prepare_cuda_dll_path() -> None:
-    """把常见 PyTorch/CUDA DLL 目录加入 PATH，避免 Windows 下 nvrtc DLL 找不到。"""
+    """把常见 PyTorch/CUDA DLL 目录加入 PATH，避免 Windows 下部分 DLL 找不到。"""
     py_root = Path(sys.executable).resolve().parent
     candidates = [
         py_root,
@@ -84,7 +86,7 @@ def prepare_cuda_dll_path() -> None:
     if found:
         print(f">>> 找到 {dll_name}: {found[0]}")
     else:
-        print(f">>> 警告: 未在当前 Python 环境中找到 {dll_name}。如果 CUDA 训练失败，请修复 PyTorch/CUDA 安装或把 DEVICE 改成 'cpu'。")
+        print(f">>> 未找到 {dll_name}，但当前训练脚本已避免 torch.complex FRF 计算，通常不再触发 NVRTC。")
 
 
 # ===================== 辅助函数 =====================
@@ -146,6 +148,8 @@ def main() -> None:
         str(SEED),
     ]
 
+    if FP16:
+        train_cmd += ["--fp16"]
     if DEVICE != "auto":
         train_cmd += ["--device", DEVICE]
 
