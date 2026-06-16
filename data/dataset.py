@@ -12,15 +12,18 @@ L_BASE, W_BASE, H_BASE = 0.160, 0.060, 0.010
 E_BASE, RHO_BASE, PRXY_BASE = 71.7e9, 2810.0, 0.33
 
 NODE_FEATURE_DIM = 21
-N_MODES = 3
+DEFAULT_N_MODES = 3
 
 
 class GraphHDF5Dataset(Dataset):
-    """HDF5 graph dataset for modal-only MeshGraphNet training.
+    """HDF5 graph dataset for z-only modal MeshGraphNet training.
 
-    This loader intentionally ignores damping/FRF fields even if they exist in the
-    generated HDF5 files.  The first-stage target is only:
-        geometry + stiffness boundary -> omega + full-node xyz mode shapes.
+    The first-stage target is only:
+        geometry + stiffness boundary -> omega + full-node z mode shapes.
+
+    Full xyz mode shapes are still loaded as modal_phi_xyz because the loss uses
+    them to compute the per-mode z-dominance ratio. Damping/FRF fields may exist
+    in the HDF5 files, but are ignored by this training dataset.
     """
 
     def __init__(self,
@@ -33,6 +36,7 @@ class GraphHDF5Dataset(Dataset):
         self.data_dir = data_dir
         self.normalization = normalization
         self.test = test
+        self.n_modes = int(self.config.get("n_modes", DEFAULT_N_MODES))
         self.knn_k = int(self.config.get("graph", {}).get("knn_k", 12))
         self.omega_scale = float(self.config.get("omega_scale", 2.0 * torch.pi * 5000.0))
         self.samples: List[Tuple[str, str]] = []
@@ -93,8 +97,9 @@ class GraphHDF5Dataset(Dataset):
             if edge_attr.shape[0] != edge_index.shape[1]:
                 edge_attr = build_edge_attr(points, edge_index)
 
-            omega = torch.from_numpy(g["modal_omega"][:]).float()[:N_MODES]
-            phi = _read_phi(g, n_nodes)
+            omega = torch.from_numpy(g["modal_omega"][:]).float()[:self.n_modes]
+            phi_xyz = _read_phi_xyz(g, n_nodes, self.n_modes)
+            phi_z = phi_xyz[..., 2]
 
             if "excitation_index" in g:
                 excitation_index = torch.tensor(int(g["excitation_index"][()]), dtype=torch.long)
@@ -144,8 +149,11 @@ class GraphHDF5Dataset(Dataset):
             "modal_omega_phys": omega,
             "modal_omega_norm": omega / self.omega_scale,
             "modal_freq_hz": omega / (2.0 * torch.pi),
-            "modal_phi": phi,
-            "modal_phi_xyz": phi,
+            "modal_phi_z": phi_z,
+            # Backward-compatible alias: modal_phi is now z-only [N,K].
+            "modal_phi": phi_z,
+            # Keep full xyz only for computing z-dominance weights/diagnostics.
+            "modal_phi_xyz": phi_xyz,
             "excitation_index": excitation_index,
             "excitation_coord": excitation_coord,
             "sample_name": grp_name,
@@ -171,7 +179,7 @@ def _read_point_features(g, n_nodes: int) -> torch.Tensor:
     return torch.nan_to_num(pf[:, :7].float(), nan=0.0, posinf=0.0, neginf=0.0)
 
 
-def _read_phi(g, n_nodes: int) -> torch.Tensor:
+def _read_phi_xyz(g, n_nodes: int, n_modes: int) -> torch.Tensor:
     if "modal_phi_xyz" in g:
         phi = torch.from_numpy(g["modal_phi_xyz"][:]).float()
     else:
@@ -185,7 +193,9 @@ def _read_phi(g, n_nodes: int) -> torch.Tensor:
             raise ValueError(f"Unsupported modal_phi shape: {tuple(raw.shape)}")
     if phi.shape[0] != n_nodes:
         raise ValueError(f"modal_phi node count mismatch: {phi.shape[0]} vs {n_nodes}")
-    return torch.nan_to_num(phi[:, :N_MODES, :3].float(), nan=0.0, posinf=0.0, neginf=0.0)
+    if phi.shape[1] < n_modes:
+        raise ValueError(f"modal_phi has only {phi.shape[1]} modes, requested {n_modes}")
+    return torch.nan_to_num(phi[:, :n_modes, :3].float(), nan=0.0, posinf=0.0, neginf=0.0)
 
 
 def _read_optional_node_array(g, key: str, n_nodes: int, width: int) -> torch.Tensor:
@@ -314,7 +324,8 @@ def build_edge_attr(points: torch.Tensor, edge_index: torch.Tensor) -> torch.Ten
 def collate_geometry_batch(batch: List[Dict[str, torch.Tensor]]) -> Dict[str, torch.Tensor]:
     node_features, points, query_coords, edge_indices, edge_attrs, batch_vec = [], [], [], [], [], []
     node_weight = []
-    modal_phi = []
+    modal_phi_z = []
+    modal_phi_xyz = []
     node_offset = 0
     excitation_index_local, excitation_index_global, excitation_coord = [], [], []
     passthrough_cat = {k: [] for k in [
@@ -328,7 +339,8 @@ def collate_geometry_batch(batch: List[Dict[str, torch.Tensor]]) -> Dict[str, to
         points.append(item["points"])
         query_coords.append(item["query_coords"])
         node_weight.append(item["node_weight"])
-        modal_phi.append(item["modal_phi"])
+        modal_phi_z.append(item["modal_phi_z"])
+        modal_phi_xyz.append(item["modal_phi_xyz"])
         edge_indices.append(item["edge_index"].long() + node_offset)
         edge_attrs.append(item.get("edge_attr", build_edge_attr(item["points"], item["edge_index"])))
         batch_vec.append(torch.full((n_i,), graph_id, dtype=torch.long))
@@ -344,6 +356,9 @@ def collate_geometry_batch(batch: List[Dict[str, torch.Tensor]]) -> Dict[str, to
 
         node_offset += n_i
 
+    phi_z_cat = torch.cat(modal_phi_z, dim=0)
+    phi_xyz_cat = torch.cat(modal_phi_xyz, dim=0)
+
     out = {
         "node_features": torch.cat(node_features, dim=0),
         "points": torch.cat(points, dim=0),
@@ -352,8 +367,10 @@ def collate_geometry_batch(batch: List[Dict[str, torch.Tensor]]) -> Dict[str, to
         "edge_attr": torch.cat(edge_attrs, dim=0),
         "batch": torch.cat(batch_vec, dim=0),
         "node_weight": torch.cat(node_weight, dim=0),
-        "modal_phi": torch.cat(modal_phi, dim=0),
-        "modal_phi_xyz": torch.cat(modal_phi, dim=0),
+        "modal_phi_z": phi_z_cat,
+        # Backward-compatible alias: modal_phi is now z-only [total_N,K].
+        "modal_phi": phi_z_cat,
+        "modal_phi_xyz": phi_xyz_cat,
         "modal_omega_phys": torch.stack([item["modal_omega_phys"] for item in batch]),
         "modal_omega_norm": torch.stack([item["modal_omega_norm"] for item in batch]),
         "modal_freq_hz": torch.stack([item["modal_freq_hz"] for item in batch]),
