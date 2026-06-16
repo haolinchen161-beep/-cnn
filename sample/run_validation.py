@@ -39,6 +39,8 @@ def parse_args():
     parser.add_argument("--knn_k", type=int, default=12)
     parser.add_argument("--validation_frequency", type=int, default=5)
     parser.add_argument("--progress_interval", type=int, default=10)
+    parser.add_argument("--fp16", action="store_true", default=True, help="CUDA 下默认开启混合精度以降低显存占用")
+    parser.add_argument("--no_fp16", action="store_false", dest="fp16", help="关闭混合精度")
     return parser.parse_args()
 
 
@@ -56,6 +58,7 @@ def build_config(args):
         "gradient_clip": 2.0,
         "validation_frequency": args.validation_frequency,
         "progress_interval": args.progress_interval,
+        "fp16": bool(args.fp16),
         "graph": {"knn_k": args.knn_k},
     }
 
@@ -79,7 +82,7 @@ def main():
     args = parse_args()
     torch.manual_seed(args.seed)
     cfg = build_config(args)
-    run_args = SimpleNamespace(device=args.device, dir=args.out_dir)
+    run_args = SimpleNamespace(device=args.device, dir=args.out_dir, fp16=bool(args.fp16))
 
     print("=" * 80, flush=True)
     print("Z 向模态 MeshGraphNet 训练", flush=True)
@@ -87,6 +90,7 @@ def main():
     print("本阶段不训练阻尼和 FRF。", flush=True)
     print("=" * 80, flush=True)
     print(f"设备: {args.device}", flush=True)
+    print(f"混合精度 fp16: {bool(args.fp16) and str(args.device).startswith('cuda')}", flush=True)
     print(f"数据目录: {args.data_dir}", flush=True)
     print(f"输出目录: {args.out_dir}", flush=True)
     print(f"消息传递层数: {args.n_layers}，每 {args.progress_interval} 个 batch 打印一次进度", flush=True)
