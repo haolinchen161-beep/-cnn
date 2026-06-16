@@ -48,7 +48,7 @@ SEED = 42
 
 # DEVICE 可选："cuda"、"cpu"。
 # 如果写成 "auto"，会交给 train_modal_residue_model.py 自动选择。
-DEVICE = "auto"
+DEVICE = "cuda"
 
 
 # ===================== 辅助函数 =====================
