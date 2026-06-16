@@ -1,32 +1,38 @@
-# Mesh Modal Lite Clean: Z-only MeshGraphNet modal prediction
+# Mesh Modal Lite Clean：Z 向模态预测
 
-This branch is the current lightweight training branch.
+当前分支 `mesh-modal-lite-clean` 是轻量模态训练分支。
 
-The first-stage target is now simplified to:
+本阶段目标为：
 
 ```text
-FE mesh + geometry + material + stiffness boundary
-        -> first K natural circular frequencies omega
-        -> full-node z-direction mode shapes phi_z
+有限元网格 + 几何参数 + 材料参数 + 装夹刚度边界
+        → 前 K 阶固有圆频率 omega
+        → 全节点 Z 向振型 phi_z
 ```
 
-Default K is 3.
+默认 `K = 3`。
 
-The model no longer predicts full-field `phi_x` and `phi_y` in this stage. The HDF5 loader still reads `modal_phi_xyz`, but only to compute the per-mode z-dominance ratio used by the loss weighting.
+当前模型不预测全场 `phi_x` 和 `phi_y`。数据加载器仍会读取 `modal_phi_xyz`，但只是为了计算每阶模态的 Z 向能量比例 `dir_z_ratio`，用于损失加权。
 
-## Why z-only
+## 1. 为什么改成 Z-only
 
-The current task is Z-direction excitation and Z-direction response FRF. The modal numerator mainly uses the z-direction projection of each mode:
+当前研究对象是 Z 向激励、Z 向响应的 FRF。模态叠加中，Z-Z FRF 的分子主要依赖：
 
 ```text
 phi_response_z * phi_excitation_z
 ```
 
-Therefore, the first version should learn `omega + phi_z` before adding damping or FRF reconstruction.
+因此第一阶段优先训练：
 
-## Dataset
+```text
+几何 + 材料 + 装夹刚度 → omega + phi_z
+```
 
-The default dataset remains:
+阻尼和 FRF 重建放到后续物理层处理。
+
+## 2. 数据集字段
+
+默认使用：
 
 ```text
 ansys/data/train.h5
@@ -34,72 +40,92 @@ ansys/data/val.h5
 ansys/data/test.h5
 ```
 
-Required modal fields:
+至少需要：
 
 ```text
-modal_omega      [at least K]
-modal_phi_xyz    [N, at least K, 3]
+points                [N, 3]
+edge_index            [2, E]
+edge_attr             [E, 4]
+point_features        [N, 7]
+spring_k_xyz          [N, 3]
+node_type             [N]
+pocket_bottom_mask    [N]
+cut_region_mask       [N]
+local_thickness_ratio [N]
+pocket_depth_ratio    [N]
+excitation_index      scalar
+excitation_coord      [3]
+modal_omega           [>=K]
+modal_phi_xyz         [N, >=K, 3]
 ```
 
-The actual training labels are:
+实际训练标签：
 
 ```text
 modal_omega[:K]
 modal_phi_xyz[:, :K, 2]
 ```
 
-Damping and FRF fields may exist in the HDF5 files, but this branch ignores them during training.
+`modal_zeta`、`spring_c_xyz`、`point_frf`、`frequencies` 可以保留在 HDF5 中，但本阶段训练会忽略它们。
 
-## Model output
+## 3. 模型输出
 
 ```text
 omega: [B, K]
 phi_z: [total_N, K]
 ```
 
-## Loss
+## 4. 损失函数
 
-Frequency loss is not direction-weighted.
+频率损失不按方向加权。
 
-Mode-shape loss is z-only and uses:
+Z 向振型损失包含：
+
+```text
+1. 符号对齐后的 phi_z MSE
+2. phi_z 尺度 loss
+3. phi_z MAC loss
+```
+
+每阶模态的振型损失权重为：
 
 ```text
 w_k = min_mode_weight + (1 - min_mode_weight) * dir_z_ratio_k
 ```
 
-Default:
+默认：
 
 ```text
 min_mode_weight = 0.2
 ```
 
-This keeps all samples. Non-z-dominant modes are not removed; their z projection is still learned, but with lower shape-loss weight.
+这表示：非 Z 主导模态不删除，但它的 Z 向振型损失权重更小。模型仍然学习“该模态在 Z 向上的投影较小”这一事实。
 
-## Train
+## 5. 训练
 
 ```bash
 python -u modal_run.py
 ```
 
-Equivalent explicit command:
+或显式指定：
 
 ```bash
 python -u modal_run.py --data_dir ansys/data --out_dir sample/output_modal_zonly --n_modes 3
 ```
 
-The old sample entrypoint now redirects to the same training flow:
+旧入口也可用，它现在会转到同一套训练流程：
 
 ```bash
 python -u sample/run_validation.py
 ```
 
-## Evaluate
+## 6. 评估
 
 ```bash
 python -u sample/evaluate.py --data_dir ansys/data --out_dir sample/output_modal_zonly
 ```
 
-Main metrics:
+主要指标：
 
 ```text
 freq_mae_hz
@@ -112,17 +138,25 @@ dir_z_ratio_mode1 / mode2 / mode3
 mode_weight_mode1 / mode2 / mode3
 ```
 
-## Current research scope
+## 7. 当前研究定位
 
-This branch only validates:
+当前分支只验证：
 
 ```text
-complex machined geometry + equivalent clamping stiffness -> omega + phi_z
+复杂加工几何 + 等效装夹刚度边界 → 固有频率 + Z 向振型
 ```
 
-Damping and FRF reconstruction should be added later as a separate physical layer. For early FRF checks, use predicted `omega + phi_z` together with existing `modal_zeta` or a calibrated damping model.
+建议后续路线：
 
-If three modes are insufficient for the target frequency band, the same code can be run with six modes using HDF5 files that contain at least six modes:
+```text
+阶段 1：训练当前 Z-only 模态模型，确认 omega 和 phi_z 可预测
+阶段 2：使用预测 omega + phi_z 与数据集 modal_zeta 重建低频 Z-Z FRF
+阶段 3：如果前三阶不足，再扩展到前 6 阶 phi_z
+阶段 4：阻尼模型单独验证，可采用 modal_zeta、经验阻尼或 FRF/实验反标定
+阶段 5：必要时再补装夹区域三向振型，用于计算装夹阻尼
+```
+
+如果 HDF5 中已经包含至少 6 阶模态，可直接运行：
 
 ```bash
 python -u modal_run.py --n_modes 6 --data_dir ansys/data_20modes
