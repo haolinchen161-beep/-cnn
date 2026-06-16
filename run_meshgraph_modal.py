@@ -17,8 +17,13 @@ GNN_LAYERS = 2
 LEARNING_RATE = 1e-3
 WEIGHT_DECAY = 1e-5
 GRAD_CLIP_NORM = 1.0
+
 OMEGA_LOSS_WEIGHT = 1.0
-PHI_LOSS_WEIGHT = 1.0
+A_SHAPE_LOSS_WEIGHT = 1.0
+A_SCALE_LOSS_WEIGHT = 0.2
+BEST_A_WEIGHT = 0.01
+RESIDUE_VISIBLE_REL = 1e-3
+
 LOG_EVERY = 10
 SEED = 42
 DEVICE = "cuda"
@@ -40,7 +45,10 @@ def main() -> int:
         "--lr", str(LEARNING_RATE),
         "--weight-decay", str(WEIGHT_DECAY),
         "--omega-loss-weight", str(OMEGA_LOSS_WEIGHT),
-        "--phi-loss-weight", str(PHI_LOSS_WEIGHT),
+        "--a-shape-loss-weight", str(A_SHAPE_LOSS_WEIGHT),
+        "--a-scale-loss-weight", str(A_SCALE_LOSS_WEIGHT),
+        "--best-a-weight", str(BEST_A_WEIGHT),
+        "--residue-visible-rel", str(RESIDUE_VISIBLE_REL),
         "--grad-clip-norm", str(GRAD_CLIP_NORM),
         "--log-every", str(LOG_EVERY),
         "--seed", str(SEED),
