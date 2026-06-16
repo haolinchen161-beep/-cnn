@@ -1,15 +1,16 @@
 # 模态留数 FRF 预测流程
 
-该分支已经清理为当前阶段所需的最小代码结构，只保留模态留数 FRF 预测相关文件。
+该分支保留当前阶段所需的模态留数 FRF 预测相关文件。
 
 ## 文件结构
 
 ```text
 README.md
-run_train_modal_residue.py          # 推荐训练入口：所有常用参数集中写在这里
+run_meshgraph_modal.py              # 正式训练入口：所有常用参数集中写在这里
 modal_residue/
-├── train_modal_residue_model.py    # 模型、损失、训练循环、验证、测试
-└── validate_dataset.py             # 检查本地 HDF5 数据集质量
+├── generate_modal_residue_dataset_filtered_v2.py   # 数据生成程序，如果已上传则保留在这里
+├── train_modal_residue_model.py                    # MeshGraph 模型、损失、训练循环、验证、测试
+└── validate_dataset.py                             # 检查本地 HDF5 数据集质量
 ```
 
 生成的 ANSYS/HDF5 数据集体积较大，保存在本地，不提交到 GitHub。
@@ -35,44 +36,42 @@ F:/pytorch_cuda12/python.exe -B modal_residue/validate_dataset.py --data-dir dat
 
 ```text
 1. HDF5 文件是否存在；
-2. 每个样本是否包含必要字段；
-3. 是否为 10 阶模态；
-4. 模态频率是否递增；
-5. 频率网格是否覆盖第 10 阶模态；
+2. 每个样本是否包含图结构 edge_index / edge_attr；
+3. 每个样本是否包含节点特征、装夹特征和材料/几何特征；
+4. 每个样本是否包含 modal_omega 与 modal_residue_z；
+5. 模态频率是否递增；
 6. 近频过滤是否满足最小相对间隔要求；
-7. modal_residue_z 是否满足 A_r(x)=phi_r,z(x)*phi_r,z(x_f)；
-8. point_frf 是否满足模态叠加公式。
+7. 如果存在 modal_phi_xyz，则检查 modal_residue_z 是否满足 A_r(x)=phi_r,z(x)*phi_r,z(x_f)。
 ```
 
 ## 推荐训练入口
 
-推荐直接运行根目录的训练入口：
+直接运行根目录的正式训练入口：
 
 ```powershell
-F:/pytorch_cuda12/python.exe -B run_train_modal_residue.py
+F:/pytorch_cuda12/python.exe -B run_meshgraph_modal.py
 ```
 
-所有常用参数都集中放在 `run_train_modal_residue.py` 顶部，例如：
+所有常用参数都集中放在 `run_meshgraph_modal.py` 顶部，例如：
 
 ```text
 DATA_DIR
 OUT_DIR
-VALIDATE_BEFORE_TRAIN
-MIN_RELATIVE_GAP
 EPOCHS
 QUERY_NODES
 EVAL_QUERY_NODES
 HIDDEN
+GNN_LAYERS
 LEARNING_RATE
 WEIGHT_DECAY
 GRAD_CLIP_NORM
-FRF_LOSS_WEIGHT
+OMEGA_LOSS_WEIGHT
+PHI_LOSS_WEIGHT
 LOG_EVERY
 SEED
 DEVICE
+FP16
 ```
-
-这样后续改训练参数时，只需要改 `run_train_modal_residue.py`，不用在命令行写一长串参数。
 
 ## 底层训练脚本
 
@@ -88,34 +87,21 @@ modal_residue/train_modal_residue_model.py
 1. argparse 参数设置；
 2. HDF5 数据读取；
 3. 节点输入特征构造；
-4. 归一化统计；
-5. ModalResidueNet 模型；
+4. edge_index / edge_attr 图消息传递；
+5. MeshGraphNet 风格模型；
 6. modal_omega 损失；
 7. modal_residue_z 损失；
-8. FRF 物理重建损失；
-9. 训练、验证、测试与结果保存。
+8. 训练、验证、测试与结果保存。
 ```
 
-不使用 `config.yaml`，也不单独拆 `losses.py`。
+当前训练不依赖 `point_frf`，也不使用 FRF loss。FRF 后续由预测出的 `modal_omega` 和 `modal_residue_z` 按物理公式重建。
 
-## 命令行训练方式
-
-如果不使用根目录入口，也可以直接运行底层训练脚本：
-
-```powershell
-F:/pytorch_cuda12/python.exe -B modal_residue/train_modal_residue_model.py `
-  --data-dir data_modal_residue_filtered `
-  --out-dir runs/modal_residue_baseline `
-  --epochs 300 `
-  --query-nodes 512 `
-  --eval-query-nodes 1024 `
-  --frf-loss-weight 0.05
-```
+## 训练输出
 
 训练输出默认保存在：
 
 ```text
-runs/modal_residue_baseline/
+runs/modal_residue_meshgraph/
 ├── best_model.pt
 ├── last_model.pt
 ├── normalization_stats.npz
@@ -128,7 +114,7 @@ runs/modal_residue_baseline/
 
 ## 模型预测目标
 
-模型第一版预测两个核心量：
+模型预测两个核心量：
 
 ```text
 modal_omega       # 10 阶模态角频率
@@ -149,4 +135,4 @@ H_z(x,\omega)=\sum_{r=1}^{10}\frac{A_r(x)}{\omega_r^2-\omega^2+2j\zeta_r\omega_r
 
 ## 当前阶段说明
 
-该分支用于验证“几何/装夹条件 → 模态频率与模态留数 → FRF 重建”的最小训练流程。当前版本不是最终模型结构，主要用于确认数据集、标签和训练闭环是否正常。
+30 个样本主要用于验证 MeshGraph 模型结构、标签读取、训练日志和保存逻辑。正式泛化能力需要继续扩展到更多样本。
