@@ -13,6 +13,7 @@ import torch
 from torch import nn
 
 GEOM_SCALE = np.array([0.160, 0.060, 0.010], dtype=np.float32)
+EPS_A = 1e-30
 
 
 def seed_all(seed: int) -> None:
@@ -62,7 +63,6 @@ class H5Split:
 
 
 def node_input(s: Dict[str, np.ndarray]) -> np.ndarray:
-    # omega_head 不使用 excitation_coord；激励点信息只给 residue_head。
     xyz = s["points"] / GEOM_SCALE.reshape(1, 3)
     k = np.log10(1.0 + np.maximum(s["spring_k_xyz"], 0.0)) / 8.0
     c = np.log10(1.0 + np.maximum(s["spring_c_xyz"], 0.0)) / 4.0
@@ -75,13 +75,17 @@ def node_input(s: Dict[str, np.ndarray]) -> np.ndarray:
     return np.concatenate(parts, axis=1).astype(np.float32)
 
 
+def np_A_scale(A: np.ndarray) -> np.ndarray:
+    return np.sqrt(np.mean(A.astype(np.float64) ** 2, axis=0) + EPS_A).astype(np.float32)
+
+
 def compute_stats(ds: H5Split) -> Dict[str, np.ndarray]:
     sx = sx2 = None
     se = se2 = None
     n_node = 0
     n_edge = 0
     omega_logs = []
-    residues = []
+    A_log_scales = []
 
     for i in range(len(ds)):
         s = ds[i]
@@ -99,14 +103,14 @@ def compute_stats(ds: H5Split) -> Dict[str, np.ndarray]:
         n_node += x.shape[0]
         n_edge += e.shape[0]
         omega_logs.append(np.log(np.maximum(s["modal_omega"], 1e-12)))
-        residues.append(s["modal_residue_z"].reshape(-1, s["modal_residue_z"].shape[-1]))
+        A_log_scales.append(np.log(np.maximum(np_A_scale(s["modal_residue_z"]), 1e-30)))
 
     x_mean = sx / max(n_node, 1)
     x_std = np.sqrt(np.maximum(sx2 / max(n_node, 1) - x_mean * x_mean, 1e-12))
     e_mean = se / max(n_edge, 1)
     e_std = np.sqrt(np.maximum(se2 / max(n_edge, 1) - e_mean * e_mean, 1e-12))
     omega_log = np.stack(omega_logs, axis=0).astype(np.float32)
-    residue_all = np.concatenate(residues, axis=0).astype(np.float32)
+    A_log_scale = np.stack(A_log_scales, axis=0).astype(np.float32)
     return {
         "x_mean": x_mean.astype(np.float32),
         "x_std": x_std.astype(np.float32),
@@ -114,8 +118,8 @@ def compute_stats(ds: H5Split) -> Dict[str, np.ndarray]:
         "edge_std": e_std.astype(np.float32),
         "omega_log_mean": omega_log.mean(axis=0).astype(np.float32),
         "omega_log_std": (omega_log.std(axis=0) + 1e-6).astype(np.float32),
-        "residue_mean": residue_all.mean(axis=0).astype(np.float32),
-        "residue_std": (residue_all.std(axis=0) + 1e-12).astype(np.float32),
+        "A_log_scale_mean": A_log_scale.mean(axis=0).astype(np.float32),
+        "A_log_scale_std": (A_log_scale.std(axis=0) + 1e-6).astype(np.float32),
     }
 
 
@@ -162,7 +166,7 @@ class MeshGraphBlock(nn.Module):
 
 
 class MeshGraphModalResidueNet(nn.Module):
-    def __init__(self, node_in_dim: int, edge_in_dim: int, n_modes: int, hidden: int = 192, gnn_layers: int = 4):
+    def __init__(self, node_in_dim: int, edge_in_dim: int, n_modes: int, hidden: int = 64, gnn_layers: int = 2):
         super().__init__()
         self.node_encoder = mlp(node_in_dim, hidden, hidden, layers=3)
         self.edge_encoder = mlp(edge_in_dim, hidden, hidden, layers=3)
@@ -172,14 +176,15 @@ class MeshGraphModalResidueNet(nn.Module):
             nn.Linear(hidden, hidden), nn.LayerNorm(hidden), nn.SiLU(),
         )
         self.omega_head = nn.Sequential(nn.Linear(hidden, hidden), nn.SiLU(), nn.Linear(hidden, n_modes))
-        self.residue_head = nn.Sequential(
+        self.A_scale_head = nn.Sequential(nn.Linear(2 * hidden, hidden), nn.SiLU(), nn.Linear(hidden, n_modes))
+        self.A_shape_head = nn.Sequential(
             nn.Linear(3 * hidden + 6, hidden), nn.LayerNorm(hidden), nn.SiLU(),
             nn.Linear(hidden, hidden), nn.LayerNorm(hidden), nn.SiLU(),
             nn.Linear(hidden, n_modes),
         )
 
     def forward(self, x: torch.Tensor, edge_index: torch.Tensor, edge_attr: torch.Tensor,
-                coords_norm: torch.Tensor, q: torch.Tensor, exc_idx: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+                coords_norm: torch.Tensor, q: torch.Tensor, exc_idx: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         h = self.node_encoder(x)
         e = self.edge_encoder(edge_attr).to(dtype=h.dtype)
         for block in self.blocks:
@@ -190,13 +195,20 @@ class MeshGraphModalResidueNet(nn.Module):
         omega_norm = self.omega_head(g)
 
         exc_i = torch.clamp(exc_idx.long(), 0, h.shape[0] - 1)
+        he0 = h[exc_i]
+        A_scale_norm = self.A_scale_head(torch.cat([g, he0], dim=0))
+
         hq = h[q]
-        he = h[exc_i].view(1, -1).expand(hq.shape[0], -1)
+        he = he0.view(1, -1).expand(hq.shape[0], -1)
         gg = g.view(1, -1).expand(hq.shape[0], -1)
         q_xyz = coords_norm[q].to(dtype=h.dtype)
         rel_xyz = q_xyz - coords_norm[exc_i].view(1, 3).to(dtype=h.dtype)
-        residue_norm = self.residue_head(torch.cat([hq, gg, he, q_xyz, rel_xyz], dim=-1))
-        return omega_norm, residue_norm
+        A_shape = self.A_shape_head(torch.cat([hq, gg, he, q_xyz, rel_xyz], dim=-1))
+        return omega_norm, A_shape, A_scale_norm
+
+
+def torch_A_scale(A: torch.Tensor) -> torch.Tensor:
+    return torch.sqrt(torch.mean(A.float() * A.float(), dim=0) + EPS_A)
 
 
 def to_tensors(s: Dict[str, np.ndarray], stats: Dict[str, np.ndarray], device: torch.device) -> Dict[str, torch.Tensor]:
@@ -211,7 +223,7 @@ def to_tensors(s: Dict[str, np.ndarray], stats: Dict[str, np.ndarray], device: t
         "coords": torch.from_numpy(coords.astype(np.float32)).to(device, non_blocking=True),
         "exc_idx": torch.as_tensor(int(s["excitation_index"]), dtype=torch.long, device=device),
         "omega": torch.from_numpy(s["modal_omega"]).to(device, non_blocking=True),
-        "residue": torch.from_numpy(s["modal_residue_z"]).to(device, non_blocking=True),
+        "A": torch.from_numpy(s["modal_residue_z"]).to(device, non_blocking=True),
     }
 
 
@@ -219,23 +231,34 @@ def norm_targets(t: Dict[str, torch.Tensor], stats: Dict[str, np.ndarray], q: to
     dev = t["x"].device
     om_m = torch.as_tensor(stats["omega_log_mean"], device=dev)
     om_s = torch.as_tensor(stats["omega_log_std"], device=dev)
-    rz_m = torch.as_tensor(stats["residue_mean"], device=dev)
-    rz_s = torch.as_tensor(stats["residue_std"], device=dev)
+    As_m = torch.as_tensor(stats["A_log_scale_mean"], device=dev)
+    As_s = torch.as_tensor(stats["A_log_scale_std"], device=dev)
+
     omega_norm = (torch.log(torch.clamp(t["omega"], min=1e-12)) - om_m) / om_s
-    residue_norm = (t["residue"][q] - rz_m) / rz_s
-    return omega_norm, residue_norm
+    A_scale = torch_A_scale(t["A"])
+    A_shape = t["A"][q].float() / A_scale.view(1, -1)
+    A_scale_norm = (torch.log(torch.clamp(A_scale, min=1e-30)) - As_m) / As_s
+    return omega_norm, A_shape, A_scale_norm, A_scale
 
 
-def denorm(omega_norm: torch.Tensor, residue_norm: torch.Tensor, stats: Dict[str, np.ndarray]):
+def denorm_outputs(omega_norm: torch.Tensor, A_shape: torch.Tensor, A_scale_norm: torch.Tensor, stats: Dict[str, np.ndarray]):
     dev = omega_norm.device
     omega = torch.exp(omega_norm.float() * torch.as_tensor(stats["omega_log_std"], device=dev)
                       + torch.as_tensor(stats["omega_log_mean"], device=dev))
-    residue = residue_norm.float() * torch.as_tensor(stats["residue_std"], device=dev) + torch.as_tensor(stats["residue_mean"], device=dev)
-    return omega, residue
+    A_scale = torch.exp(A_scale_norm.float() * torch.as_tensor(stats["A_log_scale_std"], device=dev)
+                        + torch.as_tensor(stats["A_log_scale_mean"], device=dev))
+    A = A_shape.float() * A_scale.view(1, -1)
+    return omega, A, A_scale
 
 
 def rand_query(n: int, k: int, device: torch.device) -> torch.Tensor:
     return torch.randperm(n, device=device)[:min(k, n)]
+
+
+def eval_query(n: int, k: int, device: torch.device) -> torch.Tensor:
+    if k <= 0 or k >= n:
+        return torch.arange(n, device=device)
+    return torch.linspace(0, n - 1, steps=k, device=device).round().long().unique()
 
 
 def triplet_percent(values: List[np.ndarray]) -> Tuple[float, float, float]:
@@ -256,14 +279,12 @@ def mode_mean(values: List[np.ndarray], n_modes: int) -> np.ndarray:
         return np.nanmean(arr, axis=0)
 
 
-def residue_visible_error_pct(pred: torch.Tensor, true: torch.Tensor, visible_rel: float) -> torch.Tensor:
-    # pred/true: [Q, M]. 对每一阶模态，只有当该阶留数范数足够大时才计算相对误差。
-    denom = torch.linalg.norm(true, dim=0)
+def A_visible_error_pct(pred: torch.Tensor, true: torch.Tensor, visible_rel: float) -> torch.Tensor:
+    denom = torch.linalg.norm(true.float(), dim=0)
     scale = torch.clamp(torch.max(denom), min=1e-20)
     visible = denom > (visible_rel * scale)
-    err = torch.linalg.norm(pred - true, dim=0) / torch.clamp(denom, min=1e-20) * 100.0
-    nan = torch.full_like(err, float("nan"))
-    return torch.where(visible, err, nan)
+    err = torch.linalg.norm(pred.float() - true.float(), dim=0) / torch.clamp(denom, min=1e-20) * 100.0
+    return torch.where(visible, err, torch.full_like(err, float("nan")))
 
 
 def fmt_triplet(t: Tuple[float, float, float], ndigits: int = 1) -> str:
@@ -285,8 +306,8 @@ def row_add_modes(row: Dict[str, float], prefix: str, values: np.ndarray) -> Non
         row[f"{prefix}{i:02d}_pct"] = float(v) if np.isfinite(v) else float("nan")
 
 
-def modal_score(metrics: Dict[str, Tuple[float, float, float]]) -> float:
-    return float(metrics["w10_triplet"][2] + metrics["A_vis_triplet"][2])
+def modal_score(metrics: Dict[str, Tuple[float, float, float]], best_a_weight: float) -> float:
+    return float(metrics["w10_triplet"][2] + best_a_weight * metrics["A_vis_triplet"][2])
 
 
 def forward_model(model, t, q):
@@ -297,9 +318,10 @@ def train_epoch(model, ds, opt, scaler, stats, args, device):
     model.train()
     order = list(range(len(ds)))
     random.shuffle(order)
-    sums = np.zeros(3, dtype=np.float64)
+    sums = np.zeros(4, dtype=np.float64)
     omega_errs: List[np.ndarray] = []
-    a_vis_errs: List[np.ndarray] = []
+    A_vis_errs: List[np.ndarray] = []
+    A_scale_errs: List[np.ndarray] = []
     amp_enabled = bool(args.fp16 and device.type == "cuda")
 
     for i in order:
@@ -307,11 +329,12 @@ def train_epoch(model, ds, opt, scaler, stats, args, device):
         q = rand_query(t["x"].shape[0], args.query_nodes, device)
         opt.zero_grad(set_to_none=True)
         with torch.cuda.amp.autocast(enabled=amp_enabled):
-            omega_p, residue_p = forward_model(model, t, q)
-            omega_t, residue_t = norm_targets(t, stats, q)
+            omega_p, A_shape_p, A_scale_p = forward_model(model, t, q)
+            omega_t, A_shape_t, A_scale_t, A_scale_true = norm_targets(t, stats, q)
             loss_omega = nn.functional.mse_loss(omega_p.float(), omega_t.float())
-            loss_A_norm = nn.functional.mse_loss(residue_p.float(), residue_t.float())
-            loss = args.omega_loss_weight * loss_omega + args.phi_loss_weight * loss_A_norm
+            loss_A_shape = nn.functional.mse_loss(A_shape_p.float(), A_shape_t.float())
+            loss_A_scale = nn.functional.mse_loss(A_scale_p.float(), A_scale_t.float())
+            loss = args.omega_loss_weight * loss_omega + args.a_shape_loss_weight * loss_A_shape + args.a_scale_loss_weight * loss_A_scale
 
         scaler.scale(loss).backward()
         scaler.unscale_(opt)
@@ -320,21 +343,25 @@ def train_epoch(model, ds, opt, scaler, stats, args, device):
         scaler.update()
 
         with torch.no_grad():
-            omega_phys, residue_phys = denorm(omega_p.detach(), residue_p.detach(), stats)
+            omega_phys, A_phys, A_scale_phys = denorm_outputs(omega_p.detach(), A_shape_p.detach(), A_scale_p.detach(), stats)
             w_rel = torch.abs(omega_phys - t["omega"]) / torch.clamp(torch.abs(t["omega"]), min=1e-12) * 100.0
-            residue_true = t["residue"][q]
-            a_vis = residue_visible_error_pct(residue_phys, residue_true, args.residue_visible_rel)
+            A_true = t["A"][q]
+            A_vis = A_visible_error_pct(A_phys, A_true, args.residue_visible_rel)
+            A_scale_rel = torch.abs(A_scale_phys - A_scale_true) / torch.clamp(A_scale_true, min=1e-20) * 100.0
             omega_errs.append(w_rel.detach().cpu().numpy())
-            a_vis_errs.append(a_vis.detach().cpu().numpy())
+            A_vis_errs.append(A_vis.detach().cpu().numpy())
+            A_scale_errs.append(A_scale_rel.detach().cpu().numpy())
 
-        sums += np.array([float(loss.detach().cpu()), float(loss_omega.detach().cpu()), float(loss_A_norm.detach().cpu())])
+        sums += np.array([float(loss.detach().cpu()), float(loss_omega.detach().cpu()), float(loss_A_shape.detach().cpu()), float(loss_A_scale.detach().cpu())])
 
     n_modes = len(omega_errs[0]) if omega_errs else 0
     return sums / max(len(order), 1), {
         "w10_triplet": triplet_percent(omega_errs),
-        "A_vis_triplet": triplet_percent(a_vis_errs),
+        "A_vis_triplet": triplet_percent(A_vis_errs),
+        "A_scale_triplet": triplet_percent(A_scale_errs),
         "w_modes": mode_mean(omega_errs, n_modes),
-        "A_vis_modes": mode_mean(a_vis_errs, n_modes),
+        "A_vis_modes": mode_mean(A_vis_errs, n_modes),
+        "A_scale_modes": mode_mean(A_scale_errs, n_modes),
     }
 
 
@@ -343,40 +370,49 @@ def evaluate(model, ds, stats, args, device):
     model.eval()
     rows: List[Dict[str, float]] = []
     omega_errs: List[np.ndarray] = []
-    a_vis_errs: List[np.ndarray] = []
+    A_vis_errs: List[np.ndarray] = []
+    A_scale_errs: List[np.ndarray] = []
     amp_enabled = bool(args.fp16 and device.type == "cuda")
 
     for i in range(len(ds)):
         t = to_tensors(ds[i], stats, device)
-        q = rand_query(t["x"].shape[0], args.eval_query_nodes, device)
+        q = eval_query(t["x"].shape[0], args.eval_query_nodes, device)
         with torch.cuda.amp.autocast(enabled=amp_enabled):
-            omega_n, residue_n = forward_model(model, t, q)
-        omega, residue = denorm(omega_n, residue_n, stats)
+            omega_n, A_shape_n, A_scale_n = forward_model(model, t, q)
+        _, _, _, A_scale_true = norm_targets(t, stats, q)
+        omega, A, A_scale = denorm_outputs(omega_n, A_shape_n, A_scale_n, stats)
 
         w_rel = torch.abs(omega - t["omega"]) / torch.clamp(torch.abs(t["omega"]), min=1e-12) * 100.0
-        residue_true = t["residue"][q]
-        a_vis = residue_visible_error_pct(residue, residue_true, args.residue_visible_rel)
+        A_true = t["A"][q]
+        A_vis = A_visible_error_pct(A, A_true, args.residue_visible_rel)
+        A_scale_rel = torch.abs(A_scale - A_scale_true) / torch.clamp(A_scale_true, min=1e-20) * 100.0
 
         w_np = w_rel.detach().cpu().numpy()
-        a_np = a_vis.detach().cpu().numpy()
+        A_np = A_vis.detach().cpu().numpy()
+        S_np = A_scale_rel.detach().cpu().numpy()
         omega_errs.append(w_np)
-        a_vis_errs.append(a_np)
+        A_vis_errs.append(A_np)
+        A_scale_errs.append(S_np)
 
         row = {"sample": i}
         row_add_triplet(row, "w10", triplet_percent([w_np]))
-        row_add_triplet(row, "A_vis", triplet_percent([a_np]))
+        row_add_triplet(row, "A_vis", triplet_percent([A_np]))
+        row_add_triplet(row, "A_scale", triplet_percent([S_np]))
         row_add_modes(row, "w", w_np)
-        row_add_modes(row, "A_vis", a_np)
+        row_add_modes(row, "A_vis", A_np)
+        row_add_modes(row, "A_scale", S_np)
         rows.append(row)
 
     n_modes = len(omega_errs[0]) if omega_errs else 0
     mean = {
         "w10_triplet": triplet_percent(omega_errs),
-        "A_vis_triplet": triplet_percent(a_vis_errs),
+        "A_vis_triplet": triplet_percent(A_vis_errs),
+        "A_scale_triplet": triplet_percent(A_scale_errs),
         "w_modes": mode_mean(omega_errs, n_modes),
-        "A_vis_modes": mode_mean(a_vis_errs, n_modes),
+        "A_vis_modes": mode_mean(A_vis_errs, n_modes),
+        "A_scale_modes": mode_mean(A_scale_errs, n_modes),
     }
-    mean["modal_score"] = modal_score(mean)
+    mean["modal_score"] = modal_score(mean, args.best_a_weight)
     return mean, rows
 
 
@@ -418,19 +454,25 @@ def main():
     p.add_argument("--epochs", type=int, default=300)
     p.add_argument("--query-nodes", type=int, default=512)
     p.add_argument("--eval-query-nodes", type=int, default=1024)
-    p.add_argument("--hidden", type=int, default=192)
-    p.add_argument("--gnn-layers", type=int, default=4)
+    p.add_argument("--hidden", type=int, default=64)
+    p.add_argument("--gnn-layers", type=int, default=2)
     p.add_argument("--lr", type=float, default=1e-3)
     p.add_argument("--weight-decay", type=float, default=1e-5)
     p.add_argument("--omega-loss-weight", type=float, default=1.0)
-    p.add_argument("--phi-loss-weight", type=float, default=1.0)
+    p.add_argument("--a-shape-loss-weight", type=float, default=1.0)
+    p.add_argument("--a-scale-loss-weight", type=float, default=0.2)
+    p.add_argument("--best-a-weight", type=float, default=0.01)
     p.add_argument("--residue-visible-rel", type=float, default=1e-3)
     p.add_argument("--grad-clip-norm", type=float, default=1.0)
     p.add_argument("--log-every", type=int, default=10)
     p.add_argument("--fp16", action="store_true")
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
+    # 兼容旧入口参数；如果外部还传 --phi-loss-weight，则映射到 A_shape。
+    p.add_argument("--phi-loss-weight", type=float, default=None)
     args = p.parse_args()
+    if args.phi_loss_weight is not None:
+        args.a_shape_loss_weight = args.phi_loss_weight
 
     seed_all(args.seed)
     args.out_dir.mkdir(parents=True, exist_ok=True)
@@ -457,7 +499,7 @@ def main():
     total_params = sum(p.numel() for p in model.parameters())
     print(f">>> data={args.data_dir}, train/val/test={len(train)}/{len(val)}/{len(test)}, device={device}, fp16={args.fp16}")
     print(f">>> MeshGraph modal-residue model: node_dim={in_dim}, edge_dim={edge_dim}, hidden={args.hidden}, layers={args.gnn_layers}, params={total_params:,}")
-    print(">>> targets: modal_omega + modal_residue_z; A_vis means visible modal residue only, not phi_z.")
+    print(">>> A decomposition: A_r(x)=A_scale_r * A_shape_r(x); A_scale is sample/mode RMS of modal_residue_z.")
 
     best = float("inf")
     hist: List[Dict[str, float]] = []
@@ -477,17 +519,17 @@ def main():
             "lr": float(opt.param_groups[0]["lr"]),
             "loss": float(tr_loss[0]),
             "loss_w": float(tr_loss[1]),
-            "loss_A_norm": float(tr_loss[2]),
+            "loss_A_shape": float(tr_loss[2]),
+            "loss_A_scale": float(tr_loss[3]),
             "val_modal_score": score,
         }
-        row_add_triplet(row, "train_w10", tr_m["w10_triplet"])
-        row_add_triplet(row, "train_A_vis", tr_m["A_vis_triplet"])
-        row_add_triplet(row, "val_w10", va["w10_triplet"])
-        row_add_triplet(row, "val_A_vis", va["A_vis_triplet"])
-        row_add_modes(row, "train_w", tr_m["w_modes"])
-        row_add_modes(row, "train_A_vis", tr_m["A_vis_modes"])
-        row_add_modes(row, "val_w", va["w_modes"])
-        row_add_modes(row, "val_A_vis", va["A_vis_modes"])
+        for prefix, metrics in [("train", tr_m), ("val", va)]:
+            row_add_triplet(row, f"{prefix}_w10", metrics["w10_triplet"])
+            row_add_triplet(row, f"{prefix}_A_vis", metrics["A_vis_triplet"])
+            row_add_triplet(row, f"{prefix}_A_scale", metrics["A_scale_triplet"])
+            row_add_modes(row, f"{prefix}_w", metrics["w_modes"])
+            row_add_modes(row, f"{prefix}_A_vis", metrics["A_vis_modes"])
+            row_add_modes(row, f"{prefix}_A_scale", metrics["A_scale_modes"])
         hist.append(row)
         append_csv_row(log_csv, row)
 
@@ -496,12 +538,14 @@ def main():
                 f"Epoch {ep:4d} | "
                 f"w10[mean/max/rms]=[{fmt_triplet(tr_m['w10_triplet'], 1)}]%  "
                 f"A_vis[mean/max/rms]=[{fmt_triplet(tr_m['A_vis_triplet'], 1)}]%  "
-                f"loss={fmt_loss(float(tr_loss[0]))}(w={fmt_loss(float(tr_loss[1]))},A={fmt_loss(float(tr_loss[2]))})"
+                f"A_scale[mean/max/rms]=[{fmt_triplet(tr_m['A_scale_triplet'], 1)}]%  "
+                f"loss={fmt_loss(float(tr_loss[0]))}(w={fmt_loss(float(tr_loss[1]))},Ash={fmt_loss(float(tr_loss[2]))},Asc={fmt_loss(float(tr_loss[3]))})"
             )
             print(
                 f"Val modal | "
                 f"w10[mean/max/rms]=[{fmt_triplet(va['w10_triplet'], 3)}]%  "
-                f"A_vis[mean/max/rms]=[{fmt_triplet(va['A_vis_triplet'], 1)}]%"
+                f"A_vis[mean/max/rms]=[{fmt_triplet(va['A_vis_triplet'], 1)}]%  "
+                f"A_scale[mean/max/rms]=[{fmt_triplet(va['A_scale_triplet'], 1)}]%"
             )
 
     write_csv(args.out_dir / "history.csv", hist)
@@ -514,8 +558,18 @@ def main():
 
     summary = {
         "best_modal_score": best,
-        "val": {"w10_mean_max_rms_pct": list(va["w10_triplet"]), "A_vis_mean_max_rms_pct": list(va["A_vis_triplet"]), "modal_score": va["modal_score"]},
-        "test": {"w10_mean_max_rms_pct": list(te["w10_triplet"]), "A_vis_mean_max_rms_pct": list(te["A_vis_triplet"]), "modal_score": te["modal_score"]},
+        "val": {
+            "w10_mean_max_rms_pct": list(va["w10_triplet"]),
+            "A_vis_mean_max_rms_pct": list(va["A_vis_triplet"]),
+            "A_scale_mean_max_rms_pct": list(va["A_scale_triplet"]),
+            "modal_score": va["modal_score"],
+        },
+        "test": {
+            "w10_mean_max_rms_pct": list(te["w10_triplet"]),
+            "A_vis_mean_max_rms_pct": list(te["A_vis_triplet"]),
+            "A_scale_mean_max_rms_pct": list(te["A_scale_triplet"]),
+            "modal_score": te["modal_score"],
+        },
     }
     with open(args.out_dir / "summary.json", "w", encoding="utf-8") as f:
         json.dump(summary, f, indent=2, ensure_ascii=False)
