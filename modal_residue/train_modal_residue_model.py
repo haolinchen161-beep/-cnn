@@ -37,8 +37,10 @@ class H5Split:
     def __getitem__(self, i: int) -> Dict[str, np.ndarray]:
         with h5py.File(self.path, "r") as f:
             g = f[self.keys[i]]
-            return {
+            out = {
                 "points": g["points"][:].astype(np.float32),
+                "edge_index": g["edge_index"][:].astype(np.int64),
+                "edge_attr": g["edge_attr"][:].astype(np.float32),
                 "point_features": g["point_features"][:].astype(np.float32),
                 "spring_k_xyz": g["spring_k_xyz"][:].astype(np.float32),
                 "spring_c_xyz": g["spring_c_xyz"][:].astype(np.float32),
@@ -47,43 +49,69 @@ class H5Split:
                 "modal_residue_z": g["modal_residue_z"][:].astype(np.float32),
                 "excitation_coord": g["excitation_coord"][:].astype(np.float32),
             }
+            if "excitation_index" in g:
+                out["excitation_index"] = np.array(int(g["excitation_index"][()]), dtype=np.int64)
+            else:
+                d = np.linalg.norm(out["points"] - out["excitation_coord"].reshape(1, 3), axis=1)
+                out["excitation_index"] = np.array(int(np.argmin(d)), dtype=np.int64)
+            if "local_thickness_ratio" in g:
+                out["local_thickness_ratio"] = g["local_thickness_ratio"][:].astype(np.float32)
+            if "pocket_depth_ratio" in g:
+                out["pocket_depth_ratio"] = g["pocket_depth_ratio"][:].astype(np.float32)
+            return out
 
 
 def node_input(s: Dict[str, np.ndarray]) -> np.ndarray:
+    """频率模型输入不使用 excitation_coord；激励点只给 residue_head。"""
     xyz = s["points"] / GEOM_SCALE.reshape(1, 3)
-    exc = s["excitation_coord"] / GEOM_SCALE
-    rel = xyz - exc.reshape(1, 3)
     k = np.log10(1.0 + np.maximum(s["spring_k_xyz"], 0.0)) / 8.0
     c = np.log10(1.0 + np.maximum(s["spring_c_xyz"], 0.0)) / 4.0
     nt = s["node_type"].astype(np.float32).reshape(-1, 1) / 4.0
-    return np.concatenate([xyz, rel, s["point_features"], k, c, nt], axis=1).astype(np.float32)
+    parts = [xyz, s["point_features"], k, c, nt]
+    if "local_thickness_ratio" in s:
+        parts.append(s["local_thickness_ratio"].reshape(-1, 1))
+    if "pocket_depth_ratio" in s:
+        parts.append(s["pocket_depth_ratio"].reshape(-1, 1))
+    return np.concatenate(parts, axis=1).astype(np.float32)
 
 
 def compute_stats(ds: H5Split) -> Dict[str, np.ndarray]:
-    sx = None
-    sx2 = None
-    n = 0
+    sx = sx2 = None
+    se = se2 = None
+    n_node = 0
+    n_edge = 0
     logs = []
     residues = []
+
     for i in range(len(ds)):
         s = ds[i]
         x = node_input(s).astype(np.float64)
+        e = s["edge_attr"].astype(np.float64)
         if sx is None:
             sx = np.zeros(x.shape[1], dtype=np.float64)
             sx2 = np.zeros(x.shape[1], dtype=np.float64)
+            se = np.zeros(e.shape[1], dtype=np.float64)
+            se2 = np.zeros(e.shape[1], dtype=np.float64)
         sx += x.sum(axis=0)
         sx2 += (x * x).sum(axis=0)
-        n += x.shape[0]
+        se += e.sum(axis=0)
+        se2 += (e * e).sum(axis=0)
+        n_node += x.shape[0]
+        n_edge += e.shape[0]
         logs.append(np.log(np.maximum(s["modal_omega"], 1e-12)))
         residues.append(s["modal_residue_z"].reshape(-1, s["modal_residue_z"].shape[-1]))
 
-    xm = sx / max(n, 1)
-    xs = np.sqrt(np.maximum(sx2 / max(n, 1) - xm * xm, 1e-12))
+    xm = sx / max(n_node, 1)
+    xs = np.sqrt(np.maximum(sx2 / max(n_node, 1) - xm * xm, 1e-12))
+    em = se / max(n_edge, 1)
+    es = np.sqrt(np.maximum(se2 / max(n_edge, 1) - em * em, 1e-12))
     lo = np.stack(logs, axis=0).astype(np.float32)
     rr = np.concatenate(residues, axis=0).astype(np.float32)
     return {
         "x_mean": xm.astype(np.float32),
         "x_std": xs.astype(np.float32),
+        "edge_mean": em.astype(np.float32),
+        "edge_std": es.astype(np.float32),
         "omega_log_mean": lo.mean(axis=0).astype(np.float32),
         "omega_log_std": (lo.std(axis=0) + 1e-6).astype(np.float32),
         "residue_mean": rr.mean(axis=0).astype(np.float32),
@@ -91,43 +119,103 @@ def compute_stats(ds: H5Split) -> Dict[str, np.ndarray]:
     }
 
 
-class ModalResidueNet(nn.Module):
-    def __init__(self, in_dim: int, n_modes: int, hidden: int = 192):
+def mlp(in_dim: int, hidden: int, out_dim: int, layers: int = 2) -> nn.Sequential:
+    mods: List[nn.Module] = []
+    d = in_dim
+    for _ in range(max(layers - 1, 1)):
+        mods += [nn.Linear(d, hidden), nn.LayerNorm(hidden), nn.SiLU()]
+        d = hidden
+    mods.append(nn.Linear(d, out_dim))
+    return nn.Sequential(*mods)
+
+
+class MeshGraphBlock(nn.Module):
+    def __init__(self, hidden: int):
         super().__init__()
-        self.node = nn.Sequential(
-            nn.Linear(in_dim, hidden), nn.LayerNorm(hidden), nn.SiLU(),
-            nn.Linear(hidden, hidden), nn.LayerNorm(hidden), nn.SiLU(),
+        self.edge_mlp = mlp(hidden * 3, hidden, hidden, layers=2)
+        self.msg_mlp = mlp(hidden * 3, hidden, hidden, layers=2)
+        self.node_mlp = mlp(hidden * 2, hidden, hidden, layers=2)
+        self.edge_norm = nn.LayerNorm(hidden)
+        self.node_norm = nn.LayerNorm(hidden)
+
+    def forward(self, h: torch.Tensor, e: torch.Tensor, edge_index: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        src = edge_index[0].long()
+        dst = edge_index[1].long()
+        edge_in = torch.cat([h[src], h[dst], e], dim=-1)
+        e = self.edge_norm(e + self.edge_mlp(edge_in))
+
+        msg_in = torch.cat([h[src], h[dst], e], dim=-1)
+        m = self.msg_mlp(msg_in)
+        agg = torch.zeros_like(h)
+        agg.index_add_(0, dst, m)
+        deg = torch.zeros((h.shape[0], 1), dtype=h.dtype, device=h.device)
+        deg.index_add_(0, dst, torch.ones((dst.shape[0], 1), dtype=h.dtype, device=h.device))
+        agg = agg / torch.clamp(deg, min=1.0)
+
+        h = self.node_norm(h + self.node_mlp(torch.cat([h, agg], dim=-1)))
+        return h, e
+
+
+class MeshGraphModalResidueNet(nn.Module):
+    def __init__(self, node_in_dim: int, edge_in_dim: int, n_modes: int, hidden: int = 192, gnn_layers: int = 4):
+        super().__init__()
+        self.node_encoder = mlp(node_in_dim, hidden, hidden, layers=3)
+        self.edge_encoder = mlp(edge_in_dim, hidden, hidden, layers=3)
+        self.blocks = nn.ModuleList([MeshGraphBlock(hidden) for _ in range(gnn_layers)])
+        self.global_mlp = nn.Sequential(
+            nn.Linear(2 * hidden, hidden), nn.LayerNorm(hidden), nn.SiLU(),
             nn.Linear(hidden, hidden), nn.LayerNorm(hidden), nn.SiLU(),
         )
-        self.glob = nn.Sequential(
-            nn.Linear(2 * hidden, hidden), nn.SiLU(),
-            nn.Linear(hidden, hidden), nn.SiLU(),
-        )
-        self.omega = nn.Sequential(
+        self.omega_head = nn.Sequential(
             nn.Linear(hidden, hidden), nn.SiLU(),
             nn.Linear(hidden, n_modes),
         )
-        self.residue = nn.Sequential(
-            nn.Linear(2 * hidden, hidden), nn.SiLU(),
-            nn.Linear(hidden, hidden), nn.SiLU(),
+        # query h + global g + excitation h + query xyz + relative xyz
+        self.residue_head = nn.Sequential(
+            nn.Linear(3 * hidden + 6, hidden), nn.LayerNorm(hidden), nn.SiLU(),
+            nn.Linear(hidden, hidden), nn.LayerNorm(hidden), nn.SiLU(),
             nn.Linear(hidden, n_modes),
         )
 
-    def forward(self, x: torch.Tensor, q: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        h = self.node(x)
-        g = self.glob(torch.cat([h.mean(dim=0), h.max(dim=0).values], dim=0))
-        omega_norm = self.omega(g)
-        qh = h[q]
-        gg = g.unsqueeze(0).expand(qh.shape[0], -1)
-        residue_norm = self.residue(torch.cat([qh, gg], dim=1))
+    def forward(
+        self,
+        x: torch.Tensor,
+        edge_index: torch.Tensor,
+        edge_attr: torch.Tensor,
+        coords_norm: torch.Tensor,
+        q: torch.Tensor,
+        exc_idx: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        h = self.node_encoder(x)
+        e = self.edge_encoder(edge_attr)
+        for block in self.blocks:
+            h, e = block(h, e, edge_index)
+
+        g_raw = torch.cat([h.mean(dim=0), h.max(dim=0).values], dim=0)
+        g = self.global_mlp(g_raw)
+        omega_norm = self.omega_head(g)
+
+        exc_i = torch.clamp(exc_idx.long(), 0, h.shape[0] - 1)
+        hq = h[q]
+        he = h[exc_i].view(1, -1).expand(hq.shape[0], -1)
+        gg = g.view(1, -1).expand(hq.shape[0], -1)
+        q_xyz = coords_norm[q]
+        rel_xyz = q_xyz - coords_norm[exc_i].view(1, 3)
+        residue_norm = self.residue_head(torch.cat([hq, gg, he, q_xyz, rel_xyz], dim=-1))
         return omega_norm, residue_norm
 
 
 def to_tensors(s: Dict[str, np.ndarray], stats: Dict[str, np.ndarray], device: torch.device) -> Dict[str, torch.Tensor]:
     x = node_input(s)
     x = (x - stats["x_mean"][None, :]) / stats["x_std"][None, :]
+    edge_attr = (s["edge_attr"] - stats["edge_mean"][None, :]) / stats["edge_std"][None, :]
+    coords = s["points"] / GEOM_SCALE.reshape(1, 3)
     return {
         "x": torch.from_numpy(x).to(device, non_blocking=True),
+        "edge_index": torch.from_numpy(s["edge_index"]).long().to(device, non_blocking=True),
+        "edge_attr": torch.from_numpy(edge_attr.astype(np.float32)).to(device, non_blocking=True),
+        "coords": torch.from_numpy(coords.astype(np.float32)).to(device, non_blocking=True),
+        "exc_idx": torch.as_tensor(int(s["excitation_index"]), dtype=torch.long, device=device),
         "omega": torch.from_numpy(s["modal_omega"]).to(device, non_blocking=True),
         "residue": torch.from_numpy(s["modal_residue_z"]).to(device, non_blocking=True),
     }
@@ -184,8 +272,11 @@ def row_add_triplet(row: Dict[str, float], prefix: str, t: Tuple[float, float, f
 
 
 def modal_score(metrics: Dict[str, Tuple[float, float, float]]) -> float:
-    # 用验证集 modal_omega 与 modal_residue_z 的 RMS 误差作为保存最优模型的指标。
     return float(metrics["w_triplet"][2] + metrics["phiN_triplet"][2])
+
+
+def forward_model(model, t, q):
+    return model(t["x"], t["edge_index"], t["edge_attr"], t["coords"], q, t["exc_idx"])
 
 
 def train_epoch(model, ds, opt, scaler, stats, args, device):
@@ -200,10 +291,9 @@ def train_epoch(model, ds, opt, scaler, stats, args, device):
     for i in order:
         t = to_tensors(ds[i], stats, device)
         q = rand_query(t["x"].shape[0], args.query_nodes, device)
-
         opt.zero_grad(set_to_none=True)
         with torch.cuda.amp.autocast(enabled=amp_enabled):
-            omega_p, residue_p = model(t["x"], q)
+            omega_p, residue_p = forward_model(model, t, q)
             omega_t, residue_t = norm_targets(t, stats, q)
             loss_omega = nn.functional.mse_loss(omega_p.float(), omega_t.float())
             loss_phi = nn.functional.mse_loss(residue_p.float(), residue_t.float())
@@ -223,14 +313,9 @@ def train_epoch(model, ds, opt, scaler, stats, args, device):
             omega_errs.append(w_rel.detach().cpu().numpy())
             phi_errs.append(phi_rel.detach().cpu().numpy())
 
-        sums += np.array([
-            float(loss.detach().cpu()),
-            float(loss_omega.detach().cpu()),
-            float(loss_phi.detach().cpu()),
-        ])
+        sums += np.array([float(loss.detach().cpu()), float(loss_omega.detach().cpu()), float(loss_phi.detach().cpu())])
 
-    metrics = {"w_triplet": triplet_percent(omega_errs), "phiN_triplet": triplet_percent(phi_errs)}
-    return sums / max(len(order), 1), metrics
+    return sums / max(len(order), 1), {"w_triplet": triplet_percent(omega_errs), "phiN_triplet": triplet_percent(phi_errs)}
 
 
 @torch.no_grad()
@@ -245,7 +330,7 @@ def evaluate(model, ds, stats, args, device):
         t = to_tensors(ds[i], stats, device)
         q = rand_query(t["x"].shape[0], args.eval_query_nodes, device)
         with torch.cuda.amp.autocast(enabled=amp_enabled):
-            omega_n, residue_n = model(t["x"], q)
+            omega_n, residue_n = forward_model(model, t, q)
         omega, residue = denorm(omega_n, residue_n, stats)
 
         w_rel = torch.abs(omega - t["omega"]) / torch.clamp(torch.abs(t["omega"]), min=1e-12) * 100.0
@@ -256,16 +341,12 @@ def evaluate(model, ds, stats, args, device):
         phi_np = phi_rel.detach().cpu().numpy()
         omega_errs.append(w_np)
         phi_errs.append(phi_np)
-
         row = {"sample": i}
         row_add_triplet(row, "w", triplet_percent([w_np]))
         row_add_triplet(row, "phiN", triplet_percent([phi_np]))
         rows.append(row)
 
-    mean = {
-        "w_triplet": triplet_percent(omega_errs),
-        "phiN_triplet": triplet_percent(phi_errs),
-    }
+    mean = {"w_triplet": triplet_percent(omega_errs), "phiN_triplet": triplet_percent(phi_errs)}
     mean["modal_score"] = modal_score(mean)
     return mean, rows
 
@@ -288,11 +369,12 @@ def append_csv_row(path: Path, row: Dict[str, float]) -> None:
         w.writerow(row)
 
 
-def checkpoint_payload(model, stats, in_dim, n_modes, args, epoch, best_value):
+def checkpoint_payload(model, stats, in_dim, edge_dim, n_modes, args, epoch, best_value):
     return {
         "model": model.state_dict(),
         "stats": stats,
-        "in_dim": in_dim,
+        "node_in_dim": in_dim,
+        "edge_in_dim": edge_dim,
         "n_modes": n_modes,
         "epoch": epoch,
         "best_modal_score": best_value,
@@ -308,6 +390,7 @@ def main():
     p.add_argument("--query-nodes", type=int, default=512)
     p.add_argument("--eval-query-nodes", type=int, default=1024)
     p.add_argument("--hidden", type=int, default=192)
+    p.add_argument("--gnn-layers", type=int, default=4)
     p.add_argument("--lr", type=float, default=1e-3)
     p.add_argument("--weight-decay", type=float, default=1e-5)
     p.add_argument("--omega-loss-weight", type=float, default=1.0)
@@ -329,22 +412,25 @@ def main():
     train = H5Split(args.data_dir, "train")
     val = H5Split(args.data_dir, "val")
     test = H5Split(args.data_dir, "test")
-
     stats = compute_stats(train)
     np.savez(args.out_dir / "normalization_stats.npz", **stats)
+
     first = train[0]
     in_dim = node_input(first).shape[1]
+    edge_dim = first["edge_attr"].shape[1]
     n_modes = first["modal_omega"].shape[0]
-    model = ModalResidueNet(in_dim, n_modes, args.hidden).to(device)
+    model = MeshGraphModalResidueNet(in_dim, edge_dim, n_modes, args.hidden, args.gnn_layers).to(device)
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=max(args.epochs, 1))
     scaler = torch.cuda.amp.GradScaler(enabled=bool(args.fp16 and device.type == "cuda"))
 
+    total_params = sum(p.numel() for p in model.parameters())
+    print(f">>> data={args.data_dir}, train/val/test={len(train)}/{len(val)}/{len(test)}, device={device}, fp16={args.fp16}")
+    print(f">>> MeshGraph modal-residue model: node_dim={in_dim}, edge_dim={edge_dim}, hidden={args.hidden}, layers={args.gnn_layers}, params={total_params:,}")
+    print(">>> targets: modal_omega + modal_residue_z; frequency head uses graph topology edge_index/edge_attr.")
+
     best = float("inf")
     hist: List[Dict[str, float]] = []
-    print(f">>> data={args.data_dir}, train/val/test={len(train)}/{len(val)}/{len(test)}, device={device}, fp16={args.fp16}")
-    print(">>> targets: modal_omega + modal_residue_z only; no point_frf is required for training.")
-
     for ep in range(1, args.epochs + 1):
         tr_loss, tr_m = train_epoch(model, train, opt, scaler, stats, args, device)
         sched.step()
@@ -353,8 +439,8 @@ def main():
         score = float(va["modal_score"])
         if score < best:
             best = score
-            torch.save(checkpoint_payload(model, stats, in_dim, n_modes, args, ep, best), args.out_dir / "best_model.pt")
-        torch.save(checkpoint_payload(model, stats, in_dim, n_modes, args, ep, best), args.out_dir / "last_model.pt")
+            torch.save(checkpoint_payload(model, stats, in_dim, edge_dim, n_modes, args, ep, best), args.out_dir / "best_model.pt")
+        torch.save(checkpoint_payload(model, stats, in_dim, edge_dim, n_modes, args, ep, best), args.out_dir / "last_model.pt")
 
         row: Dict[str, float] = {
             "epoch": ep,
@@ -372,20 +458,10 @@ def main():
         append_csv_row(log_csv, row)
 
         if ep == 1 or ep % max(args.log_every, 1) == 0 or ep == args.epochs:
-            print(
-                f"Epoch {ep:4d} | "
-                f"w=[{fmt_triplet(tr_m['w_triplet'], 1)}]%  "
-                f"phiN=[{fmt_triplet(tr_m['phiN_triplet'], 1)}]%"
-                f"loss={fmt_loss(float(tr_loss[0]))}"
-            )
-            print(
-                f"Val modal | "
-                f"w=[{fmt_triplet(va['w_triplet'], 3)}]%  "
-                f"phiN=[{fmt_triplet(va['phiN_triplet'], 1)}]%"
-            )
+            print(f"Epoch {ep:4d} | w=[{fmt_triplet(tr_m['w_triplet'], 1)}]%  phiN=[{fmt_triplet(tr_m['phiN_triplet'], 1)}]%loss={fmt_loss(float(tr_loss[0]))}")
+            print(f"Val modal | w=[{fmt_triplet(va['w_triplet'], 3)}]%  phiN=[{fmt_triplet(va['phiN_triplet'], 1)}]%")
 
     write_csv(args.out_dir / "history.csv", hist)
-
     ckpt = torch.load(args.out_dir / "best_model.pt", map_location=device)
     model.load_state_dict(ckpt["model"])
     va, vr = evaluate(model, val, stats, args, device)
@@ -395,16 +471,8 @@ def main():
 
     summary = {
         "best_modal_score": best,
-        "val": {
-            "w_mean_max_rms_pct": list(va["w_triplet"]),
-            "phiN_mean_max_rms_pct": list(va["phiN_triplet"]),
-            "modal_score": va["modal_score"],
-        },
-        "test": {
-            "w_mean_max_rms_pct": list(te["w_triplet"]),
-            "phiN_mean_max_rms_pct": list(te["phiN_triplet"]),
-            "modal_score": te["modal_score"],
-        },
+        "val": {"w_mean_max_rms_pct": list(va["w_triplet"]), "phiN_mean_max_rms_pct": list(va["phiN_triplet"]), "modal_score": va["modal_score"]},
+        "test": {"w_mean_max_rms_pct": list(te["w_triplet"]), "phiN_mean_max_rms_pct": list(te["phiN_triplet"]), "modal_score": te["modal_score"]},
     }
     with open(args.out_dir / "summary.json", "w", encoding="utf-8") as f:
         json.dump(summary, f, indent=2, ensure_ascii=False)
