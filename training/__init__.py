@@ -1,4 +1,17 @@
-from .modal_losses import modal_loss
-from .modal_trainer import evaluate_modal, train_modal
+from .modal_losses_scaled import frequency_loss, modal_loss, weighted_phi_z_terms
+from .modal_trainer_simple import evaluate_modal, run_epoch, train_modal
 
-__all__ = ["modal_loss", "train_modal", "evaluate_modal"]
+# Backward-compatible aliases for older sample scripts.
+train = train_modal
+evaluate = evaluate_modal
+
+__all__ = [
+    "frequency_loss",
+    "modal_loss",
+    "weighted_phi_z_terms",
+    "train_modal",
+    "evaluate_modal",
+    "run_epoch",
+    "train",
+    "evaluate",
+]
