@@ -23,7 +23,7 @@ CONFIG = {
     "omega_loss_weight": 1.0,
     "phi_loss_weight": 3.0,
     "mac_weight": 5.0,
-    "scale_weight": 1.0,
+    "scale_weight": 0.05,
     "n_modes": 3,
     "graph": {"knn_k": 12},
     "gradient_clip": 2.0,
