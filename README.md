@@ -6,9 +6,10 @@
 
 ```text
 README.md
+run_train_modal_residue.py          # 推荐训练入口：所有常用参数集中写在这里
 modal_residue/
-├── train_modal_residue_model.py   # 唯一训练入口：参数、数据读取、模型、损失、训练、验证、测试都在这里
-└── validate_dataset.py            # 检查本地 HDF5 数据集质量
+├── train_modal_residue_model.py    # 模型、损失、训练循环、验证、测试
+└── validate_dataset.py             # 检查本地 HDF5 数据集质量
 ```
 
 生成的 ANSYS/HDF5 数据集体积较大，保存在本地，不提交到 GitHub。
@@ -43,9 +44,39 @@ F:/pytorch_cuda12/python.exe -B modal_residue/validate_dataset.py --data-dir dat
 8. point_frf 是否满足模态叠加公式。
 ```
 
-## 训练入口
+## 推荐训练入口
 
-训练只使用一个入口文件：
+推荐直接运行根目录的训练入口：
+
+```powershell
+F:/pytorch_cuda12/python.exe -B run_train_modal_residue.py
+```
+
+所有常用参数都集中放在 `run_train_modal_residue.py` 顶部，例如：
+
+```text
+DATA_DIR
+OUT_DIR
+VALIDATE_BEFORE_TRAIN
+MIN_RELATIVE_GAP
+EPOCHS
+QUERY_NODES
+EVAL_QUERY_NODES
+HIDDEN
+LEARNING_RATE
+WEIGHT_DECAY
+GRAD_CLIP_NORM
+FRF_LOSS_WEIGHT
+LOG_EVERY
+SEED
+DEVICE
+```
+
+这样后续改训练参数时，只需要改 `run_train_modal_residue.py`，不用在命令行写一长串参数。
+
+## 底层训练脚本
+
+底层训练脚本为：
 
 ```text
 modal_residue/train_modal_residue_model.py
@@ -67,9 +98,9 @@ modal_residue/train_modal_residue_model.py
 
 不使用 `config.yaml`，也不单独拆 `losses.py`。
 
-## 训练基线模型
+## 命令行训练方式
 
-在仓库根目录运行：
+如果不使用根目录入口，也可以直接运行底层训练脚本：
 
 ```powershell
 F:/pytorch_cuda12/python.exe -B modal_residue/train_modal_residue_model.py `
@@ -86,7 +117,9 @@ F:/pytorch_cuda12/python.exe -B modal_residue/train_modal_residue_model.py `
 ```text
 runs/modal_residue_baseline/
 ├── best_model.pt
+├── last_model.pt
 ├── normalization_stats.npz
+├── training_log.csv
 ├── history.csv
 ├── val_metrics.csv
 ├── test_metrics.csv
