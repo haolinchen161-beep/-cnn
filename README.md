@@ -103,20 +103,16 @@ min_mode_weight = 0.2
 
 ## 5. 训练
 
+唯一训练入口：
+
 ```bash
-python -u modal_run.py
+python -u sample/run_validation.py
 ```
 
 或显式指定：
 
 ```bash
-python -u modal_run.py --data_dir ansys/data --out_dir sample/output_modal_zonly --n_modes 3
-```
-
-旧入口也可用，它现在会转到同一套训练流程：
-
-```bash
-python -u sample/run_validation.py
+python -u sample/run_validation.py --data_dir ansys/data --out_dir sample/output_modal_zonly --n_modes 3
 ```
 
 ## 6. 评估
@@ -159,5 +155,5 @@ mode_weight_mode1 / mode2 / mode3
 如果 HDF5 中已经包含至少 6 阶模态，可直接运行：
 
 ```bash
-python -u modal_run.py --n_modes 6 --data_dir ansys/data_20modes
+python -u sample/run_validation.py --n_modes 6 --data_dir ansys/data_20modes
 ```
