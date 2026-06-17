@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 """
 ANSYS 凹槽工件模态留数数据集生成程序。
 
@@ -13,14 +14,15 @@ ANSYS 凹槽工件模态留数数据集生成程序。
 3. 激励点来自随机已加工凹槽的底面中心附近节点，且不贴凹槽边缘。
 4. 频率上限默认按第 N_MODES 阶自适应，不再固定 5000 Hz；频率网格在 float32 保存后仍严格递增，并优先保护各模态峰附近频点。
 
-默认生成 30 个有效样本，保存到 ./data_modal_residue_filtered/train.h5、val.h5、test.h5。
-注意：这里只是常规数据集划分，不包含“分阶段训练”逻辑。
+默认生成 300 个有效样本，保存到 ./data_modal_residue_filtered300/train.h5、val.h5、test.h5。
+本版采用受控随机数据集：clamp_level × coverage_level 分层，保留 5/6/7 凹槽布局和边界扰动。
 默认加入一个简单近频过滤：任意相邻模态相对间隔 < MIN_RELATIVE_MODE_GAP 时跳过，默认 0.03。
-可通过环境变量覆盖：N_SAMPLES、N_TRAIN、N_VAL、N_TEST、N_MODES、N_FREQS、MIN_RELATIVE_MODE_GAP、FRF_OUTPUT_SCALE。
+可通过环境变量覆盖：N_SAMPLES、N_TRAIN、N_VAL、N_TEST、N_MODES、N_FREQS、MIN_RELATIVE_MODE_GAP、FRF_OUTPUT_SCALE、SAVE_POINT_FRF。
 """
 from __future__ import annotations
 
 import csv
+import math
 import os
 import random
 import time
@@ -38,10 +40,10 @@ SEED = int(os.getenv("DATASET_SEED", "2"))
 np.random.seed(SEED)
 random.seed(SEED)
 
-N_SAMPLES = int(os.getenv("N_SAMPLES", "30"))
-N_TRAIN = int(os.getenv("N_TRAIN", "24"))
-N_VAL = int(os.getenv("N_VAL", "3"))
-N_TEST = int(os.getenv("N_TEST", "3"))
+N_SAMPLES = int(os.getenv("N_SAMPLES", "300"))
+N_TRAIN = int(os.getenv("N_TRAIN", "240"))
+N_VAL = int(os.getenv("N_VAL", "30"))
+N_TEST = int(os.getenv("N_TEST", "30"))
 assert N_TRAIN + N_VAL + N_TEST == N_SAMPLES, "N_TRAIN + N_VAL + N_TEST must equal N_SAMPLES"
 
 N_MODES = int(os.getenv("N_MODES", "10"))
@@ -57,9 +59,13 @@ FREQ_MAX_MARGIN_BW_MULT = float(os.getenv("FREQ_MAX_MARGIN_BW_MULT", "4.0"))
 FREQ_MAX_HARD_HZ = float(os.getenv("FREQ_MAX_HARD_HZ", "50000.0"))
 FREQ_GRID_MIN_STEP_HZ = float(os.getenv("FREQ_GRID_MIN_STEP_HZ", "0.01"))
 MESH_SIZE = 0.006
-ZETA_MATERIAL = 0.002
+ZETA_MATERIAL = float(os.getenv("ZETA_MATERIAL", "0.002"))
+ZETA_JOINT_BASE = float(os.getenv("ZETA_JOINT_BASE", "0.015"))
+ZETA_JOINT_JITTER = float(os.getenv("ZETA_JOINT_JITTER", "0.20"))
 # FRF 默认保存为物理量 m/N；如确需数值缩放，可设置 FRF_OUTPUT_SCALE。
 FRF_OUTPUT_SCALE = float(os.getenv("FRF_OUTPUT_SCALE", "1.0"))
+SAVE_POINT_FRF = os.getenv("SAVE_POINT_FRF", "0").strip().lower() in {"1", "true", "yes", "y"}
+SAVE_POINT_FRF_QC_COUNT = int(os.getenv("SAVE_POINT_FRF_QC_COUNT", "5"))
 # 简单近频过滤：若任意相邻模态的相对间隔 (f_{r+1}-f_r)/f_r 小于该阈值，则跳过样本。
 # 设置为 0 可关闭过滤。默认 0.03，即 3%。
 MIN_RELATIVE_MODE_GAP = float(os.getenv("MIN_RELATIVE_MODE_GAP", "0.03"))
@@ -68,8 +74,8 @@ MIN_RELATIVE_MODE_GAP = float(os.getenv("MIN_RELATIVE_MODE_GAP", "0.03"))
 USE_MASS_NORMALIZATION = True
 USE_LUMPED_MASS = False
 
-OUT_DIR = os.getenv("OUT_DIR", os.path.join(os.path.dirname(__file__), "data_modal_residue_filtered"))
-VIZ_DIR = os.getenv("VIZ_DIR", os.path.join(os.path.dirname(__file__), "mesh_viz_modal_residue_filtered"))
+OUT_DIR = os.getenv("OUT_DIR", os.path.join(os.path.dirname(__file__), "data_modal_residue_filtered300"))
+VIZ_DIR = os.getenv("VIZ_DIR", os.path.join(os.path.dirname(__file__), "mesh_viz_modal_residue_filtered300"))
 os.makedirs(OUT_DIR, exist_ok=True)
 os.makedirs(VIZ_DIR, exist_ok=True)
 
@@ -80,20 +86,32 @@ L_BASE, W_BASE, H_BASE = 0.160, 0.060, 0.010
 E_RANGE = (0.95, 1.05)
 RHO_RANGE = (0.97, 1.03)
 
-GRID_JITTER = 0.15
+GRID_JITTER_RANGE = (float(os.getenv("GRID_JITTER_MIN", "0.08")), float(os.getenv("GRID_JITTER_MAX", "0.15")))
 GAP_ABS = 0.006
 BORDER_ABS = 0.006
-POCKET_DEPTH_RANGE = (0.30, 0.60)
+TARGET_DEPTH_RANGE = (float(os.getenv("TARGET_DEPTH_MIN", "0.25")), float(os.getenv("TARGET_DEPTH_MAX", "0.65")))
+TARGET_DEPTH_MODE = float(os.getenv("TARGET_DEPTH_MODE", "0.45"))
+CURRENT_PROGRESS_RANGE = (float(os.getenv("CURRENT_PROGRESS_MIN", "0.25")), float(os.getenv("CURRENT_PROGRESS_MAX", "1.00")))
 
-K_CORNER_RANGE = (5e6, 1e8)
-K_SIDE_RANGE = (1e6, 3e7)
-ZETA_JOINT_RANGE = (0.005, 0.05)
+CLAMP_LEVELS = {
+    "soft": {"K_corner_base": 1.5e7, "K_side_base": 3.0e6},
+    "normal": {"K_corner_base": 3.0e7, "K_side_base": 8.0e6},
+    "hard": {"K_corner_base": 6.0e7, "K_side_base": 1.6e7},
+}
+CLAMP_WEIGHTS = {"soft": 0.25, "normal": 0.50, "hard": 0.25}
+COVERAGE_WEIGHTS = {"low": 0.25, "medium": 0.50, "high": 0.25}
+CLAMP_LEVEL_CODE = {"soft": 0, "normal": 1, "hard": 2}
+COVERAGE_LEVEL_CODE = {"low": 0, "medium": 1, "high": 2}
+K_CORNER_JITTER = float(os.getenv("K_CORNER_JITTER", "0.20"))
+K_SIDE_JITTER = float(os.getenv("K_SIDE_JITTER", "0.30"))
 M_REF = 0.01
 
 
 # ===================== 凹槽区域定义 =====================
-def generate_region_division(n_cols, n_rows, L, W, jitter=GRID_JITTER,
+def generate_region_division(n_cols, n_rows, L, W, jitter=None,
                              gap=GAP_ABS, border=BORDER_ABS):
+    if jitter is None:
+        jitter = random.uniform(GRID_JITTER_RANGE[0], GRID_JITTER_RANGE[1])
     n_gaps_x = n_cols - 1
     n_gaps_y = n_rows - 1
     available_x = L - 2 * border - n_gaps_x * gap
@@ -152,6 +170,150 @@ POCKET_CELLS_7 = [
     [7, 8],
     [12, 13],
 ]
+
+
+# ===================== 受控随机采样计划 =====================
+def _allocate_counts(total, labels, weights):
+    """按权重把 total 个样本分配给 labels，使用 largest remainder 保证总数严格相等。"""
+    raw = np.array([float(weights[label]) for label in labels], dtype=np.float64)
+    raw = raw / raw.sum() * int(total)
+    counts = np.floor(raw).astype(int)
+    remainder = int(total) - int(counts.sum())
+    if remainder > 0:
+        order = np.argsort(-(raw - counts))
+        for idx in order[:remainder]:
+            counts[idx] += 1
+    return {label: int(counts[i]) for i, label in enumerate(labels)}
+
+
+def _balanced_layouts(n):
+    """在一个 clamp×coverage 组内部尽量均匀安排 5/6/7 布局。"""
+    layouts = [5, 6, 7]
+    out = [layouts[i % len(layouts)] for i in range(int(n))]
+    random.shuffle(out)
+    return out
+
+
+def build_sample_plan(n_train, n_val, n_test):
+    """
+    生成固定长度的样本计划。
+
+    主分层只用 clamp_level × coverage_level = 3×3。
+    每个 split 内按相同权重分配，保证 train/val/test 都覆盖 soft/normal/hard 和 low/medium/high。
+    layout_type=5/6/7 不作为硬分层，只在每个组内部尽量均匀出现。
+    """
+    plan = []
+    split_specs = [("train", int(n_train)), ("val", int(n_val)), ("test", int(n_test))]
+    clamp_labels = ["soft", "normal", "hard"]
+    coverage_labels = ["low", "medium", "high"]
+    combo_labels = [(c, g) for c in clamp_labels for g in coverage_labels]
+    combo_weights = {
+        (c, g): CLAMP_WEIGHTS[c] * COVERAGE_WEIGHTS[g]
+        for c, g in combo_labels
+    }
+    for split, n_split in split_specs:
+        combo_counts = _allocate_counts(n_split, combo_labels, combo_weights)
+        for (clamp_level, coverage_level), n_combo in combo_counts.items():
+            for layout_type in _balanced_layouts(n_combo):
+                plan.append({
+                    "split": split,
+                    "clamp_level": clamp_level,
+                    "coverage_level": coverage_level,
+                    "layout_type": int(layout_type),
+                })
+    random.shuffle(plan)
+    assert len(plan) == int(n_train + n_val + n_test)
+    return plan
+
+
+def sample_clamp_parameters(clamp_level):
+    """样本级装夹强弱 + 样本内部小扰动。"""
+    cfg = CLAMP_LEVELS[clamp_level]
+    k_corner_base = float(cfg["K_corner_base"])
+    k_side_base = float(cfg["K_side_base"])
+    K_corners, C_corners, zeta_corners = [], [], []
+    K_sides, C_sides, zeta_sides = [], [], []
+
+    for _ in range(4):
+        kc = k_corner_base * random.uniform(1.0 - K_CORNER_JITTER, 1.0 + K_CORNER_JITTER)
+        zc = ZETA_JOINT_BASE * random.uniform(1.0 - ZETA_JOINT_JITTER, 1.0 + ZETA_JOINT_JITTER)
+        K_corners.append(kc)
+        C_corners.append(2.0 * zc * np.sqrt(kc * M_REF))
+        zeta_corners.append(zc)
+    for _ in range(3):
+        ks = k_side_base * random.uniform(1.0 - K_SIDE_JITTER, 1.0 + K_SIDE_JITTER)
+        zs = ZETA_JOINT_BASE * random.uniform(1.0 - ZETA_JOINT_JITTER, 1.0 + ZETA_JOINT_JITTER)
+        K_sides.append(ks)
+        C_sides.append(2.0 * zs * np.sqrt(ks * M_REF))
+        zeta_sides.append(zs)
+    return (
+        K_corners, C_corners, K_sides, C_sides,
+        np.asarray(zeta_corners + zeta_sides, dtype=np.float32),
+        k_corner_base, k_side_base,
+    )
+
+
+def choose_layout(layout_type):
+    if int(layout_type) == 5:
+        return POCKET_CELLS_5, 4, 3
+    if int(layout_type) == 6:
+        return POCKET_CELLS_6, 4, 3
+    if int(layout_type) == 7:
+        return POCKET_CELLS_7, 5, 3
+    raise ValueError(f"unknown layout_type={layout_type}")
+
+
+def sample_active_count(num_cells, coverage_level):
+    """coverage 只控制加工区域数量，不控制深度。"""
+    n = int(num_cells)
+    if coverage_level == "low":
+        lo, hi = 1, max(1, int(math.ceil(0.30 * n)))
+    elif coverage_level == "medium":
+        lo = max(1, int(math.floor(0.30 * n)))
+        hi = max(lo, int(math.ceil(0.65 * n)))
+    elif coverage_level == "high":
+        lo = max(1, int(math.floor(0.65 * n)))
+        hi = n
+    else:
+        raise ValueError(f"unknown coverage_level={coverage_level}")
+    return random.randint(lo, hi)
+
+
+def sample_machining_state(num_cells, coverage_level):
+    """
+    返回某一加工时刻的状态。
+    已完成区域 depth=target_depth；当前加工区域 depth=target_depth*current_progress；未加工区域 depth=0。
+    """
+    order = random.sample(range(int(num_cells)), int(num_cells))
+    active_count = sample_active_count(num_cells, coverage_level)
+    target_depth = random.triangular(TARGET_DEPTH_RANGE[0], TARGET_DEPTH_RANGE[1], TARGET_DEPTH_MODE)
+
+    # 大部分样本保留一个“当前加工”区域；高覆盖且全部区域激活时，少量样本允许全部完成。
+    all_finished = (active_count == int(num_cells)) and (random.random() < 0.20)
+    if all_finished:
+        finished_count = active_count
+        current_cell = -1
+        current_progress = 1.0
+    else:
+        finished_count = max(0, active_count - 1)
+        current_cell = int(order[finished_count])
+        current_progress = random.uniform(CURRENT_PROGRESS_RANGE[0], CURRENT_PROGRESS_RANGE[1])
+
+    depth_by_cell = np.zeros(int(num_cells), dtype=np.float32)
+    for cell in order[:finished_count]:
+        depth_by_cell[int(cell)] = target_depth
+    if current_cell >= 0:
+        depth_by_cell[current_cell] = target_depth * current_progress
+
+    return {
+        "pocket_order": order,
+        "active_count": int(active_count),
+        "finished_count": int(finished_count),
+        "current_cell": int(current_cell),
+        "current_progress": float(current_progress),
+        "target_depth_ratio": float(target_depth),
+        "depth_by_cell": depth_by_cell,
+    }
 
 
 # ===================== 图边特征 =====================
@@ -253,9 +415,8 @@ def select_bottom_center_excitation(points, pocket_records):
         width, height = xmax - xmin, ymax - ymin
         if width <= 0 or height <= 0:
             continue
-
         center = np.array([(xmin + xmax) * 0.5, (ymin + ymax) * 0.5, z0], dtype=np.float32)
-        min_size = min(width, height)
+        min_size = max(min(width, height), 1e-6)
         margin_list = [
             min(0.20 * min_size, 0.45 * MESH_SIZE),
             min(0.15 * min_size, 0.35 * MESH_SIZE),
@@ -509,13 +670,13 @@ def _mode_peak_offsets(mode_strength_ratio):
     if mode_strength_ratio >= 0.50:
         return np.array([-3.0, -2.0, -1.0, -0.5, 0.0, 0.5, 1.0, 2.0, 3.0], dtype=np.float64)
     if mode_strength_ratio >= 0.15:
-        return np.array([-2.5, -1.5, -0.75, 0.0, 0.75, 1.5, 2.5], dtype=np.float64)
-    return np.array([-2.0, -1.0, 0.0, 1.0, 2.0], dtype=np.float64)
+        return np.array([-2.5, -1.25, -0.5, 0.0, 0.5, 1.25, 2.5], dtype=np.float64)
+    return np.array([-2.0, -0.75, 0.0, 0.75, 2.0], dtype=np.float64)
 
 
 def make_frequency_grid(omega_k, zeta_k, phi_z=None, exc_idx=None):
     """
-    自适应 N_FREQS 点频率网格。
+    生成自适应频率网格。
 
     改进点：
     1. 频率上限不再固定为 5000 Hz，而是默认覆盖第 N_MODES 阶模态峰。
@@ -602,6 +763,12 @@ def save_h5(name, idx_slice, arrays):
         f.attrs["frf_output_scale"] = FRF_OUTPUT_SCALE
         f.attrs["min_relative_mode_gap"] = MIN_RELATIVE_MODE_GAP
         f.attrs["freq_grid_min_step_hz"] = FREQ_GRID_MIN_STEP_HZ
+        f.attrs["sampling_strategy"] = "stratified clamp_level x coverage_level; balanced layout_type 5/6/7 inside each group"
+        f.attrs["save_point_frf"] = int(SAVE_POINT_FRF)
+        f.attrs["save_point_frf_qc_count"] = SAVE_POINT_FRF_QC_COUNT
+        f.attrs["zeta_material"] = ZETA_MATERIAL
+        f.attrs["zeta_joint_base"] = ZETA_JOINT_BASE
+        f.attrs["zeta_joint_jitter"] = ZETA_JOINT_JITTER
         f.attrs["description"] = "Modal-residue dataset generated by mass-normalized modal analysis and Python modal superposition."
         for i, idx in enumerate(idxs):
             grp = f.create_group(f"sample_{i}")
@@ -624,6 +791,8 @@ sampler = qmc.Sobol(d=2, scramble=True, seed=SEED)
 sobol_samples = sampler.random(n=N_SAMPLES + SOBOL_BUFFER)
 scaled_sobol = qmc.scale(sobol_samples, [E_RANGE[0], RHO_RANGE[0]], [E_RANGE[1], RHO_RANGE[1]])
 
+SAMPLE_PLAN = build_sample_plan(N_TRAIN, N_VAL, N_TEST)
+
 print(f"配置: {N_SAMPLES}样本, train/val/test={N_TRAIN}/{N_VAL}/{N_TEST}, {N_MODES}阶模态, {N_FREQS}个频率点")
 print(f"模态归一化: mass, 质量矩阵: {'lumped' if USE_LUMPED_MASS else 'consistent'}")
 if MIN_RELATIVE_MODE_GAP > 0:
@@ -637,6 +806,8 @@ if FREQ_MAX_FIXED is None:
 else:
     print(f"频率上限: 固定 FREQ_MAX_HZ={FREQ_MAX_FIXED:g} Hz")
 print(f"FRF输出缩放: FRF_OUTPUT_SCALE={FRF_OUTPUT_SCALE:g}，默认物理单位 m/N")
+print(f"FRF保存: SAVE_POINT_FRF={int(SAVE_POINT_FRF)}, QC_COUNT={SAVE_POINT_FRF_QC_COUNT}")
+print("采样: clamp_level×coverage_level 分层；layout 5/6/7 组内均衡；深度独立三角分布；边界 jitter 受控随机")
 print(f"网格: SOLID187, MESH_SIZE={MESH_SIZE*1000:.1f} mm")
 
 print("\n>>> 连接 ANSYS MAPDL...")
@@ -671,20 +842,51 @@ arrays = {
     "pocket_depth_ratio": [],
     "excitation_index": [],
     "excitation_coord": [],
+    "sample_id_global": [],
+    "split_code": [],
+    "clamp_level_code": [],
+    "coverage_level_code": [],
+    "layout_type": [],
+    "grid_jitter": [],
+    "target_depth_ratio": [],
+    "current_progress": [],
+    "finished_count": [],
+    "current_cell": [],
+    "cell_depth_ratio": [],
+    "pocket_order": [],
+    "cell_bounds": [],
+    "spring_k_summary": [],
+    "near_mode_summary": [],
+    "removed_volume_ratio": [],
 }
 
 csv_path = os.path.join(OUT_DIR, "sample_log.csv")
 csv_file = open(csv_path, "w", newline="", encoding="utf-8-sig")
 csv_writer = csv.writer(csv_file)
 csv_header = [
-    "sample", "n_nodes", "n_edges", "n_pockets_to_machine", "n_pocket_scheme",
-    "depth_range_%", "cut_nodes/bottom_nodes", "exc_x_mm", "exc_y_mm", "exc_z_mm",
-    "exc_pocket_id", "exc_margin_mm", "n_spring_areas", "n_spring_nodes",
+    "sample", "split", "plan_index",
+    "clamp_level", "coverage_level", "layout_type", "n_cols", "n_rows",
+    "n_nodes", "n_edges", "n_pockets_to_machine", "n_pocket_scheme",
+    "target_depth_ratio", "depth_range_%", "current_progress", "finished_count", "current_cell", "pocket_order",
+    "grid_jitter", "removed_volume_ratio", "cut_region_fraction", "pocket_bottom_fraction", "cut_nodes/bottom_nodes",
+    "exc_x_mm", "exc_y_mm", "exc_z_mm", "exc_pocket_id", "exc_margin_mm",
+    "n_spring_areas", "n_spring_nodes",
+    "K_corner_base", "K_side_base",
+    "K_corner_mean", "K_corner_min", "K_corner_max",
+    "K_side_mean", "K_side_min", "K_side_max",
+    "spring_k_sum", "spring_k_mean_nonzero", "spring_k_max",
+    "zeta_joint_base", "zeta_joint_mean", "zeta_joint_min", "zeta_joint_max",
     "modal_norm", "mass_matrix", "n_modes", "n_freqs",
     "freq_min_Hz", "freq_max_Hz", "df_min_Hz",
     "fN_Hz", "min_mode_gap_Hz", "min_relative_gap", "min_relative_gap_pair",
-    "E_ratio", "rho_ratio", "n_cols", "n_rows", "frf_output_scale",
+    "near_mode_flag", "very_near_mode_flag",
+    "E_ratio", "rho_ratio", "frf_output_scale", "save_point_frf",
 ]
+csv_header += [f"K_corner_{i+1}" for i in range(4)]
+csv_header += [f"K_side_{i+1}" for i in range(3)]
+csv_header += [f"cell_depth_{i+1:02d}" for i in range(7)]
+for i in range(7):
+    csv_header += [f"cell_{i+1:02d}_x0_mm", f"cell_{i+1:02d}_x1_mm", f"cell_{i+1:02d}_y0_mm", f"cell_{i+1:02d}_y1_mm"]
 csv_header += [f"f{k+1:02d}_Hz" for k in range(N_MODES)]
 csv_header += [f"zeta{k+1:02d}" for k in range(N_MODES)]
 csv_writer.writerow(csv_header)
@@ -716,38 +918,52 @@ while valid_samples < N_SAMPLES:
 
     try:
         # ---------- 1. 采样参数 ----------
+        plan_rec = SAMPLE_PLAN[valid_samples]
+        split_name = plan_rec["split"]
+        clamp_level = plan_rec["clamp_level"]
+        coverage_level = plan_rec["coverage_level"]
+        layout_type = int(plan_rec["layout_type"])
+
         E = E_BASE * scaled_sobol[sobol_idx, 0]
         rho = RHO_BASE * scaled_sobol[sobol_idx, 1]
         L, W, H = L_BASE, W_BASE, H_BASE
 
-        K_corners, C_corners, K_sides, C_sides = [], [], [], []
-        for _ in range(4):
-            kc = 10 ** random.uniform(np.log10(K_CORNER_RANGE[0]), np.log10(K_CORNER_RANGE[1]))
-            zc = random.uniform(*ZETA_JOINT_RANGE)
-            K_corners.append(kc)
-            C_corners.append(2.0 * zc * np.sqrt(kc * M_REF))
-        for _ in range(3):
-            ks = 10 ** random.uniform(np.log10(K_SIDE_RANGE[0]), np.log10(K_SIDE_RANGE[1]))
-            zs = random.uniform(*ZETA_JOINT_RANGE)
-            K_sides.append(ks)
-            C_sides.append(2.0 * zs * np.sqrt(ks * M_REF))
+        (
+            K_corners, C_corners, K_sides, C_sides, zeta_joint_values,
+            K_corner_base, K_side_base,
+        ) = sample_clamp_parameters(clamp_level)
 
         mapdl.mp("EX", 1, E)
         mapdl.mp("PRXY", 1, PRXY_BASE)
         mapdl.mp("DENS", 1, rho)
 
         # ---------- 2. 几何与凹槽 ----------
-        num_machined = random.choice([5, 6, 7])
-        if num_machined == 5:
-            pocket_cells, n_cols, n_rows = POCKET_CELLS_5, 4, 3
-        elif num_machined == 6:
-            pocket_cells, n_cols, n_rows = POCKET_CELLS_6, 4, 3
-        else:
-            pocket_cells, n_cols, n_rows = POCKET_CELLS_7, 5, 3
+        num_machined = layout_type
+        pocket_cells, n_cols, n_rows = choose_layout(layout_type)
+        grid_jitter = random.uniform(GRID_JITTER_RANGE[0], GRID_JITTER_RANGE[1])
+        x_pockets, y_pockets = generate_region_division(n_cols, n_rows, L, W, jitter=grid_jitter)
 
-        x_pockets, y_pockets = generate_region_division(n_cols, n_rows, L, W)
-        n_pockets_to_machine = random.randint(1, num_machined)
-        pockets_to_machine = random.sample(range(num_machined), n_pockets_to_machine)
+        machining_state = sample_machining_state(num_machined, coverage_level)
+        pocket_order = machining_state["pocket_order"]
+        depth_by_cell = machining_state["depth_by_cell"]
+        target_depth_ratio = float(machining_state["target_depth_ratio"])
+        current_progress = float(machining_state["current_progress"])
+        finished_count = int(machining_state["finished_count"])
+        current_cell = int(machining_state["current_cell"])
+
+        pockets_to_machine = [int(i) for i in range(num_machined) if float(depth_by_cell[i]) > 1e-6]
+        n_pockets_to_machine = len(pockets_to_machine)
+
+        # 记录所有 cell 的实际边界与深度：不存在的 cell 用 NaN，存在但未加工 depth=0。
+        cell_depth_ratio = np.full(7, np.nan, dtype=np.float32)
+        cell_bounds = np.full((7, 4), np.nan, dtype=np.float32)
+        for cell_idx in range(num_machined):
+            xmin_f, xmax_f, ymin_f, ymax_f = get_pocket_from_cells(x_pockets, y_pockets, pocket_cells[cell_idx], n_cols)
+            cell_depth_ratio[cell_idx] = float(depth_by_cell[cell_idx])
+            cell_bounds[cell_idx] = np.array([xmin_f * L, xmax_f * L, ymin_f * W, ymax_f * W], dtype=np.float32)
+
+        pocket_order_arr = np.full(7, -1, dtype=np.int64)
+        pocket_order_arr[:num_machined] = np.asarray(pocket_order, dtype=np.int64)
 
         mapdl.btol(0.0001)
         mapdl.block(0, L, 0, W, 0, H)
@@ -757,7 +973,9 @@ while valid_samples < N_SAMPLES:
         pocket_depth_fracs = []
         bool_ok = True
         for pocket_idx in pockets_to_machine:
-            depth_frac = random.uniform(*POCKET_DEPTH_RANGE)
+            depth_frac = float(depth_by_cell[pocket_idx])
+            if depth_frac <= 1e-6:
+                continue
             pocket_depth_fracs.append(depth_frac)
             pocket_zmin = H - depth_frac * H
             cells = pocket_cells[pocket_idx]
@@ -767,10 +985,12 @@ while valid_samples < N_SAMPLES:
             if xmax_p <= xmin_p or ymax_p <= ymin_p or pocket_zmin >= H:
                 continue
             pocket_records.append({
+                "pocket_idx": int(pocket_idx),
                 "xmin": xmin_p, "xmax": xmax_p,
                 "ymin": ymin_p, "ymax": ymax_p,
                 "bottom_z": pocket_zmin,
                 "depth_frac": depth_frac,
+                "is_current": int(pocket_idx == current_cell),
             })
 
             mapdl.allsel()
@@ -1076,7 +1296,10 @@ while valid_samples < N_SAMPLES:
         arrays["points"].append(all_node_coords)
         arrays["edge_index"].append(edge_index)
         arrays["edge_attr"].append(edge_attr)
-        arrays["point_frf"].append(frf)
+        if SAVE_POINT_FRF or valid_samples < SAVE_POINT_FRF_QC_COUNT:
+            arrays["point_frf"].append(frf)
+        else:
+            arrays["point_frf"].append(np.zeros((0, 0, 2), dtype=np.float32))
         arrays["frequencies"].append(freqs)
         arrays["frequency_max_hz"].append(np.array(freqs[-1], dtype=np.float32))
         arrays["highest_mode_frequency_hz"].append(np.array(freq_hz[-1], dtype=np.float32))
@@ -1101,6 +1324,33 @@ while valid_samples < N_SAMPLES:
         arrays["excitation_index"].append(np.array(exc_idx, dtype=np.int64))
         arrays["excitation_coord"].append(exc_actual.astype(np.float32))
 
+        # 受控随机元数据，后续可用于分层检查和误差诊断。
+        split_code = {"train": 0, "val": 1, "test": 2}[split_name]
+        spring_k_nonzero = spring_k_xyz[np.linalg.norm(spring_k_xyz, axis=1) > 0]
+        spring_k_sum = float(np.sum(spring_k_xyz))
+        spring_k_mean_nonzero = float(np.mean(spring_k_nonzero)) if spring_k_nonzero.size else 0.0
+        spring_k_max = float(np.max(spring_k_xyz)) if spring_k_xyz.size else 0.0
+        removed_volume_ratio = float(sum((rec["xmax"] - rec["xmin"]) * (rec["ymax"] - rec["ymin"]) * rec["depth_frac"] for rec in pocket_records) / (L * W))
+        near_mode_flag = int(min_relative_gap < 0.04)
+        very_near_mode_flag = int(min_relative_gap < 0.035)
+
+        arrays["sample_id_global"].append(np.array(valid_samples, dtype=np.int64))
+        arrays["split_code"].append(np.array(split_code, dtype=np.int64))
+        arrays["clamp_level_code"].append(np.array(CLAMP_LEVEL_CODE[clamp_level], dtype=np.int64))
+        arrays["coverage_level_code"].append(np.array(COVERAGE_LEVEL_CODE[coverage_level], dtype=np.int64))
+        arrays["layout_type"].append(np.array(layout_type, dtype=np.int64))
+        arrays["grid_jitter"].append(np.array(grid_jitter, dtype=np.float32))
+        arrays["target_depth_ratio"].append(np.array(target_depth_ratio, dtype=np.float32))
+        arrays["current_progress"].append(np.array(current_progress, dtype=np.float32))
+        arrays["finished_count"].append(np.array(finished_count, dtype=np.int64))
+        arrays["current_cell"].append(np.array(current_cell, dtype=np.int64))
+        arrays["cell_depth_ratio"].append(cell_depth_ratio.astype(np.float32))
+        arrays["pocket_order"].append(pocket_order_arr.astype(np.int64))
+        arrays["cell_bounds"].append(cell_bounds.astype(np.float32))
+        arrays["spring_k_summary"].append(np.array([spring_k_sum, spring_k_mean_nonzero, spring_k_max, len(spring_info)], dtype=np.float32))
+        arrays["near_mode_summary"].append(np.array([near_mode_flag, very_near_mode_flag, min_relative_gap_pair, min_relative_gap], dtype=np.float32))
+        arrays["removed_volume_ratio"].append(np.array(removed_volume_ratio, dtype=np.float32))
+
         depth_min = min(pocket_depth_fracs) * 100 if pocket_depth_fracs else 0.0
         depth_max = max(pocket_depth_fracs) * 100 if pocket_depth_fracs else 0.0
         n_cut = len(pocket_cut_indices)
@@ -1108,9 +1358,17 @@ while valid_samples < N_SAMPLES:
         min_df = float(np.min(np.diff(freqs.astype(np.float64))))
         freq_short = ", ".join(f"{v:.0f}" for v in freq_hz[:min(4, N_MODES)])
         zeta_short = ", ".join(f"{v:.4f}" for v in zeta_k[:min(4, N_MODES)])
+        cut_region_fraction = float(np.mean(cut_region_mask.astype(bool)))
+        pocket_bottom_fraction = float(np.mean(pocket_bottom_mask.astype(bool)))
+        zeta_joint_mean = float(np.mean(zeta_joint_values))
+        zeta_joint_min = float(np.min(zeta_joint_values))
+        zeta_joint_max = float(np.max(zeta_joint_values))
+
         print(
+            f"[{split_name}] clamp={clamp_level}, coverage={coverage_level}, layout={layout_type}, "
             f"N={n_nodes_total}, E={edge_index.shape[1]}, 加工{n_pockets_to_machine}/{num_machined}, "
-            f"深度{depth_min:.0f}~{depth_max:.0f}%, cut/bottom={n_cut}/{n_bottom}, "
+            f"target_depth={target_depth_ratio*100:.0f}%, 实际深度{depth_min:.0f}~{depth_max:.0f}%, "
+            f"progress={current_progress:.2f}, cut/bottom={n_cut}/{n_bottom}, "
             f"exc_pocket={excitation_pocket_id}, margin={excitation_margin*1000:.2f}mm, "
             f"modes={N_MODES}, f1..={freq_short}Hz, fN={freq_hz[-1]:.1f}Hz, "
             f"f_grid=[{freqs[0]:.1f},{freqs[-1]:.1f}]Hz/{N_FREQS}点, df_min={min_df:.4f}Hz, "
@@ -1119,17 +1377,32 @@ while valid_samples < N_SAMPLES:
             f"zeta1..={zeta_short}"
         )
 
+        pocket_order_str = " ".join(str(int(x)) for x in pocket_order_arr if int(x) >= 0)
         csv_row = [
-            valid_samples + 1, n_nodes_total, edge_index.shape[1], n_pockets_to_machine, num_machined,
-            f"{depth_min:.1f}~{depth_max:.1f}", f"{n_cut}/{n_bottom}",
+            valid_samples + 1, split_name, valid_samples,
+            clamp_level, coverage_level, layout_type, n_cols, n_rows,
+            n_nodes_total, edge_index.shape[1], n_pockets_to_machine, num_machined,
+            f"{target_depth_ratio:.6f}", f"{depth_min:.1f}~{depth_max:.1f}", f"{current_progress:.6f}", finished_count, current_cell, pocket_order_str,
+            f"{grid_jitter:.6f}", f"{removed_volume_ratio:.6f}", f"{cut_region_fraction:.6f}", f"{pocket_bottom_fraction:.6f}", f"{n_cut}/{n_bottom}",
             f"{exc_actual[0]*1000:.2f}", f"{exc_actual[1]*1000:.2f}", f"{exc_actual[2]*1000:.2f}",
             excitation_pocket_id, f"{excitation_margin*1000:.3f}",
             len(all_clamp_areas), len(spring_info),
+            f"{K_corner_base:.6g}", f"{K_side_base:.6g}",
+            f"{np.mean(K_corners):.6g}", f"{np.min(K_corners):.6g}", f"{np.max(K_corners):.6g}",
+            f"{np.mean(K_sides):.6g}", f"{np.min(K_sides):.6g}", f"{np.max(K_sides):.6g}",
+            f"{spring_k_sum:.6g}", f"{spring_k_mean_nonzero:.6g}", f"{spring_k_max:.6g}",
+            f"{ZETA_JOINT_BASE:.6f}", f"{zeta_joint_mean:.6f}", f"{zeta_joint_min:.6f}", f"{zeta_joint_max:.6f}",
             "mass", "lumped" if USE_LUMPED_MASS else "consistent", N_MODES, N_FREQS,
             f"{freqs[0]:.2f}", f"{freqs[-1]:.2f}", f"{min_df:.5f}",
             f"{freq_hz[-1]:.2f}", f"{min_mode_gap_hz:.2f}", f"{min_relative_gap:.6f}", min_relative_gap_pair,
-            f"{E/E_BASE:.4f}", f"{rho/RHO_BASE:.4f}", n_cols, n_rows, f"{FRF_OUTPUT_SCALE:g}",
+            near_mode_flag, very_near_mode_flag,
+            f"{E/E_BASE:.4f}", f"{rho/RHO_BASE:.4f}", f"{FRF_OUTPUT_SCALE:g}", int(SAVE_POINT_FRF or valid_samples < SAVE_POINT_FRF_QC_COUNT),
         ]
+        csv_row += [f"{v:.6g}" for v in K_corners]
+        csv_row += [f"{v:.6g}" for v in K_sides]
+        csv_row += ["" if np.isnan(v) else f"{float(v):.6f}" for v in cell_depth_ratio]
+        for bounds in cell_bounds:
+            csv_row += ["" if np.isnan(v) else f"{float(v)*1000.0:.3f}" for v in bounds]
         csv_row += [f"{v:.2f}" for v in freq_hz]
         csv_row += [f"{v:.6f}" for v in zeta_k]
         csv_writer.writerow(csv_row)
@@ -1185,9 +1458,13 @@ print(
 print(f"CSV日志: {csv_path}")
 
 print("\n保存 HDF5...")
-save_h5("train.h5", range(N_TRAIN), arrays)
-save_h5("val.h5", range(N_TRAIN, N_TRAIN + N_VAL), arrays)
-save_h5("test.h5", range(N_TRAIN + N_VAL, N_SAMPLES), arrays)
+train_indices = [i for i, rec in enumerate(SAMPLE_PLAN) if rec["split"] == "train"]
+val_indices = [i for i, rec in enumerate(SAMPLE_PLAN) if rec["split"] == "val"]
+test_indices = [i for i, rec in enumerate(SAMPLE_PLAN) if rec["split"] == "test"]
+assert len(train_indices) == N_TRAIN and len(val_indices) == N_VAL and len(test_indices) == N_TEST
+save_h5("train.h5", train_indices, arrays)
+save_h5("val.h5", val_indices, arrays)
+save_h5("test.h5", test_indices, arrays)
 
 # 简单 FRF 可视化
 try:
@@ -1197,6 +1474,8 @@ try:
 
     coords0 = arrays["points"][0]
     frf0 = arrays["point_frf"][0]
+    if frf0.size == 0:
+        raise RuntimeError("sample_000 未保存 point_frf；如需 FRF 图，设置 SAVE_POINT_FRF=1 或 SAVE_POINT_FRF_QC_COUNT>=1")
     freqs0 = arrays["frequencies"][0]
     amp0 = np.sqrt(frf0[..., 0] ** 2 + frf0[..., 1] ** 2)
     n_nodes0 = len(coords0)
