@@ -67,7 +67,7 @@ FRF_OUTPUT_SCALE = float(os.getenv("FRF_OUTPUT_SCALE", "1.0"))
 SAVE_POINT_FRF = os.getenv("SAVE_POINT_FRF", "0").strip().lower() in {"1", "true", "yes", "y"}
 SAVE_POINT_FRF_QC_COUNT = int(os.getenv("SAVE_POINT_FRF_QC_COUNT", "5"))
 # 简单近频过滤：若任意相邻模态的相对间隔 (f_{r+1}-f_r)/f_r 小于该阈值，则跳过样本。
-# 设置为 0 可关闭过滤。默认 0.03，即 3%。
+# 设置为 0 可关闭过滤。默认 0.01，即 1%。
 MIN_RELATIVE_MODE_GAP = float(os.getenv("MIN_RELATIVE_MODE_GAP", "0.03"))
 
 # 推荐：质量归一化 + 一致质量矩阵。
@@ -89,8 +89,8 @@ RHO_RANGE = (0.97, 1.03)
 GRID_JITTER_RANGE = (float(os.getenv("GRID_JITTER_MIN", "0.08")), float(os.getenv("GRID_JITTER_MAX", "0.15")))
 GAP_ABS = 0.006
 BORDER_ABS = 0.006
-TARGET_DEPTH_RANGE = (float(os.getenv("TARGET_DEPTH_MIN", "0.25")), float(os.getenv("TARGET_DEPTH_MAX", "0.65")))
-TARGET_DEPTH_MODE = float(os.getenv("TARGET_DEPTH_MODE", "0.45"))
+TARGET_DEPTH_RANGE = (float(os.getenv("TARGET_DEPTH_MIN", "0.25")), float(os.getenv("TARGET_DEPTH_MAX", "0.60")))
+TARGET_DEPTH_MODE = float(os.getenv("TARGET_DEPTH_MODE", "0.42"))
 CURRENT_PROGRESS_RANGE = (float(os.getenv("CURRENT_PROGRESS_MIN", "0.25")), float(os.getenv("CURRENT_PROGRESS_MAX", "1.00")))
 
 # 装夹物理上视为固定工装/螺丝预紧状态；只保留小幅制造与拧紧误差。
