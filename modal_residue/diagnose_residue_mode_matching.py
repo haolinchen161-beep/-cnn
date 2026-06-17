@@ -3,8 +3,17 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import sys
 from pathlib import Path
 from typing import Dict, List, Tuple
+
+# Allow both:
+#   python -m modal_residue.diagnose_residue_mode_matching
+# and:
+#   python modal_residue/diagnose_residue_mode_matching.py
+ROOT_DIR = Path(__file__).resolve().parents[1]
+if str(ROOT_DIR) not in sys.path:
+    sys.path.insert(0, str(ROOT_DIR))
 
 import numpy as np
 import torch
@@ -126,7 +135,6 @@ def diagnose_split(args, model, stats: Dict[str, np.ndarray], device: torch.devi
             score = abs_cos
         row_ind, col_ind = _linear_assignment_max(score)
 
-        # Store pred->true assignment. For K=10 normally row_ind is [0..9] after sorting.
         assign = np.full(n_modes, -1, dtype=np.int64)
         for r, c in zip(row_ind, col_ind):
             if 0 <= r < n_modes and 0 <= c < n_modes:
