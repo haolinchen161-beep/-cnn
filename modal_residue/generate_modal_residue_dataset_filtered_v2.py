@@ -15,7 +15,7 @@ ANSYS 凹槽工件模态留数数据集生成程序。
 4. 频率上限默认按第 N_MODES 阶自适应，不再固定 5000 Hz；频率网格在 float32 保存后仍严格递增，并优先保护各模态峰附近频点。
 
 默认生成 300 个有效样本，保存到 ./data_modal_residue_filtered300/train.h5、val.h5、test.h5。
-本版采用受控随机数据集：clamp_level × coverage_level 分层，保留 5/6/7 凹槽布局和边界扰动。
+本版采用受控随机数据集：装夹刚度固定基准 + 小扰动；coverage_level × layout_type 分层，保留 5/6/7 凹槽布局和边界扰动。
 默认加入一个简单近频过滤：任意相邻模态相对间隔 < MIN_RELATIVE_MODE_GAP 时跳过，默认 0.03。
 可通过环境变量覆盖：N_SAMPLES、N_TRAIN、N_VAL、N_TEST、N_MODES、N_FREQS、MIN_RELATIVE_MODE_GAP、FRF_OUTPUT_SCALE、SAVE_POINT_FRF。
 """
@@ -74,8 +74,8 @@ MIN_RELATIVE_MODE_GAP = float(os.getenv("MIN_RELATIVE_MODE_GAP", "0.03"))
 USE_MASS_NORMALIZATION = True
 USE_LUMPED_MASS = False
 
-OUT_DIR = os.getenv("OUT_DIR", os.path.join(os.path.dirname(__file__), "data_modal_residue_filtered300"))
-VIZ_DIR = os.getenv("VIZ_DIR", os.path.join(os.path.dirname(__file__), "mesh_viz_modal_residue_filtered300"))
+OUT_DIR = os.getenv("OUT_DIR", os.path.join(os.path.dirname(__file__), "data_modal_residue_fixedclamp300"))
+VIZ_DIR = os.getenv("VIZ_DIR", os.path.join(os.path.dirname(__file__), "mesh_viz_modal_residue_fixedclamp300"))
 os.makedirs(OUT_DIR, exist_ok=True)
 os.makedirs(VIZ_DIR, exist_ok=True)
 
@@ -93,17 +93,15 @@ TARGET_DEPTH_RANGE = (float(os.getenv("TARGET_DEPTH_MIN", "0.25")), float(os.get
 TARGET_DEPTH_MODE = float(os.getenv("TARGET_DEPTH_MODE", "0.45"))
 CURRENT_PROGRESS_RANGE = (float(os.getenv("CURRENT_PROGRESS_MIN", "0.25")), float(os.getenv("CURRENT_PROGRESS_MAX", "1.00")))
 
-CLAMP_LEVELS = {
-    "soft": {"K_corner_base": 1.5e7, "K_side_base": 3.0e6},
-    "normal": {"K_corner_base": 3.0e7, "K_side_base": 8.0e6},
-    "hard": {"K_corner_base": 6.0e7, "K_side_base": 1.6e7},
-}
-CLAMP_WEIGHTS = {"soft": 0.25, "normal": 0.50, "hard": 0.25}
+# 装夹物理上视为固定工装/螺丝预紧状态；只保留小幅制造与拧紧误差。
+# 不再把装夹刚度作为 soft/normal/hard 三类工况分层。
+K_CORNER_BASE = float(os.getenv("K_CORNER_BASE", "3.0e7"))
+K_SIDE_BASE = float(os.getenv("K_SIDE_BASE", "8.0e6"))
 COVERAGE_WEIGHTS = {"low": 0.25, "medium": 0.50, "high": 0.25}
-CLAMP_LEVEL_CODE = {"soft": 0, "normal": 1, "hard": 2}
+LAYOUT_WEIGHTS = {5: 1.0, 6: 1.0, 7: 1.0}
 COVERAGE_LEVEL_CODE = {"low": 0, "medium": 1, "high": 2}
-K_CORNER_JITTER = float(os.getenv("K_CORNER_JITTER", "0.20"))
-K_SIDE_JITTER = float(os.getenv("K_SIDE_JITTER", "0.30"))
+K_CORNER_JITTER = float(os.getenv("K_CORNER_JITTER", "0.10"))
+K_SIDE_JITTER = float(os.getenv("K_SIDE_JITTER", "0.15"))
 M_REF = 0.01
 
 
@@ -186,38 +184,29 @@ def _allocate_counts(total, labels, weights):
     return {label: int(counts[i]) for i, label in enumerate(labels)}
 
 
-def _balanced_layouts(n):
-    """在一个 clamp×coverage 组内部尽量均匀安排 5/6/7 布局。"""
-    layouts = [5, 6, 7]
-    out = [layouts[i % len(layouts)] for i in range(int(n))]
-    random.shuffle(out)
-    return out
-
-
 def build_sample_plan(n_train, n_val, n_test):
     """
     生成固定长度的样本计划。
 
-    主分层只用 clamp_level × coverage_level = 3×3。
-    每个 split 内按相同权重分配，保证 train/val/test 都覆盖 soft/normal/hard 和 low/medium/high。
-    layout_type=5/6/7 不作为硬分层，只在每个组内部尽量均匀出现。
+    装夹刚度不再作为主分层变量：物理上视为同一固定装夹方案，只保留小扰动。
+    主分层改为 coverage_level × layout_type = 3×3。
+    每个 split 内按相同权重分配，保证 train/val/test 都覆盖 low/medium/high 和 5/6/7 布局。
     """
     plan = []
     split_specs = [("train", int(n_train)), ("val", int(n_val)), ("test", int(n_test))]
-    clamp_labels = ["soft", "normal", "hard"]
     coverage_labels = ["low", "medium", "high"]
-    combo_labels = [(c, g) for c in clamp_labels for g in coverage_labels]
+    layout_labels = [5, 6, 7]
+    combo_labels = [(g, l) for g in coverage_labels for l in layout_labels]
     combo_weights = {
-        (c, g): CLAMP_WEIGHTS[c] * COVERAGE_WEIGHTS[g]
-        for c, g in combo_labels
+        (g, l): COVERAGE_WEIGHTS[g] * LAYOUT_WEIGHTS[l]
+        for g, l in combo_labels
     }
     for split, n_split in split_specs:
         combo_counts = _allocate_counts(n_split, combo_labels, combo_weights)
-        for (clamp_level, coverage_level), n_combo in combo_counts.items():
-            for layout_type in _balanced_layouts(n_combo):
+        for (coverage_level, layout_type), n_combo in combo_counts.items():
+            for _ in range(int(n_combo)):
                 plan.append({
                     "split": split,
-                    "clamp_level": clamp_level,
                     "coverage_level": coverage_level,
                     "layout_type": int(layout_type),
                 })
@@ -226,11 +215,10 @@ def build_sample_plan(n_train, n_val, n_test):
     return plan
 
 
-def sample_clamp_parameters(clamp_level):
-    """样本级装夹强弱 + 样本内部小扰动。"""
-    cfg = CLAMP_LEVELS[clamp_level]
-    k_corner_base = float(cfg["K_corner_base"])
-    k_side_base = float(cfg["K_side_base"])
+def sample_clamp_parameters():
+    """固定装夹基准刚度 + 样本内部小扰动。"""
+    k_corner_base = float(K_CORNER_BASE)
+    k_side_base = float(K_SIDE_BASE)
     K_corners, C_corners, zeta_corners = [], [], []
     K_sides, C_sides, zeta_sides = [], [], []
 
@@ -763,7 +751,7 @@ def save_h5(name, idx_slice, arrays):
         f.attrs["frf_output_scale"] = FRF_OUTPUT_SCALE
         f.attrs["min_relative_mode_gap"] = MIN_RELATIVE_MODE_GAP
         f.attrs["freq_grid_min_step_hz"] = FREQ_GRID_MIN_STEP_HZ
-        f.attrs["sampling_strategy"] = "stratified clamp_level x coverage_level; balanced layout_type 5/6/7 inside each group"
+        f.attrs["sampling_strategy"] = "stratified coverage_level x layout_type; fixed clamp stiffness with small jitter"
         f.attrs["save_point_frf"] = int(SAVE_POINT_FRF)
         f.attrs["save_point_frf_qc_count"] = SAVE_POINT_FRF_QC_COUNT
         f.attrs["zeta_material"] = ZETA_MATERIAL
@@ -807,7 +795,7 @@ else:
     print(f"频率上限: 固定 FREQ_MAX_HZ={FREQ_MAX_FIXED:g} Hz")
 print(f"FRF输出缩放: FRF_OUTPUT_SCALE={FRF_OUTPUT_SCALE:g}，默认物理单位 m/N")
 print(f"FRF保存: SAVE_POINT_FRF={int(SAVE_POINT_FRF)}, QC_COUNT={SAVE_POINT_FRF_QC_COUNT}")
-print("采样: clamp_level×coverage_level 分层；layout 5/6/7 组内均衡；深度独立三角分布；边界 jitter 受控随机")
+print("采样: 固定装夹刚度+小扰动；coverage_level×layout_type 分层；深度独立三角分布；边界 jitter 受控随机")
 print(f"网格: SOLID187, MESH_SIZE={MESH_SIZE*1000:.1f} mm")
 
 print("\n>>> 连接 ANSYS MAPDL...")
@@ -844,7 +832,7 @@ arrays = {
     "excitation_coord": [],
     "sample_id_global": [],
     "split_code": [],
-    "clamp_level_code": [],
+    "clamp_model_code": [],
     "coverage_level_code": [],
     "layout_type": [],
     "grid_jitter": [],
@@ -865,7 +853,7 @@ csv_file = open(csv_path, "w", newline="", encoding="utf-8-sig")
 csv_writer = csv.writer(csv_file)
 csv_header = [
     "sample", "split", "plan_index",
-    "clamp_level", "coverage_level", "layout_type", "n_cols", "n_rows",
+    "clamp_model", "coverage_level", "layout_type", "n_cols", "n_rows",
     "n_nodes", "n_edges", "n_pockets_to_machine", "n_pocket_scheme",
     "target_depth_ratio", "depth_range_%", "current_progress", "finished_count", "current_cell", "pocket_order",
     "grid_jitter", "removed_volume_ratio", "cut_region_fraction", "pocket_bottom_fraction", "cut_nodes/bottom_nodes",
@@ -920,7 +908,7 @@ while valid_samples < N_SAMPLES:
         # ---------- 1. 采样参数 ----------
         plan_rec = SAMPLE_PLAN[valid_samples]
         split_name = plan_rec["split"]
-        clamp_level = plan_rec["clamp_level"]
+        clamp_model = "fixed"
         coverage_level = plan_rec["coverage_level"]
         layout_type = int(plan_rec["layout_type"])
 
@@ -931,7 +919,7 @@ while valid_samples < N_SAMPLES:
         (
             K_corners, C_corners, K_sides, C_sides, zeta_joint_values,
             K_corner_base, K_side_base,
-        ) = sample_clamp_parameters(clamp_level)
+        ) = sample_clamp_parameters()
 
         mapdl.mp("EX", 1, E)
         mapdl.mp("PRXY", 1, PRXY_BASE)
@@ -1336,7 +1324,7 @@ while valid_samples < N_SAMPLES:
 
         arrays["sample_id_global"].append(np.array(valid_samples, dtype=np.int64))
         arrays["split_code"].append(np.array(split_code, dtype=np.int64))
-        arrays["clamp_level_code"].append(np.array(CLAMP_LEVEL_CODE[clamp_level], dtype=np.int64))
+        arrays["clamp_model_code"].append(np.array(0, dtype=np.int64))
         arrays["coverage_level_code"].append(np.array(COVERAGE_LEVEL_CODE[coverage_level], dtype=np.int64))
         arrays["layout_type"].append(np.array(layout_type, dtype=np.int64))
         arrays["grid_jitter"].append(np.array(grid_jitter, dtype=np.float32))
@@ -1365,7 +1353,7 @@ while valid_samples < N_SAMPLES:
         zeta_joint_max = float(np.max(zeta_joint_values))
 
         print(
-            f"[{split_name}] clamp={clamp_level}, coverage={coverage_level}, layout={layout_type}, "
+            f"[{split_name}] clamp=fixed, coverage={coverage_level}, layout={layout_type}, "
             f"N={n_nodes_total}, E={edge_index.shape[1]}, 加工{n_pockets_to_machine}/{num_machined}, "
             f"target_depth={target_depth_ratio*100:.0f}%, 实际深度{depth_min:.0f}~{depth_max:.0f}%, "
             f"progress={current_progress:.2f}, cut/bottom={n_cut}/{n_bottom}, "
@@ -1380,7 +1368,7 @@ while valid_samples < N_SAMPLES:
         pocket_order_str = " ".join(str(int(x)) for x in pocket_order_arr if int(x) >= 0)
         csv_row = [
             valid_samples + 1, split_name, valid_samples,
-            clamp_level, coverage_level, layout_type, n_cols, n_rows,
+            clamp_model, coverage_level, layout_type, n_cols, n_rows,
             n_nodes_total, edge_index.shape[1], n_pockets_to_machine, num_machined,
             f"{target_depth_ratio:.6f}", f"{depth_min:.1f}~{depth_max:.1f}", f"{current_progress:.6f}", finished_count, current_cell, pocket_order_str,
             f"{grid_jitter:.6f}", f"{removed_volume_ratio:.6f}", f"{cut_region_fraction:.6f}", f"{pocket_bottom_fraction:.6f}", f"{n_cut}/{n_bottom}",
