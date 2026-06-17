@@ -5,7 +5,18 @@ from pathlib import Path
 
 ROOT_DIR = Path(__file__).resolve().parent
 DATA_DIR = ROOT_DIR / "modal_residue" / "data_modal_residue_fixedclamp300"
-OUT_DIR = ROOT_DIR / "runs" / "modal_residue_asinh_fixedclamp300"
+
+# Small-sample overfit diagnostic. Set DEBUG_TRAIN_SAMPLES = 0 to use the full split.
+DEBUG_TRAIN_SAMPLES = 1
+DEBUG_VAL_SAMPLES = 1
+DEBUG_TEST_SAMPLES = 1
+DEBUG_VAL_TEST_FROM_TRAIN = True
+
+OUT_DIR = ROOT_DIR / (
+    "runs/modal_residue_asinh_fixedclamp300_debug1"
+    if DEBUG_TRAIN_SAMPLES and DEBUG_TRAIN_SAMPLES > 0
+    else "runs/modal_residue_asinh_fixedclamp300"
+)
 
 EPOCHS = 300
 QUERY_NODES = 0
@@ -25,7 +36,7 @@ NODE_DOMINANT_K = 1
 BEST_A_WEIGHT = 0.01
 RESIDUE_VISIBLE_REL = 1e-3
 
-LOG_EVERY = 10
+LOG_EVERY = 1
 SEED = 42
 DEVICE = "cuda"
 FP16 = True
@@ -43,10 +54,35 @@ def residue_first_modal_score(metrics, best_a_weight):
     return float(y_rms + 0.05 * w_rms + 0.001 * a_vis_mean)
 
 
+def install_debug_split(trainer) -> None:
+    if not DEBUG_TRAIN_SAMPLES or DEBUG_TRAIN_SAMPLES <= 0:
+        return
+
+    base_split = trainer.H5Split
+
+    class LimitedH5Split(base_split):
+        def __init__(self, data_dir, split: str):
+            source_split = "train" if DEBUG_VAL_TEST_FROM_TRAIN and split in {"val", "test"} else split
+            super().__init__(data_dir, source_split)
+            if split == "train":
+                limit = DEBUG_TRAIN_SAMPLES
+            elif split == "val":
+                limit = DEBUG_VAL_SAMPLES
+            elif split == "test":
+                limit = DEBUG_TEST_SAMPLES
+            else:
+                limit = 0
+            if limit and limit > 0:
+                self.keys = self.keys[: min(int(limit), len(self.keys))]
+
+    trainer.H5Split = LimitedH5Split
+
+
 def main() -> int:
     import modal_residue.train_modal_residue_model as trainer
 
     trainer.modal_score = residue_first_modal_score
+    install_debug_split(trainer)
     train_main = trainer.main
 
     argv = [
