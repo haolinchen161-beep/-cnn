@@ -12,6 +12,10 @@ DEBUG_VAL_SAMPLES = 0
 DEBUG_TEST_SAMPLES = 0
 DEBUG_VAL_TEST_FROM_TRAIN = False
 
+# 关键加速：把 train/val/test 需要读取的 HDF5 样本一次性加载到内存。
+# 之前每个 epoch、每个样本都会重新打开 h5 + gzip 解压，所以看起来“卡住不动”。
+PRELOAD_SPLITS = True
+
 TARGET_REGION = "bottom"
 KEY_QUERY_NODES = 256          # 训练时最多抽 256 个凹槽底面点；底面少于 256 时使用全部底面点，不重复补点。
 EVAL_QUERY_NODES = 0           # 验证/测试用全部凹槽底面点。
@@ -39,7 +43,7 @@ BEST_A_WEIGHT = 0.01
 RESIDUE_VISIBLE_REL = 1e-3
 SIGN_VISIBLE_REL = 1e-4
 
-LOG_EVERY = 1
+LOG_EVERY = 5
 SEED = 42
 DEVICE = "cuda"
 FP16 = True
@@ -58,35 +62,53 @@ def residue_first_modal_score(metrics, best_a_weight):
     return float(y_rms + 0.05 * w_rms + 0.001 * a_vis_mean + 0.0002 * max(0.0, 100.0 - sign_mean))
 
 
-def install_debug_split(trainer) -> None:
-    if not DEBUG_TRAIN_SAMPLES or DEBUG_TRAIN_SAMPLES <= 0:
-        return
+def _limit_for_requested_split(split: str) -> int:
+    if split == "train":
+        return int(DEBUG_TRAIN_SAMPLES or 0)
+    if split == "val":
+        return int(DEBUG_VAL_SAMPLES or 0)
+    if split == "test":
+        return int(DEBUG_TEST_SAMPLES or 0)
+    return 0
 
+
+def install_cached_split(trainer) -> None:
     base_split = trainer.H5Split
 
-    class LimitedH5Split(base_split):
+    class CachedH5Split(base_split):
         def __init__(self, data_dir, split: str):
+            requested_split = split
             source_split = "train" if DEBUG_VAL_TEST_FROM_TRAIN and split in {"val", "test"} else split
             super().__init__(data_dir, source_split)
-            if split == "train":
-                limit = DEBUG_TRAIN_SAMPLES
-            elif split == "val":
-                limit = DEBUG_VAL_SAMPLES
-            elif split == "test":
-                limit = DEBUG_TEST_SAMPLES
-            else:
-                limit = 0
-            if limit and limit > 0:
-                self.keys = self.keys[: min(int(limit), len(self.keys))]
 
-    trainer.H5Split = LimitedH5Split
+            limit = _limit_for_requested_split(requested_split)
+            if limit and limit > 0:
+                self.keys = self.keys[: min(limit, len(self.keys))]
+
+            self._cache = None
+            if PRELOAD_SPLITS:
+                total = len(self.keys)
+                print(f">>> preload {requested_split} from {source_split}: {total} samples ...", flush=True)
+                cache = []
+                for i in range(total):
+                    cache.append(base_split.__getitem__(self, i))
+                    if (i + 1) % 20 == 0 or (i + 1) == total:
+                        print(f"    loaded {requested_split}: {i + 1}/{total}", flush=True)
+                self._cache = cache
+
+        def __getitem__(self, i: int):
+            if self._cache is not None:
+                return self._cache[i]
+            return super().__getitem__(i)
+
+    trainer.H5Split = CachedH5Split
 
 
 def main() -> int:
     import modal_residue.train_modal_residue_bottom_model as trainer
 
     trainer.modal_score = residue_first_modal_score
-    install_debug_split(trainer)
+    install_cached_split(trainer)
     train_main = trainer.main
 
     argv = [
