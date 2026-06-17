@@ -31,11 +31,26 @@ DEVICE = "cuda"
 FP16 = True
 
 
+def residue_first_modal_score(metrics, best_a_weight):
+    y_triplet = metrics.get("Y_smooth_l1_triplet")
+    if y_triplet is None:
+        w_rms = float(metrics.get("w10_triplet", (0.0, 0.0, 0.0))[2])
+        a_vis_rms = float(metrics.get("A_vis_triplet", (0.0, 0.0, 0.0))[2])
+        return float(w_rms + float(best_a_weight) * a_vis_rms)
+    y_rms = float(y_triplet[2])
+    w_rms = float(metrics.get("w10_triplet", (0.0, 0.0, 0.0))[2])
+    a_vis_mean = float(metrics.get("A_vis_triplet", (0.0, 0.0, 0.0))[0])
+    return float(y_rms + 0.05 * w_rms + 0.001 * a_vis_mean)
+
+
 def main() -> int:
-    from modal_residue.train_modal_residue_model_best_y import main as train_main
+    import modal_residue.train_modal_residue_model as trainer
+
+    trainer.modal_score = residue_first_modal_score
+    train_main = trainer.main
 
     argv = [
-        "train_modal_residue_model_best_y.py",
+        "train_modal_residue_model.py",
         "--data-dir", str(DATA_DIR),
         "--out-dir", str(OUT_DIR),
         "--epochs", str(EPOCHS),
