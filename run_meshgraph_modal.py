@@ -6,11 +6,11 @@ from pathlib import Path
 ROOT_DIR = Path(__file__).resolve().parent
 DATA_DIR = ROOT_DIR / "modal_residue" / "data_modal_residue_fixedclamp300"
 
-# 先用 10 个样本检查凹槽底面目标是否能过拟合；恢复全数据时改成 0。
-DEBUG_TRAIN_SAMPLES = 10
-DEBUG_VAL_SAMPLES = 10
-DEBUG_TEST_SAMPLES = 10
-DEBUG_VAL_TEST_FROM_TRAIN = True
+# 全数据训练。需要快速小样本排查时，再把下面三个值改成 10 或 3。
+DEBUG_TRAIN_SAMPLES = 0
+DEBUG_VAL_SAMPLES = 0
+DEBUG_TEST_SAMPLES = 0
+DEBUG_VAL_TEST_FROM_TRAIN = False
 
 TARGET_REGION = "bottom"
 KEY_QUERY_NODES = 256          # 训练时最多抽 256 个凹槽底面点；底面少于 256 时使用全部底面点，不重复补点。
@@ -23,8 +23,8 @@ OUT_DIR = ROOT_DIR / (
 )
 
 EPOCHS = 300
-HIDDEN = 128
-GNN_LAYERS = 3
+HIDDEN = 64                    # 先用轻量配置跑通底面目标；128 会明显更慢。
+GNN_LAYERS = 2                 # 2 层优先，确认有效后再试 96x2 或 128x3。
 LEARNING_RATE = 1e-3
 WEIGHT_DECAY = 1e-5
 GRAD_CLIP_NORM = 1.0
