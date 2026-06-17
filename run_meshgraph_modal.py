@@ -6,23 +6,25 @@ from pathlib import Path
 ROOT_DIR = Path(__file__).resolve().parent
 DATA_DIR = ROOT_DIR / "modal_residue" / "data_modal_residue_fixedclamp300"
 
-#  恢复全数据训练时将下面DEBUG_TRAIN_SAMPLES改成0 
-DEBUG_TRAIN_SAMPLES = 1
-DEBUG_VAL_SAMPLES = 1
-DEBUG_TEST_SAMPLES = 1
+# 先用 10 个样本检查凹槽底面目标是否能过拟合；恢复全数据时改成 0。
+DEBUG_TRAIN_SAMPLES = 10
+DEBUG_VAL_SAMPLES = 10
+DEBUG_TEST_SAMPLES = 10
 DEBUG_VAL_TEST_FROM_TRAIN = True
 
+TARGET_REGION = "bottom"
+KEY_QUERY_NODES = 256          # 训练时最多抽 256 个凹槽底面点；底面少于 256 时使用全部底面点，不重复补点。
+EVAL_QUERY_NODES = 0           # 验证/测试用全部凹槽底面点。
+
 OUT_DIR = ROOT_DIR / (
-    "runs/modal_residue_asinh_fixedclamp300_debug1"
+    f"runs/modal_residue_bottom_asinh_fixedclamp300_debug{DEBUG_TRAIN_SAMPLES}"
     if DEBUG_TRAIN_SAMPLES and DEBUG_TRAIN_SAMPLES > 0
-    else "runs/modal_residue_asinh_fixedclamp300"
+    else "runs/modal_residue_bottom_asinh_fixedclamp300"
 )
 
 EPOCHS = 300
-QUERY_NODES = 0
-EVAL_QUERY_NODES = 0
-HIDDEN = 64
-GNN_LAYERS = 2
+HIDDEN = 128
+GNN_LAYERS = 3
 LEARNING_RATE = 1e-3
 WEIGHT_DECAY = 1e-5
 GRAD_CLIP_NORM = 1.0
@@ -35,6 +37,7 @@ TOP_NODE_FRAC = 0.10
 NODE_DOMINANT_K = 1
 BEST_A_WEIGHT = 0.01
 RESIDUE_VISIBLE_REL = 1e-3
+SIGN_VISIBLE_REL = 1e-4
 
 LOG_EVERY = 1
 SEED = 42
@@ -51,7 +54,8 @@ def residue_first_modal_score(metrics, best_a_weight):
     y_rms = float(y_triplet[2])
     w_rms = float(metrics.get("w10_triplet", (0.0, 0.0, 0.0))[2])
     a_vis_mean = float(metrics.get("A_vis_triplet", (0.0, 0.0, 0.0))[0])
-    return float(y_rms + 0.05 * w_rms + 0.001 * a_vis_mean)
+    sign_mean = float(metrics.get("A_sign_triplet", (0.0, 0.0, 0.0))[0])
+    return float(y_rms + 0.05 * w_rms + 0.001 * a_vis_mean + 0.0002 * max(0.0, 100.0 - sign_mean))
 
 
 def install_debug_split(trainer) -> None:
@@ -79,18 +83,19 @@ def install_debug_split(trainer) -> None:
 
 
 def main() -> int:
-    import modal_residue.train_modal_residue_model as trainer
+    import modal_residue.train_modal_residue_bottom_model as trainer
 
     trainer.modal_score = residue_first_modal_score
     install_debug_split(trainer)
     train_main = trainer.main
 
     argv = [
-        "train_modal_residue_model.py",
+        "train_modal_residue_bottom_model.py",
         "--data-dir", str(DATA_DIR),
         "--out-dir", str(OUT_DIR),
         "--epochs", str(EPOCHS),
-        "--query-nodes", str(QUERY_NODES),
+        "--target-region", TARGET_REGION,
+        "--query-nodes", str(KEY_QUERY_NODES),
         "--eval-query-nodes", str(EVAL_QUERY_NODES),
         "--hidden", str(HIDDEN),
         "--gnn-layers", str(GNN_LAYERS),
@@ -104,6 +109,7 @@ def main() -> int:
         "--node-dominant-k", str(NODE_DOMINANT_K),
         "--best-a-weight", str(BEST_A_WEIGHT),
         "--residue-visible-rel", str(RESIDUE_VISIBLE_REL),
+        "--sign-visible-rel", str(SIGN_VISIBLE_REL),
         "--grad-clip-norm", str(GRAD_CLIP_NORM),
         "--log-every", str(LOG_EVERY),
         "--seed", str(SEED),
