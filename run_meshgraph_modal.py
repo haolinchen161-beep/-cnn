@@ -6,7 +6,7 @@ from pathlib import Path
 ROOT_DIR = Path(__file__).resolve().parent
 DATA_DIR = ROOT_DIR / "modal_residue" / "data_modal_residue_fixedclamp300"
 
-# Small-sample overfit diagnostic. Set DEBUG_TRAIN_SAMPLES = 0 to use the full split.
+#  恢复全数据训练时将下面DEBUG_TRAIN_SAMPLES改成0 
 DEBUG_TRAIN_SAMPLES = 1
 DEBUG_VAL_SAMPLES = 1
 DEBUG_TEST_SAMPLES = 1
