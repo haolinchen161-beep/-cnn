@@ -68,7 +68,7 @@ SAVE_POINT_FRF = os.getenv("SAVE_POINT_FRF", "0").strip().lower() in {"1", "true
 SAVE_POINT_FRF_QC_COUNT = int(os.getenv("SAVE_POINT_FRF_QC_COUNT", "5"))
 # 简单近频过滤：若任意相邻模态的相对间隔 (f_{r+1}-f_r)/f_r 小于该阈值，则跳过样本。
 # 设置为 0 可关闭过滤。默认 0.01，即 1%。
-MIN_RELATIVE_MODE_GAP = float(os.getenv("MIN_RELATIVE_MODE_GAP", "0.03"))
+MIN_RELATIVE_MODE_GAP = float(os.getenv("MIN_RELATIVE_MODE_GAP", "0.01"))
 
 # 推荐：质量归一化 + 一致质量矩阵。
 USE_MASS_NORMALIZATION = True
