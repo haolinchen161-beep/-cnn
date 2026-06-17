@@ -1319,8 +1319,8 @@ while valid_samples < N_SAMPLES:
         spring_k_mean_nonzero = float(np.mean(spring_k_nonzero)) if spring_k_nonzero.size else 0.0
         spring_k_max = float(np.max(spring_k_xyz)) if spring_k_xyz.size else 0.0
         removed_volume_ratio = float(sum((rec["xmax"] - rec["xmin"]) * (rec["ymax"] - rec["ymin"]) * rec["depth_frac"] for rec in pocket_records) / (L * W))
-        near_mode_flag = int(min_relative_gap < 0.04)
-        very_near_mode_flag = int(min_relative_gap < 0.035)
+        near_mode_flag = int(min_relative_gap < 0.02)
+        very_near_mode_flag = int(min_relative_gap < 0.01)
 
         arrays["sample_id_global"].append(np.array(valid_samples, dtype=np.int64))
         arrays["split_code"].append(np.array(split_code, dtype=np.int64))
