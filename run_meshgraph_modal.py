@@ -7,11 +7,13 @@ ROOT_DIR = Path(__file__).resolve().parent
 DATA_DIR = ROOT_DIR / "modal_residue" / "data_modal_residue_fixedclamp300"
 OUT_DIR = ROOT_DIR / "runs/r3_quantile_A_frf_bottom"
 
+# 实验设置：R=3，只训练凹槽底面点的 A，频率仍为全局模态频率。
 N_MODES_USED = 3
 TARGET_REGION = "bottom"
 KEY_QUERY_NODES = 256
 EVAL_QUERY_NODES = 0
 
+# 训练规模和优化器参数。
 EPOCHS = 150
 HIDDEN = 96
 GNN_LAYERS = 3
@@ -26,11 +28,13 @@ NODE_DOMINANT_LOSS_WEIGHT = 0.10
 TOP_NODE_FRAC = 0.10
 NODE_DOMINANT_K = 1
 
+# 每阶 |A| 排序分位数权重：0-50%、50-80%、80-95%、95-100%。
 AMP_Q0_WEIGHT = 0.5
 AMP_Q50_WEIGHT = 1.0
 AMP_Q80_WEIGHT = 2.0
 AMP_Q95_WEIGHT = 4.0
 
+# FRF 辅助项默认用真实 omega 和固定阻尼，避免前期频率误差带偏 A。
 FRF_LOSS_WEIGHT = 0.01
 FRF_WARMUP_EPOCHS = 30
 FRF_OMEGA_SOURCE = "true"
@@ -47,10 +51,12 @@ DEVICE = "cuda"
 FP16 = True
 PRELOAD = True
 
+# 自动断点续训。需要从头训练时，把 FORCE_RESTART 改 True 或换 OUT_DIR。
 AUTO_RESUME = True
 FORCE_RESTART = False
 RESUME_PATH = ""
 
+# 调试用；正式训练保持 0。
 DEBUG_TRAIN_SAMPLES = 0
 DEBUG_VAL_SAMPLES = 0
 DEBUG_TEST_SAMPLES = 0
