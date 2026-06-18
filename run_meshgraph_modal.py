@@ -1,7 +1,13 @@
 from __future__ import annotations
 
+import os
 import sys
 from pathlib import Path
+
+# Windows 上部分 PyTorch/CUDA 环境缺 nvrtc-builtins64_121.dll 时，JIT fusion 会在训练中途崩溃。
+# 本项目没有使用 torch.compile，这里禁用 NVFuser/JIT fusion，优先走普通 CUDA kernel。
+os.environ.setdefault("PYTORCH_NVFUSER_DISABLE", "1")
+os.environ.setdefault("PYTORCH_JIT_ENABLE_NVFUSER", "0")
 
 ROOT_DIR = Path(__file__).resolve().parent
 DATA_DIR = ROOT_DIR / "modal_residue" / "data_modal_residue_fixedclamp300"
