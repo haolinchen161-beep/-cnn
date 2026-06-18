@@ -13,6 +13,7 @@ TARGET_REGION = "bottom"
 KEY_QUERY_NODES = 256
 EVAL_QUERY_NODES = 0
 
+# EPOCHS 是目标总 epoch。断点重训时，如果 last_model.pt 已经到 80，EPOCHS=150 就从 81 训到 150。
 EPOCHS = 150
 HIDDEN = 96
 GNN_LAYERS = 3
@@ -34,6 +35,11 @@ SEED = 42
 DEVICE = "cuda"
 FP16 = True
 PRELOAD = True
+
+# 断点重训：第一次训练保持 False；中断后改 True。
+RESUME = False
+# 默认从 OUT_DIR/last_model.pt 恢复；指定路径时填 Path 字符串，例如 r"runs/.../last_model.pt"。
+RESUME_PATH = ""
 
 # 调试用；正式训练保持 0。
 DEBUG_TRAIN_SAMPLES = 0
@@ -78,10 +84,16 @@ def main() -> int:
         argv.append("--preload")
     else:
         argv.append("--no-preload")
+    if RESUME:
+        argv.append("--resume")
+        if RESUME_PATH:
+            argv += ["--resume-path", str(RESUME_PATH)]
     if DEVICE != "auto":
         argv += ["--device", DEVICE]
 
     print(">>> 启动下一步正式实验：R=3 + 每阶独立 A-head + 每阶独立 loss")
+    if RESUME:
+        print(">>> 断点重训开启：从 last_model.pt 或 RESUME_PATH 继续")
     old_argv = sys.argv
     try:
         sys.argv = argv
