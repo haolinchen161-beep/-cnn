@@ -25,7 +25,8 @@ OMEGA_LOSS_WEIGHT = 1.0
 RESIDUE_FULL_LOSS_WEIGHT = 1.0
 # A_top 现在只是最高幅值区域的物理 A 辅助约束；主 A 已由分位数均衡 loss 负责。
 TOP_AUX_LOSS_WEIGHT = 0.10
-NODE_DOMINANT_LOSS_WEIGHT = 0.10
+# 关闭 dominant A 辅助项，避免它偏向每个节点最大阶次而削弱第二阶。
+NODE_DOMINANT_LOSS_WEIGHT = 0.0
 # 与分位数最高档 95-100% 对齐：A_top 只看每阶 |A| 最大的 5% 点。
 TOP_NODE_FRAC = 0.05
 NODE_DOMINANT_K = 1
