@@ -5,15 +5,13 @@ from pathlib import Path
 
 ROOT_DIR = Path(__file__).resolve().parent
 DATA_DIR = ROOT_DIR / "modal_residue" / "data_modal_residue_fixedclamp300"
-OUT_DIR = ROOT_DIR / "runs/下一步_R3_每阶A头_bottom"
+OUT_DIR = ROOT_DIR / "runs/r3_quantile_A_frf_bottom"
 
-# 下一步正式实验：R=3、底面点、每阶独立 A-head、每阶独立损失。
 N_MODES_USED = 3
 TARGET_REGION = "bottom"
 KEY_QUERY_NODES = 256
 EVAL_QUERY_NODES = 0
 
-# EPOCHS 是目标总 epoch。若 last_model.pt 已经到 80，EPOCHS=150 就从 81 训到 150。
 EPOCHS = 150
 HIDDEN = 96
 GNN_LAYERS = 3
@@ -27,6 +25,19 @@ TOP_AUX_LOSS_WEIGHT = 0.25
 NODE_DOMINANT_LOSS_WEIGHT = 0.10
 TOP_NODE_FRAC = 0.10
 NODE_DOMINANT_K = 1
+
+AMP_Q0_WEIGHT = 0.5
+AMP_Q50_WEIGHT = 1.0
+AMP_Q80_WEIGHT = 2.0
+AMP_Q95_WEIGHT = 4.0
+
+FRF_LOSS_WEIGHT = 0.02
+FRF_WARMUP_EPOCHS = 20
+FRF_OMEGA_SOURCE = "true"
+FRF_DEFAULT_ZETA = 0.01
+FRF_FREQ_SAMPLES = 64
+FRF_BAND_PAD = 0.15
+
 RESIDUE_VISIBLE_REL = 1e-3
 SIGN_VISIBLE_REL = 1e-4
 
@@ -36,15 +47,10 @@ DEVICE = "cuda"
 FP16 = True
 PRELOAD = True
 
-# 默认自动断点续训：
-# - 第一次运行：没有 last_model.pt，自动从头训练；
-# - 中断后再次运行：发现 last_model.pt，自动继续训练；
-# - 想彻底重训：把 FORCE_RESTART 改 True，或删除 OUT_DIR。
 AUTO_RESUME = True
 FORCE_RESTART = False
-RESUME_PATH = ""  # 留空时默认使用 OUT_DIR/last_model.pt
+RESUME_PATH = ""
 
-# 调试用；正式训练保持 0。
 DEBUG_TRAIN_SAMPLES = 0
 DEBUG_VAL_SAMPLES = 0
 DEBUG_TEST_SAMPLES = 0
@@ -76,6 +82,16 @@ def main() -> int:
         "--node-dominant-loss-weight", str(NODE_DOMINANT_LOSS_WEIGHT),
         "--top-node-frac", str(TOP_NODE_FRAC),
         "--node-dominant-k", str(NODE_DOMINANT_K),
+        "--amp-q0-weight", str(AMP_Q0_WEIGHT),
+        "--amp-q50-weight", str(AMP_Q50_WEIGHT),
+        "--amp-q80-weight", str(AMP_Q80_WEIGHT),
+        "--amp-q95-weight", str(AMP_Q95_WEIGHT),
+        "--frf-loss-weight", str(FRF_LOSS_WEIGHT),
+        "--frf-warmup-epochs", str(FRF_WARMUP_EPOCHS),
+        "--frf-omega-source", FRF_OMEGA_SOURCE,
+        "--frf-default-zeta", str(FRF_DEFAULT_ZETA),
+        "--frf-freq-samples", str(FRF_FREQ_SAMPLES),
+        "--frf-band-pad", str(FRF_BAND_PAD),
         "--residue-visible-rel", str(RESIDUE_VISIBLE_REL),
         "--sign-visible-rel", str(SIGN_VISIBLE_REL),
         "--grad-clip-norm", str(GRAD_CLIP_NORM),
@@ -97,13 +113,13 @@ def main() -> int:
     if DEVICE != "auto":
         argv += ["--device", DEVICE]
 
-    print(">>> 启动下一步正式实验：R=3 + 每阶独立 A-head + 每阶独立 loss")
+    print(">>> Start R3 quantile-balanced A training with safe FRF auxiliary loss")
     if should_resume:
-        print(f">>> 自动断点续训：{resume_path}")
+        print(f">>> Auto resume: {resume_path}")
     elif FORCE_RESTART:
-        print(">>> FORCE_RESTART=True：忽略旧 checkpoint，从头训练")
+        print(">>> FORCE_RESTART=True: start a new run")
     else:
-        print(">>> 未发现 checkpoint：从头训练")
+        print(">>> No checkpoint found: start a new run")
 
     old_argv = sys.argv
     try:
