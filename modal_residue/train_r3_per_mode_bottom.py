@@ -315,8 +315,9 @@ def append_csv_row(path: Path, row: Dict[str, float]) -> None:
         w.writerow(row)
 
 
-def checkpoint_payload(model, stats, in_dim, edge_dim, n_modes, args, epoch, best_value):
-    return {
+def checkpoint_payload(model, stats, in_dim, edge_dim, n_modes, args, epoch, best_value,
+                       opt=None, sched=None, scaler=None):
+    payload = {
         "model": model.state_dict(),
         "stats": stats,
         "node_in_dim": in_dim,
@@ -330,13 +331,43 @@ def checkpoint_payload(model, stats, in_dim, edge_dim, n_modes, args, epoch, bes
         "target_transform": "signed_asinh_fixed_per_mode_scale_bottom_region_R3",
         "args": {k: str(v) if isinstance(v, Path) else v for k, v in vars(args).items()},
     }
+    if opt is not None:
+        payload["optimizer"] = opt.state_dict()
+    if sched is not None:
+        payload["scheduler"] = sched.state_dict()
+    if scaler is not None:
+        payload["scaler"] = scaler.state_dict()
+    return payload
+
+
+def load_resume_state(path: Path, model, opt, sched, scaler, device):
+    ckpt = torch.load(path, map_location=device)
+    model.load_state_dict(ckpt["model"])
+    if "optimizer" in ckpt:
+        opt.load_state_dict(ckpt["optimizer"])
+    else:
+        print(">>> resume warning: checkpoint has no optimizer state; optimizer restarts.")
+    if "scheduler" in ckpt:
+        sched.load_state_dict(ckpt["scheduler"])
+    else:
+        print(">>> resume warning: checkpoint has no scheduler state; scheduler restarts.")
+    if "scaler" in ckpt and scaler is not None:
+        try:
+            scaler.load_state_dict(ckpt["scaler"])
+        except Exception as exc:
+            print(f">>> resume warning: failed to load GradScaler state: {exc}")
+    start_epoch = int(ckpt.get("epoch", 0)) + 1
+    best = float(ckpt.get("best_modal_score", float("inf")))
+    stats = ckpt.get("stats", None)
+    print(f">>> resumed from {path}: previous_epoch={start_epoch - 1}, next_epoch={start_epoch}, best={best:.6g}")
+    return start_epoch, best, stats
 
 
 def main() -> None:
     p = argparse.ArgumentParser()
     p.add_argument("--data-dir", type=Path, default=Path("modal_residue/data_modal_residue_fixedclamp300"))
     p.add_argument("--out-dir", type=Path, default=Path("runs/下一步_R3_每阶A头_bottom"))
-    p.add_argument("--epochs", type=int, default=150)
+    p.add_argument("--epochs", type=int, default=150, help="Total target epoch. When --resume is used, training continues until this epoch.")
     p.add_argument("--n-modes-used", type=int, default=N_MODES_USED)
     p.add_argument("--query-nodes", type=int, default=256)
     p.add_argument("--eval-query-nodes", type=int, default=0)
@@ -359,6 +390,8 @@ def main() -> None:
     p.add_argument("--fp16", action="store_true")
     p.add_argument("--preload", action="store_true")
     p.add_argument("--no-preload", action="store_true")
+    p.add_argument("--resume", action="store_true", help="Resume from last_model.pt or --resume-path.")
+    p.add_argument("--resume-path", type=Path, default=None, help="Checkpoint path for resume. Default: out_dir/last_model.pt.")
     p.add_argument("--debug-train-samples", type=int, default=0)
     p.add_argument("--debug-val-samples", type=int, default=0)
     p.add_argument("--debug-test-samples", type=int, default=0)
@@ -375,7 +408,7 @@ def main() -> None:
     seed_all(args.seed)
     args.out_dir.mkdir(parents=True, exist_ok=True)
     log_csv = args.out_dir / "training_log.csv"
-    if log_csv.exists():
+    if log_csv.exists() and not args.resume:
         log_csv.unlink()
 
     device = torch.device(args.device)
@@ -383,7 +416,6 @@ def main() -> None:
     val = LimitedCachedBottomSplit(args.data_dir, "val", args.n_modes_used, preload=preload, limit=args.debug_val_samples)
     test = LimitedCachedBottomSplit(args.data_dir, "test", args.n_modes_used, preload=preload, limit=args.debug_test_samples)
     stats = bottom.compute_stats(train, args.data_dir, target_region=args.target_region)
-    np.savez(args.out_dir / "normalization_stats.npz", **stats)
 
     first = train[0]
     in_dim = bottom.node_input(first).shape[1]
@@ -394,26 +426,42 @@ def main() -> None:
     sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=max(args.epochs, 1))
     scaler = torch.cuda.amp.GradScaler(enabled=bool(args.fp16 and device.type == "cuda"))
 
+    start_epoch = 1
+    best = float("inf")
+    if args.resume:
+        resume_path = args.resume_path or (args.out_dir / "last_model.pt")
+        if not resume_path.exists():
+            raise FileNotFoundError(f"resume checkpoint not found: {resume_path}")
+        start_epoch, best, ckpt_stats = load_resume_state(resume_path, model, opt, sched, scaler, device)
+        if ckpt_stats is not None:
+            stats = ckpt_stats
+
+    np.savez(args.out_dir / "normalization_stats.npz", **stats)
+
     total_params = sum(p.numel() for p in model.parameters())
     print(f">>> R3 per-mode bottom model: data={args.data_dir}, train/val/test={len(train)}/{len(val)}/{len(test)}")
-    print(f">>> device={device}, fp16={args.fp16}, preload={preload}")
+    print(f">>> device={device}, fp16={args.fp16}, preload={preload}, resume={args.resume}")
     print(f">>> node_dim={in_dim}, edge_dim={edge_dim}, modes={n_modes}, hidden={args.hidden}, layers={args.gnn_layers}, params={total_params:,}")
     print(f">>> loss: per-mode weighted omega + signed-asinh A + top A + dominant A")
     print(f">>> target_region={args.target_region}, query={args.query_nodes}, eval_query={args.eval_query_nodes}")
     print(f">>> A_scale={np.array2string(stats['A_asinh_scale'], precision=6, separator=', ')}")
 
-    best = float("inf")
     hist: List[Dict[str, float]] = []
-    for ep in range(1, args.epochs + 1):
+    if start_epoch > args.epochs:
+        print(f">>> resume checkpoint epoch is already {start_epoch - 1}, target epochs={args.epochs}; skip training and run final evaluation.")
+
+    for ep in range(start_epoch, args.epochs + 1):
         tr_loss, tr_m = train_epoch(model, train, opt, scaler, stats, args, device)
         sched.step()
         va, _ = evaluate(model, val, stats, args, device)
         score = float(va["modal_score"])
 
+        payload = checkpoint_payload(model, stats, in_dim, edge_dim, n_modes, args, ep, best, opt=opt, sched=sched, scaler=scaler)
         if score < best:
             best = score
-            torch.save(checkpoint_payload(model, stats, in_dim, edge_dim, n_modes, args, ep, best), args.out_dir / "best_model.pt")
-        torch.save(checkpoint_payload(model, stats, in_dim, edge_dim, n_modes, args, ep, best), args.out_dir / "last_model.pt")
+            payload = checkpoint_payload(model, stats, in_dim, edge_dim, n_modes, args, ep, best, opt=opt, sched=sched, scaler=scaler)
+            torch.save(payload, args.out_dir / "best_model.pt")
+        torch.save(payload, args.out_dir / "last_model.pt")
 
         row: Dict[str, float] = {
             "epoch": ep,
@@ -458,9 +506,18 @@ def main() -> None:
                 f"Y=[{base.fmt_triplet(va['Y_smooth_l1_triplet'], 4)}]"
             )
 
-    write_csv(args.out_dir / "history.csv", hist)
-    ckpt = torch.load(args.out_dir / "best_model.pt", map_location=device)
-    model.load_state_dict(ckpt["model"])
+    if hist:
+        existing_rows = []
+        if args.resume and (args.out_dir / "history.csv").exists():
+            # Keep previous history.csv as-is if it exists; training_log.csv is the continuous log.
+            pass
+        else:
+            write_csv(args.out_dir / "history.csv", hist)
+
+    ckpt_path = args.out_dir / "best_model.pt"
+    if ckpt_path.exists():
+        ckpt = torch.load(ckpt_path, map_location=device)
+        model.load_state_dict(ckpt["model"])
     va, vr = evaluate(model, val, stats, args, device)
     te, tr = evaluate(model, test, stats, args, device)
     write_csv(args.out_dir / "val_metrics.csv", vr)
