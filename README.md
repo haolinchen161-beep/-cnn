@@ -46,7 +46,7 @@ modal_residue/train_r3_per_mode_bottom.py
 4. 每阶独立 A-head；
 5. 每阶独立 omega/A/top/dominant loss；
 6. checkpoint 中记录 model_type 和 loss_type；
-7. checkpoint 中保存 optimizer/scheduler/scaler，可断点重训。
+7. checkpoint 中保存 optimizer/scheduler/scaler，可自动断点续训。
 ```
 
 当前配置：
@@ -91,27 +91,25 @@ L = L_omega_per_mode
 runs/下一步_R3_每阶A头_bottom/
 ```
 
-## 断点重训
+## 自动断点续训
 
-第一次训练保持：
+现在不需要手动改 `RESUME`。
 
-```text
-RESUME = False
-```
-
-中断后，把 `run_meshgraph_modal.py` 里的开关改成：
+同一个命令重复运行即可：
 
 ```text
-RESUME = True
+F:/pytorch_cuda12/python.exe -B run_meshgraph_modal.py
 ```
 
-再次运行同一个命令即可从：
+规则是：
 
 ```text
-runs/下一步_R3_每阶A头_bottom/last_model.pt
+第一次运行：没有 last_model.pt，自动从头训练。
+中断后再次运行：发现 last_model.pt，自动继续训练。
+想彻底重训：把 run_meshgraph_modal.py 里的 FORCE_RESTART 改 True，或删除输出目录。
 ```
 
-继续训练。`EPOCHS` 表示目标总 epoch，不是额外 epoch。例如 checkpoint 已经到 80，`EPOCHS = 150` 会从 81 继续到 150。
+`EPOCHS` 表示目标总 epoch，不是额外 epoch。例如 checkpoint 已经到 80，`EPOCHS = 150` 会从 81 继续到 150。
 
 ## 评价与误差分析脚本
 
