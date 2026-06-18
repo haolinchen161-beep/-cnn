@@ -133,6 +133,47 @@ def per_mode_smooth_l1(pred: torch.Tensor, target: torch.Tensor, weights: torch.
     return weighted_mean(loss_per_mode, weights)
 
 
+def amplitude_quantile_weights(A_true: torch.Tensor, q_weights: Tuple[float, float, float, float]) -> torch.Tensor:
+    """按每阶真实 |A| 的排序分位数给节点权重。
+
+    0-50% -> q_weights[0]
+    50-80% -> q_weights[1]
+    80-95% -> q_weights[2]
+    95-100% -> q_weights[3]
+
+    使用排序名次而不是 torch.quantile 阈值，避免大量相同/接近 0 的值把所有点挤进同一档。
+    """
+    A_abs = torch.abs(A_true.detach().float())
+    out = torch.empty_like(A_abs)
+    n_nodes, n_modes = A_abs.shape
+    for r in range(n_modes):
+        order = torch.argsort(A_abs[:, r], dim=0)
+        wr = torch.empty(n_nodes, device=A_abs.device, dtype=A_abs.dtype)
+        n50 = int(np.ceil(0.50 * n_nodes))
+        n80 = int(np.ceil(0.80 * n_nodes))
+        n95 = int(np.ceil(0.95 * n_nodes))
+        wr[order[:n50]] = float(q_weights[0])
+        wr[order[n50:n80]] = float(q_weights[1])
+        wr[order[n80:n95]] = float(q_weights[2])
+        wr[order[n95:]] = float(q_weights[3])
+        out[:, r] = wr
+    return out
+
+
+def per_mode_balanced_smooth_l1(pred: torch.Tensor, target: torch.Tensor,
+                                A_true: torch.Tensor, weights: torch.Tensor,
+                                q_weights: Tuple[float, float, float, float]) -> torch.Tensor:
+    """所有 bottom 查询点都参与，但按每阶 |A_true| 分位数均衡加权。"""
+    err = nn.functional.smooth_l1_loss(pred.float(), target.float(), reduction="none")
+    if err.dim() == 1:
+        return weighted_mean(err, weights)
+    pw = amplitude_quantile_weights(A_true, q_weights).to(device=err.device, dtype=err.dtype)
+    num = torch.sum(err * pw, dim=0)
+    den = torch.clamp(torch.sum(pw, dim=0), min=EPS)
+    loss_per_mode = num / den
+    return weighted_mean(loss_per_mode, weights)
+
+
 def per_mode_masked_physical_smooth_l1(A_pred: torch.Tensor, A_true: torch.Tensor,
                                        scale: torch.Tensor, mask: torch.Tensor,
                                        weights: torch.Tensor) -> torch.Tensor:
@@ -151,20 +192,73 @@ def per_mode_masked_physical_smooth_l1(A_pred: torch.Tensor, A_true: torch.Tenso
     return weighted_mean(torch.stack(losses), torch.stack(used_w))
 
 
+def modal_frf(A: torch.Tensor, omega: torch.Tensor, zeta: torch.Tensor,
+              n_freq: int, band_pad: float) -> torch.Tensor:
+    """由 A、omega、zeta 重构局部 FRF，输出 [n_query, n_freq] 复数张量。"""
+    A = A.float()
+    omega = torch.clamp(omega.float(), min=1e-6)
+    zeta = torch.clamp(zeta.float(), min=1e-6)
+    w_min = torch.clamp(torch.min(omega).detach() * float(max(0.0, 1.0 - band_pad)), min=1e-6)
+    w_max = torch.clamp(torch.max(omega).detach() * float(1.0 + max(0.0, band_pad)), min=w_min + 1e-6)
+    freq = torch.linspace(0.0, 1.0, steps=max(int(n_freq), 2), device=A.device, dtype=A.dtype)
+    w = w_min + (w_max - w_min) * freq
+    den_real = omega.view(1, -1) ** 2 - w.view(-1, 1) ** 2
+    den_imag = 2.0 * zeta.view(1, -1) * omega.view(1, -1) * w.view(-1, 1)
+    denom = torch.complex(den_real, den_imag)
+    return torch.sum(torch.complex(A, torch.zeros_like(A)).unsqueeze(1) / denom.unsqueeze(0), dim=-1)
+
+
+def frf_reconstruction_loss(A_pred: torch.Tensor, A_true: torch.Tensor,
+                            omega_pred_phys: torch.Tensor, omega_true: torch.Tensor,
+                            args) -> torch.Tensor:
+    """FRF 辅助损失。
+
+    默认推荐 frf_omega_source=true：用真实 omega 和默认阻尼重构 H，让 FRF loss 主要约束 A。
+    这样前期预测频率误差不会通过峰位错位把 A 带偏。
+    """
+    if args.frf_loss_weight <= 0.0:
+        return A_pred.sum() * 0.0
+
+    if args.frf_omega_source == "pred":
+        omega_for_pred = omega_pred_phys
+    elif args.frf_omega_source == "detach_pred":
+        omega_for_pred = omega_pred_phys.detach()
+    else:
+        omega_for_pred = omega_true.detach()
+
+    omega_for_true = omega_true.detach()
+    zeta_pred = torch.full_like(omega_for_pred, float(args.frf_default_zeta))
+    zeta_true = torch.full_like(omega_for_true, float(args.frf_default_zeta))
+
+    H_pred = modal_frf(A_pred, omega_for_pred, zeta_pred, args.frf_freq_samples, args.frf_band_pad)
+    H_true = modal_frf(A_true.detach(), omega_for_true, zeta_true, args.frf_freq_samples, args.frf_band_pad)
+    scale = torch.sqrt(torch.mean(torch.abs(H_true.detach()) ** 2)).clamp(min=EPS)
+
+    err_re = (H_pred.real - H_true.real) / scale
+    err_im = (H_pred.imag - H_true.imag) / scale
+    zero_re = torch.zeros_like(err_re)
+    zero_im = torch.zeros_like(err_im)
+    return 0.5 * (
+        nn.functional.smooth_l1_loss(err_re, zero_re)
+        + nn.functional.smooth_l1_loss(err_im, zero_im)
+    )
+
+
 def forward_model(model: nn.Module, t: Dict[str, torch.Tensor], q: torch.Tensor):
     return model(t["x"], t["edge_index"], t["edge_attr"], t["coords"], q, t["exc_idx"])
 
 
-def train_epoch(model, ds, opt, scaler, stats, args, device):
+def train_epoch(model, ds, opt, scaler, stats, args, device, epoch: int):
     model.train()
     order = list(range(len(ds)))
     random.shuffle(order)
-    sums = np.zeros(4, dtype=np.float64)
+    sums = np.zeros(5, dtype=np.float64)
     omega_errs: List[np.ndarray] = []
     A_vis_errs: List[np.ndarray] = []
     A_top_errs: List[np.ndarray] = []
     A_sign_errs: List[np.ndarray] = []
     amp_enabled = bool(args.fp16 and device.type == "cuda")
+    q_weights = (args.amp_q0_weight, args.amp_q50_weight, args.amp_q80_weight, args.amp_q95_weight)
 
     for i in order:
         t = bottom.to_tensors(ds[i], stats, device)
@@ -175,17 +269,22 @@ def train_epoch(model, ds, opt, scaler, stats, args, device):
             omega_p, Y_p = forward_model(model, t, q)
             omega_t, Y_t, A_t, scale = bottom.norm_targets(t, stats, q)
             loss_omega = per_mode_mse(omega_p, omega_t, weights)
-            loss_full = per_mode_smooth_l1(Y_p, Y_t, weights)
-            A_p = base.asinh_to_physical(Y_p, scale, clamp=args.asinh_clamp)
+            loss_full = per_mode_balanced_smooth_l1(Y_p, Y_t, A_t, weights, q_weights)
+            omega_phys, A_p = base.denorm_outputs(omega_p, Y_p, stats, clamp=args.asinh_clamp)
             top_mask = base.top_mode_mask(A_t, args.top_node_frac)
             dom_mask = base.node_dominant_mask(A_t, args.node_dominant_k)
             loss_top = per_mode_masked_physical_smooth_l1(A_p, A_t, scale, top_mask, weights)
             loss_dom = per_mode_masked_physical_smooth_l1(A_p, A_t, scale, dom_mask, weights)
+            if epoch <= args.frf_warmup_epochs:
+                loss_frf = A_p.sum() * 0.0
+            else:
+                loss_frf = frf_reconstruction_loss(A_p, A_t, omega_phys, t["omega"], args)
             loss = (
                 args.omega_loss_weight * loss_omega
                 + args.residue_full_loss_weight * loss_full
                 + args.top_aux_loss_weight * loss_top
                 + args.node_dominant_loss_weight * loss_dom
+                + args.frf_loss_weight * loss_frf
             )
 
         scaler.scale(loss).backward()
@@ -195,8 +294,8 @@ def train_epoch(model, ds, opt, scaler, stats, args, device):
         scaler.update()
 
         with torch.no_grad():
-            omega_phys, A_phys = base.denorm_outputs(omega_p.detach(), Y_p.detach(), stats, clamp=args.asinh_clamp)
-            w_rel = torch.abs(omega_phys - t["omega"]) / torch.clamp(torch.abs(t["omega"]), min=EPS) * 100.0
+            omega_phys_m, A_phys = base.denorm_outputs(omega_p.detach(), Y_p.detach(), stats, clamp=args.asinh_clamp)
+            w_rel = torch.abs(omega_phys_m - t["omega"]) / torch.clamp(torch.abs(t["omega"]), min=EPS) * 100.0
             A_true = t["A"][q]
             A_vis = base.A_visible_error_pct(A_phys, A_true, args.residue_visible_rel)
             A_top = base.A_top_error_pct(A_phys, A_true, args.top_node_frac)
@@ -211,6 +310,7 @@ def train_epoch(model, ds, opt, scaler, stats, args, device):
             float(loss_omega.detach().cpu()),
             float(loss_full.detach().cpu()),
             float((args.top_aux_loss_weight * loss_top + args.node_dominant_loss_weight * loss_dom).detach().cpu()),
+            float((args.frf_loss_weight * loss_frf).detach().cpu()),
         ])
 
     n_modes = len(omega_errs[0]) if omega_errs else 0
@@ -237,6 +337,7 @@ def evaluate(model, ds, stats, args, device):
     y_losses: List[float] = []
     n_query_values: List[float] = []
     amp_enabled = bool(args.fp16 and device.type == "cuda")
+    q_weights = (args.amp_q0_weight, args.amp_q50_weight, args.amp_q80_weight, args.amp_q95_weight)
 
     for i in range(len(ds)):
         t = bottom.to_tensors(ds[i], stats, device)
@@ -250,7 +351,7 @@ def evaluate(model, ds, stats, args, device):
         A_vis = base.A_visible_error_pct(A, A_true, args.residue_visible_rel)
         A_top = base.A_top_error_pct(A, A_true, args.top_node_frac)
         A_sign = bottom.A_sign_accuracy_pct(A, A_true, args.sign_visible_rel)
-        y_loss = per_mode_smooth_l1(Y_n.float(), Y_t.float(), weights).detach()
+        y_loss = per_mode_balanced_smooth_l1(Y_n.float(), Y_t.float(), A_true, weights, q_weights).detach()
 
         w_np = w_rel.detach().cpu().numpy()
         A_np = A_vis.detach().cpu().numpy()
@@ -263,7 +364,7 @@ def evaluate(model, ds, stats, args, device):
         y_losses.append(float(y_loss.cpu()))
         n_query_values.append(float(q.numel()))
 
-        row = {"sample": i, "n_target_nodes": int(q.numel()), "Y_smooth_l1": float(y_loss.cpu())}
+        row = {"sample": i, "n_target_nodes": int(q.numel()), "Y_balanced_smooth_l1": float(y_loss.cpu())}
         base.row_add_triplet(row, "w", base.triplet_percent([w_np]))
         base.row_add_triplet(row, "A_vis", base.triplet_percent([A_np]))
         base.row_add_triplet(row, "A_top", base.triplet_percent([T_np]))
@@ -324,7 +425,7 @@ def checkpoint_payload(model, stats, in_dim, edge_dim, n_modes, args, epoch, bes
         "edge_in_dim": edge_dim,
         "n_modes": n_modes,
         "model_type": "PerModeResidueNet",
-        "loss_type": "per_mode_weighted_asinh_A",
+        "loss_type": "per_mode_quantile_balanced_asinh_A_plus_optional_frf",
         "epoch": epoch,
         "best_modal_score": best_value,
         "target_region": args.target_region,
@@ -366,7 +467,7 @@ def load_resume_state(path: Path, model, opt, sched, scaler, device):
 def main() -> None:
     p = argparse.ArgumentParser()
     p.add_argument("--data-dir", type=Path, default=Path("modal_residue/data_modal_residue_fixedclamp300"))
-    p.add_argument("--out-dir", type=Path, default=Path("runs/下一步_R3_每阶A头_bottom"))
+    p.add_argument("--out-dir", type=Path, default=Path("runs/下一步_R3_分位A_FRF_bottom"))
     p.add_argument("--epochs", type=int, default=150, help="Total target epoch. When --resume is used, training continues until this epoch.")
     p.add_argument("--n-modes-used", type=int, default=N_MODES_USED)
     p.add_argument("--query-nodes", type=int, default=256)
@@ -380,6 +481,16 @@ def main() -> None:
     p.add_argument("--residue-full-loss-weight", type=float, default=1.0)
     p.add_argument("--top-aux-loss-weight", type=float, default=0.25)
     p.add_argument("--node-dominant-loss-weight", type=float, default=0.10)
+    p.add_argument("--frf-loss-weight", type=float, default=0.0)
+    p.add_argument("--frf-warmup-epochs", type=int, default=20)
+    p.add_argument("--frf-omega-source", choices=["true", "pred", "detach_pred"], default="true")
+    p.add_argument("--frf-default-zeta", type=float, default=0.01)
+    p.add_argument("--frf-freq-samples", type=int, default=64)
+    p.add_argument("--frf-band-pad", type=float, default=0.15)
+    p.add_argument("--amp-q0-weight", type=float, default=0.5)
+    p.add_argument("--amp-q50-weight", type=float, default=1.0)
+    p.add_argument("--amp-q80-weight", type=float, default=2.0)
+    p.add_argument("--amp-q95-weight", type=float, default=4.0)
     p.add_argument("--top-node-frac", type=float, default=0.10)
     p.add_argument("--node-dominant-k", type=int, default=1)
     p.add_argument("--asinh-clamp", type=float, default=20.0)
@@ -442,7 +553,9 @@ def main() -> None:
     print(f">>> R3 per-mode bottom model: data={args.data_dir}, train/val/test={len(train)}/{len(val)}/{len(test)}")
     print(f">>> device={device}, fp16={args.fp16}, preload={preload}, resume={args.resume}")
     print(f">>> node_dim={in_dim}, edge_dim={edge_dim}, modes={n_modes}, hidden={args.hidden}, layers={args.gnn_layers}, params={total_params:,}")
-    print(f">>> loss: per-mode weighted omega + signed-asinh A + top A + dominant A")
+    print(">>> loss: per-mode omega + quantile-balanced signed-asinh A + top A + dominant A + optional FRF")
+    print(f">>> A quantile weights: 0-50%={args.amp_q0_weight}, 50-80%={args.amp_q50_weight}, 80-95%={args.amp_q80_weight}, 95-100%={args.amp_q95_weight}")
+    print(f">>> FRF: weight={args.frf_loss_weight}, warmup={args.frf_warmup_epochs}, omega_source={args.frf_omega_source}, zeta={args.frf_default_zeta}")
     print(f">>> target_region={args.target_region}, query={args.query_nodes}, eval_query={args.eval_query_nodes}")
     print(f">>> A_scale={np.array2string(stats['A_asinh_scale'], precision=6, separator=', ')}")
 
@@ -451,7 +564,7 @@ def main() -> None:
         print(f">>> resume checkpoint epoch is already {start_epoch - 1}, target epochs={args.epochs}; skip training and run final evaluation.")
 
     for ep in range(start_epoch, args.epochs + 1):
-        tr_loss, tr_m = train_epoch(model, train, opt, scaler, stats, args, device)
+        tr_loss, tr_m = train_epoch(model, train, opt, scaler, stats, args, device, ep)
         sched.step()
         va, _ = evaluate(model, val, stats, args, device)
         score = float(va["modal_score"])
@@ -468,8 +581,9 @@ def main() -> None:
             "lr": float(sched.get_last_lr()[0]),
             "loss": float(tr_loss[0]),
             "loss_w": float(tr_loss[1]),
-            "loss_Y_full": float(tr_loss[2]),
+            "loss_Y_balanced": float(tr_loss[2]),
             "loss_A_aux_weighted": float(tr_loss[3]),
+            "loss_FRF_weighted": float(tr_loss[4]),
             "val_modal_score": score,
         }
         for prefix, metrics in [("train", tr_m), ("val", va)]:
@@ -494,7 +608,9 @@ def main() -> None:
                 f"A_vis=[{base.fmt_triplet(tr_m['A_vis_triplet'], 1)}]%  "
                 f"A_top=[{base.fmt_triplet(tr_m['A_top_triplet'], 1)}]%  "
                 f"sign=[{base.fmt_triplet(tr_m['A_sign_triplet'], 1)}]%  "
-                f"loss={base.fmt_loss(float(tr_loss[0]))}(w={base.fmt_loss(float(tr_loss[1]))},Y={base.fmt_loss(float(tr_loss[2]))},Aaux={base.fmt_loss(float(tr_loss[3]))})"
+                f"loss={base.fmt_loss(float(tr_loss[0]))}(w={base.fmt_loss(float(tr_loss[1]))},"
+                f"Ybal={base.fmt_loss(float(tr_loss[2]))},Aaux={base.fmt_loss(float(tr_loss[3]))},"
+                f"FRF={base.fmt_loss(float(tr_loss[4]))})"
             )
             print(
                 f"Val | "
@@ -525,12 +641,26 @@ def main() -> None:
 
     summary = {
         "model_type": "PerModeResidueNet",
-        "loss_type": "per_mode_weighted_asinh_A",
+        "loss_type": "per_mode_quantile_balanced_asinh_A_plus_optional_frf",
         "n_modes_used": n_modes,
         "target_region": args.target_region,
         "query_nodes": args.query_nodes,
         "eval_query_nodes": args.eval_query_nodes,
         "A_asinh_scale": stats["A_asinh_scale"].astype(float).tolist(),
+        "amp_quantile_weights": {
+            "0_50": args.amp_q0_weight,
+            "50_80": args.amp_q50_weight,
+            "80_95": args.amp_q80_weight,
+            "95_100": args.amp_q95_weight,
+        },
+        "frf": {
+            "loss_weight": args.frf_loss_weight,
+            "warmup_epochs": args.frf_warmup_epochs,
+            "omega_source": args.frf_omega_source,
+            "default_zeta": args.frf_default_zeta,
+            "freq_samples": args.frf_freq_samples,
+            "band_pad": args.frf_band_pad,
+        },
         "best_modal_score": best,
         "val": {
             "w_mean_max_rms_pct": list(va["w_triplet"]),
