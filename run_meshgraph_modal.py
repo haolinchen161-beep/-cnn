@@ -13,7 +13,7 @@ TARGET_REGION = "bottom"
 KEY_QUERY_NODES = 256
 EVAL_QUERY_NODES = 0
 
-# EPOCHS 是目标总 epoch。断点重训时，如果 last_model.pt 已经到 80，EPOCHS=150 就从 81 训到 150。
+# EPOCHS 是目标总 epoch。若 last_model.pt 已经到 80，EPOCHS=150 就从 81 训到 150。
 EPOCHS = 150
 HIDDEN = 96
 GNN_LAYERS = 3
@@ -36,10 +36,13 @@ DEVICE = "cuda"
 FP16 = True
 PRELOAD = True
 
-# 断点重训：第一次训练保持 False；中断后改 True。
-RESUME = False
-# 默认从 OUT_DIR/last_model.pt 恢复；指定路径时填 Path 字符串，例如 r"runs/.../last_model.pt"。
-RESUME_PATH = ""
+# 默认自动断点续训：
+# - 第一次运行：没有 last_model.pt，自动从头训练；
+# - 中断后再次运行：发现 last_model.pt，自动继续训练；
+# - 想彻底重训：把 FORCE_RESTART 改 True，或删除 OUT_DIR。
+AUTO_RESUME = True
+FORCE_RESTART = False
+RESUME_PATH = ""  # 留空时默认使用 OUT_DIR/last_model.pt
 
 # 调试用；正式训练保持 0。
 DEBUG_TRAIN_SAMPLES = 0
@@ -49,6 +52,10 @@ DEBUG_TEST_SAMPLES = 0
 
 def main() -> int:
     from modal_residue.train_r3_per_mode_bottom import main as train_main
+
+    default_resume_path = OUT_DIR / "last_model.pt"
+    resume_path = Path(RESUME_PATH) if RESUME_PATH else default_resume_path
+    should_resume = bool(AUTO_RESUME and (not FORCE_RESTART) and resume_path.exists())
 
     argv = [
         "train_r3_per_mode_bottom.py",
@@ -84,16 +91,20 @@ def main() -> int:
         argv.append("--preload")
     else:
         argv.append("--no-preload")
-    if RESUME:
+    if should_resume:
         argv.append("--resume")
-        if RESUME_PATH:
-            argv += ["--resume-path", str(RESUME_PATH)]
+        argv += ["--resume-path", str(resume_path)]
     if DEVICE != "auto":
         argv += ["--device", DEVICE]
 
     print(">>> 启动下一步正式实验：R=3 + 每阶独立 A-head + 每阶独立 loss")
-    if RESUME:
-        print(">>> 断点重训开启：从 last_model.pt 或 RESUME_PATH 继续")
+    if should_resume:
+        print(f">>> 自动断点续训：{resume_path}")
+    elif FORCE_RESTART:
+        print(">>> FORCE_RESTART=True：忽略旧 checkpoint，从头训练")
+    else:
+        print(">>> 未发现 checkpoint：从头训练")
+
     old_argv = sys.argv
     try:
         sys.argv = argv
