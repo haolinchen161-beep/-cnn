@@ -157,6 +157,43 @@ def weighted_smooth_l1_loss(pred: torch.Tensor, target: torch.Tensor, beta: floa
     return (element_loss * w).sum() / (element_loss.shape[0] * w.sum().clamp_min(1.0e-8))
 
 
+def adaptive_kernel_windows(
+    omega_true: torch.Tensor,
+    max_window: float,
+    gap_safety: float,
+    min_window: float,
+    eps: float,
+) -> torch.Tensor:
+    """Return per-sample, per-mode symmetric windows that avoid neighboring modes.
+
+    A fixed +/-3% window can overlap when mode 2 and mode 3 are close. For each
+    mode r, the safe window is limited by the midpoint to its nearest neighboring
+    modal frequency. For example, the right-side boundary is
+        0.5 * (omega_{r+1}/omega_r - 1).
+    We multiply that half-gap by ``gap_safety`` and cap it by ``max_window``.
+    """
+    bsz, n_modes = omega_true.shape
+    device = omega_true.device
+    dtype = omega_true.dtype
+    base_w = torch.full((bsz, n_modes), float(max_window), device=device, dtype=dtype)
+
+    if n_modes <= 1:
+        return base_w.clamp_min(float(min_window))
+
+    left_limit = torch.full_like(base_w, float(max_window))
+    right_limit = torch.full_like(base_w, float(max_window))
+
+    ratio_prev = omega_true[:, :-1] / omega_true[:, 1:].clamp_min(eps)
+    left_limit[:, 1:] = 0.5 * (1.0 - ratio_prev).clamp_min(0.0)
+
+    ratio_next = omega_true[:, 1:] / omega_true[:, :-1].clamp_min(eps)
+    right_limit[:, :-1] = 0.5 * (ratio_next - 1.0).clamp_min(0.0)
+
+    gap_limit = torch.minimum(left_limit, right_limit) * float(gap_safety)
+    local_w = torch.minimum(base_w, gap_limit)
+    return local_w.clamp_min(float(min_window))
+
+
 def local_peak_kernel_loss(
     omega_pred: torch.Tensor,
     omega_true: torch.Tensor,
@@ -165,8 +202,10 @@ def local_peak_kernel_loss(
     zeta_kernel: float,
     mode_weights: torch.Tensor,
     eps: float,
+    gap_safety: float = 0.80,
+    min_window: float = 0.001,
 ) -> torch.Tensor:
-    """Dimensionless local peak-position loss.
+    """Dimensionless local peak-position loss with adaptive modal-gap windows.
 
     Let s = Omega / omega_true and alpha = omega_pred / omega_true.
     The target and predicted log kernels are
@@ -174,7 +213,8 @@ def local_peak_kernel_loss(
         K_pred = -log(sqrt((alpha^2 - s^2)^2 + (2*zeta_kernel*s)^2)).
 
     zeta_kernel is a fixed numerical peak width. It is not true damping and is
-    not predicted damping.
+    not predicted damping. The local window is capped by neighboring modal gaps,
+    so close mode-2/mode-3 pairs do not train on strongly overlapping intervals.
     """
     if n_freq <= 1 or window <= 0.0 or zeta_kernel <= 0.0:
         return torch.zeros((), device=omega_true.device, dtype=omega_true.dtype)
@@ -182,18 +222,22 @@ def local_peak_kernel_loss(
     bsz, n_modes = omega_true.shape
     device = omega_true.device
     dtype = omega_true.dtype
-    s = torch.linspace(1.0 - window, 1.0 + window, int(n_freq), device=device, dtype=dtype).view(1, -1)
+    t = torch.linspace(-1.0, 1.0, int(n_freq), device=device, dtype=dtype).view(1, -1)
     alpha = (omega_pred / omega_true.clamp_min(eps)).clamp_min(eps)
     beta_width = 2.0 * float(zeta_kernel)
+    windows = adaptive_kernel_windows(omega_true, window, gap_safety, min_window, eps)
 
-    d_true = torch.sqrt((1.0 - s ** 2) ** 2 + (beta_width * s) ** 2 + eps)
-    k_true = -torch.log(d_true + eps)
     per_mode = []
     for r in range(n_modes):
+        local_w = windows[:, r].view(bsz, 1)
+        s = 1.0 + local_w * t
         a = alpha[:, r].view(bsz, 1)
+
+        d_true = torch.sqrt((1.0 - s ** 2) ** 2 + (beta_width * s) ** 2 + eps)
         d_pred = torch.sqrt((a ** 2 - s ** 2) ** 2 + (beta_width * s) ** 2 + eps)
+        k_true = -torch.log(d_true + eps)
         k_pred = -torch.log(d_pred + eps)
-        per_mode.append(F.smooth_l1_loss(k_pred, k_true.expand_as(k_pred), beta=0.25, reduction="mean"))
+        per_mode.append(F.smooth_l1_loss(k_pred, k_true, beta=0.25, reduction="mean"))
 
     losses = torch.stack(per_mode)
     w = mode_weights.to(device=device, dtype=dtype).view(-1)[:n_modes]
@@ -249,6 +293,8 @@ def run_epoch(model, loader, optimizer, stats, device, cfg, train: bool, epoch: 
                 zeta_kernel=float(cfg_get(cfg, "kernel_zeta", 0.005)),
                 mode_weights=mode_weights,
                 eps=cfg.eps,
+                gap_safety=float(cfg_get(cfg, "kernel_gap_safety", 0.80)),
+                min_window=float(cfg_get(cfg, "kernel_min_window", 0.001)),
             )
             wp_log = pred * stats["omega_log_std"].view(1, -1) + stats["omega_log_mean"].view(1, -1)
             if cfg.order_loss_weight > 0 and cfg.target_modes > 1:
@@ -403,7 +449,9 @@ def train_frequency_model(config: Any) -> None:
         f"kernel_ramp={cfg_get(cfg, 'kernel_ramp_epochs', 0)}, "
         f"kernel_window={cfg_get(cfg, 'kernel_window', 0.03)}, "
         f"kernel_n_freq={cfg_get(cfg, 'kernel_n_freq', 49)}, "
-        f"kernel_zeta={cfg_get(cfg, 'kernel_zeta', 0.005)}"
+        f"kernel_zeta={cfg_get(cfg, 'kernel_zeta', 0.005)}, "
+        f"kernel_gap_safety={cfg_get(cfg, 'kernel_gap_safety', 0.80)}, "
+        f"kernel_min_window={cfg_get(cfg, 'kernel_min_window', 0.001)}"
     )
 
     optimizer = torch.optim.AdamW(
