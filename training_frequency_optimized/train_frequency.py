@@ -69,6 +69,7 @@ class FrequencyTrainConfig:
     # Two-stage local peak kernel loss.
     # 先训练普通频率误差；到 kernel_start_epoch 后逐步引入无量纲局部峰位 kernel loss。
     # 该 loss 只使用 omega_pred/omega_true 和固定 kernel_zeta，不使用真实阻尼或 FRF 标签。
+    # kernel_window 是最大窗口；实际每阶窗口会按相邻模态间隔自适应缩小，避免二三阶近频时窗口重叠。
     mode_loss_weights: tuple[float, ...] = (1.0, 1.5, 1.5)
     kernel_loss_weight: float = 0.03
     kernel_start_epoch: int = 80
@@ -76,6 +77,8 @@ class FrequencyTrainConfig:
     kernel_window: float = 0.03
     kernel_n_freq: int = 49
     kernel_zeta: float = 0.005
+    kernel_gap_safety: float = 0.80
+    kernel_min_window: float = 0.001
 
     # Reporting and checkpoint saving
     val_interval: int = 1
@@ -143,6 +146,8 @@ PRESETS = {
         kernel_window=0.03,
         kernel_n_freq=49,
         kernel_zeta=0.005,
+        kernel_gap_safety=0.80,
+        kernel_min_window=0.001,
     ),
 }
 
