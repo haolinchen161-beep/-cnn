@@ -1,8 +1,11 @@
 # -*- coding: utf-8 -*-
 """固有频率训练入口。
 
-当前训练固有频率 baseline：
+当前版本使用 Transformer + Fourier PE 的频率预测模型：
     pocket_features + clamp_features + material/global scalars -> modal_omega[:3]
+
+模型类名仍为 FrequencyTokenMLP，但 training_frequency_optimized_frfloss/model_frequency.py
+内部已经升级为 token Transformer，不再是简单 mean/max pooling baseline。
 """
 from __future__ import annotations
 
@@ -27,7 +30,7 @@ class FrequencyTrainConfig:
     train_h5: str = str(Path(DATA_DIR) / "train.h5")
     val_h5: str = str(Path(DATA_DIR) / "val.h5")
     test_h5: str = str(Path(DATA_DIR) / "test.h5")
-    output_dir: str = os.path.join(CURRENT_DIR, "runs")
+    output_dir: str = os.path.join(CURRENT_DIR, "runs_transformer_pe")
 
     # Target settings
     target_modes: int = 3
@@ -44,6 +47,9 @@ class FrequencyTrainConfig:
     token_layers: int = 3
     fusion_layers: int = 4
     dropout: float = 0.05
+    transformer_layers: int = 2
+    transformer_heads: int = 4
+    pe_num_bands: int = 4
 
     # Optimizer settings
     epochs: int = 350
@@ -61,6 +67,7 @@ class FrequencyTrainConfig:
     smooth_l1_beta: float = 0.25
     order_loss_weight: float = 0.02
     order_log_margin: float = 1.0e-4
+    mode_loss_weights: tuple[float, ...] = (1.0, 1.5, 1.5)
     eps: float = 1.0e-8
 
     # Reporting and checkpoint saving
@@ -88,7 +95,7 @@ PRESETS = {
         log_interval=1,
         save_last_interval=1,
         early_stop_patience=15,
-        output_dir=os.path.join(CURRENT_DIR, "runs_debug10"),
+        output_dir=os.path.join(CURRENT_DIR, "runs_debug10_transformer_pe"),
     ),
     "small": dict(
         epochs=100,
@@ -102,7 +109,7 @@ PRESETS = {
         log_interval=1,
         save_last_interval=5,
         early_stop_patience=30,
-        output_dir=os.path.join(CURRENT_DIR, "runs_small"),
+        output_dir=os.path.join(CURRENT_DIR, "runs_small_transformer_pe"),
     ),
     "full": dict(
         epochs=350,
@@ -116,7 +123,8 @@ PRESETS = {
         log_interval=1,
         save_last_interval=5,
         early_stop_patience=120,
-        output_dir=os.path.join(CURRENT_DIR, "runs"),
+        output_dir=os.path.join(CURRENT_DIR, "runs_transformer_pe"),
+        mode_loss_weights=(1.0, 1.5, 1.5),
     ),
 }
 
@@ -138,7 +146,7 @@ def build_config(preset: str, data_dir: str | None = None) -> FrequencyTrainConf
     return cfg
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Train Baseline MLP natural frequency model")
+    parser = argparse.ArgumentParser(description="Train Transformer-PE natural frequency model")
     parser.add_argument("--preset", default=RUN_PRESET, choices=list(PRESETS.keys()), help="Training preset")
     parser.add_argument("--data-dir", default=None, help="Dataset folder path containing train.h5/val.h5/test.h5")
     parser.add_argument("--device", default=None, help="Device to use (auto/cuda/cpu)")
@@ -155,6 +163,7 @@ def main() -> None:
     print(f"Using preset: {args.preset}")
     print(f"Dataset path: {Path(cfg.train_h5).parent}")
     print(f"Output directory: {cfg.output_dir}")
+    print("Frequency model: Transformer + Fourier PE over pocket/clamp tokens")
     train_frequency_model(cfg)
 
 if __name__ == "__main__":
